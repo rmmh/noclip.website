@@ -126,8 +126,8 @@ class SceneDesc implements Viewer.SceneDesc {
             const sceneRenderer = new BKRenderer(fakeTextureHolder);
 
             if (obj.OpaGeoFileId >= 0) {
-                const geo = Geo.parse(obj.Files[obj.OpaGeoFileId].Data, true);
-                this.addGeo(device, viewerTextures, sceneRenderer, geo);
+                // const geo = Geo.parse(obj.Files[obj.OpaGeoFileId].Data, true);
+                // this.addGeo(device, viewerTextures, sceneRenderer, geo);
             }
 
             if (obj.XluGeoFileId >= 0) {
