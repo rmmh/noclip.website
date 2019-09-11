@@ -263,9 +263,9 @@ class Main {
         // Load the state from the hash, remove the extra character at the end.
         const hash = window.location.hash;
         if (hash.startsWith('#')) {
-            this._loadState(decodeURIComponent(hash.slice(1)));
             // Wipe out the hash from the URL.
             window.history.replaceState('', '', '/');
+            this._loadState(decodeURIComponent(hash.slice(1)));
         }
     }
 
@@ -583,6 +583,8 @@ class Main {
 
         const sceneDescId = this._getCurrentSceneDescId();
 
+        window.history.replaceState('', document.title, '#' + sceneDescId);
+
         if (typeof gtag !== 'undefined') {
             gtag("event", "loadScene", {
                 'event_category': "Scenes",
@@ -701,6 +703,6 @@ window.downloadBuffer = (name: any, buffer: any) => {
         downloadBufferSlice(name, buffer);
     else if (name.name && name.buffer)
         window.downloadBuffer(name.name, name.buffer);
-    else if (buffer instanceof ArrayBuffer) 
+    else if (buffer instanceof ArrayBuffer)
         downloadBuffer(name, buffer);
 };
