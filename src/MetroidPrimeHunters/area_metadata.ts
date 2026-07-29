@@ -1,6 +1,9 @@
+import { MPHEntityMetadata } from './entity.js';
+
 // The extractor tool writes every metadata table the viewer needs into one file.
 export interface MPHMetadata {
     areas: readonly MPHAreaMetadata[];
+    entities: MPHEntityMetadata;
     // Archive stem to the texture file its models share, and model filename to
     // the archive holding it.
     archiveTextures: Record<string, string>;
