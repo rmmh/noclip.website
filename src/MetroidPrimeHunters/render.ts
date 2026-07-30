@@ -354,8 +354,8 @@ export interface MPHRendererOptions {
     lighting?: MPHLighting;
     mapAnimationTime?: (timeInMilliseconds: number) => number;
     mapMaterialAnimationTime?: (timeInMilliseconds: number) => number;
-    additionalNodeAnimations?: MPHNodeAnimation[];
-    additionalMaterialAnimations?: MPHMaterialAnimation[];
+    additionalNodeAnimations?: (MPHNodeAnimation | null)[];
+    additionalMaterialAnimations?: (MPHMaterialAnimation | null)[];
     selectNodeAnimation?: (timeInMilliseconds: number) => number;
     selectMaterialAnimation?: (timeInMilliseconds: number) => number;
     modifyMaterialColor?: (dst: Color, materialName: string, timeInMilliseconds: number) => void;
@@ -408,7 +408,7 @@ export class MPHRenderer {
     public modelScale: number;
     private nodeDrawOrder: Node[] = [];
     private nodeAnimator: MPHNodeAnimator | null;
-    private nodeAnimators: MPHNodeAnimator[];
+    private nodeAnimators: (MPHNodeAnimator | null)[];
     private selectNodeAnimation: MPHRendererOptions['selectNodeAnimation'];
     private modifyNodeMatrix: MPHRendererOptions['modifyNodeMatrix'];
     private sceneMode: MPHSceneMode;
@@ -442,9 +442,9 @@ export class MPHRenderer {
         this.gfxProgram = cache.createProgram(program);
         const nodeAnimation = mphAnimation?.node ?? null;
         this.nodeAnimator = nodeAnimation !== null ? new MPHNodeAnimator(this.animationController, nodeAnimation) : null;
-        this.nodeAnimators = this.nodeAnimator !== null ? [this.nodeAnimator] : [];
+        this.nodeAnimators = [this.nodeAnimator];
         for (const animation of options.additionalNodeAnimations ?? [])
-            this.nodeAnimators.push(new MPHNodeAnimator(this.animationController, animation));
+            this.nodeAnimators.push(animation !== null ? new MPHNodeAnimator(this.animationController, animation) : null);
         this.modelScale = mphModel.posScale * (1 << mphModel.scaleFactor);
         mat4.fromScaling(this.modelMatrix, [this.modelScale, this.modelScale, this.modelScale]);
 

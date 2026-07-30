@@ -124,13 +124,26 @@ function entityMetadata(images: Map<number, Image>, hasFile: (name: string) => b
         return assetStem(readCString(image.data, offset));
     };
 
+    const signedByte = (overlay: number, address: number) => {
+        const { image, offset } = read(overlay, address);
+        return image.data.readInt32LE(offset);
+    };
+
     const platforms = [];
     for (let i = 0; i < PLATFORM_COUNT; i++) {
         const entry = PLATFORM_TABLE + i * PLATFORM_STRIDE;
         const animationName = name(WORLD_OVERLAY, pointer(WORLD_OVERLAY, entry + 0x04));
-        // Of the four per-state animation slots, the game renders the third.
-        const animationId = animationName !== null ? pointer(WORLD_OVERLAY, entry + 0x14) : 0;
-        platforms.push({ modelName: name(WORLD_OVERLAY, pointer(WORLD_OVERLAY, entry)), animationName, animationId });
+        // SetPlatformActiveAnimation @ 0x0216F208 reads these four slots as
+        // inactive, activation transition, active, and deactivation transition;
+        // -1 means the state has no animation.
+        const animationIds = animationName !== null ?
+            [0x0C, 0x10, 0x14, 0x18].map((offs) => signedByte(WORLD_OVERLAY, entry + offs)) : [0, 0, 0, 0];
+        platforms.push({
+            modelName: name(WORLD_OVERLAY, pointer(WORLD_OVERLAY, entry)),
+            animationName,
+            animationId: animationIds[2],
+            animationIds,
+        });
     }
 
     const objects = [];

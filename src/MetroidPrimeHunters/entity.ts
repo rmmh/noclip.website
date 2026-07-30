@@ -547,6 +547,8 @@ export interface MPHPlatformMetadata {
     modelName: string | null;
     animationName: string | null;
     animationId: number;
+    // Inactive, activation transition, active, and deactivation transition.
+    animationIds: readonly [number, number, number, number];
 }
 
 export interface MPHDoorMetadata {
@@ -591,14 +593,21 @@ function getObjectModelSpec(metadata: MPHEntityMetadata, object: MPHObjectEntity
     };
 }
 
+function isPlatformModelSupported(metadata: MPHEntityMetadata, platform: MPHPlatformEntity): boolean {
+    return metadata.platforms[platform.modelId] !== undefined;
+}
+
 function getPlatformModelSpec(metadata: MPHEntityMetadata, platform: MPHPlatformEntity): MPHEntityModelSpec | null {
     const platform_ = metadata.platforms[platform.modelId];
     if (platform_ === undefined || platform_.modelName === null)
         return null;
+    const additionalAnimationIds = platform_.animationName === null ? undefined :
+        [...new Set(platform_.animationIds.filter((animationId) => animationId >= 0 && animationId !== platform_.animationId))];
     return {
         modelFilename: `${platform_.modelName}_Model.bin`,
         animationFilename: platform_.animationName !== null ? `${platform_.animationName}_Anim.bin` : undefined,
         animationId: platform_.animationName !== null ? platform_.animationId : undefined,
+        additionalAnimationIds,
     };
 }
 
@@ -789,7 +798,7 @@ interface MPHSharedTexture {
     bin: MPHbin;
 }
 
-function createEntityModelRenderer(device: GfxDevice, cache: MPHEntityResourceCache, renderCache: GfxRenderCache, spec: MPHEntityModelSpec, options: MPHRendererOptions | ((animation: MPHAnimation | null) => MPHRendererOptions)): MPHRenderer {
+function createEntityModelRenderer(device: GfxDevice, cache: MPHEntityResourceCache, renderCache: GfxRenderCache, spec: MPHEntityModelSpec, options: MPHRendererOptions | ((animation: MPHAnimation | null, additionalAnimations: readonly MPHAnimation[]) => MPHRendererOptions)): MPHRenderer {
     const modelFile = assertExists(cache.getFileData(`models/${spec.modelFilename}`));
     let shared: MPHSharedTexture | null = null;
     if (spec.sharedTextureFilename !== undefined) {
@@ -820,11 +829,12 @@ function createEntityModelRenderer(device: GfxDevice, cache: MPHEntityResourceCa
         const texCoordAnimation = parseMPHAnimation(animationFile, spec.texCoordAnimationId).texCoord;
         animation = { node: animation?.node ?? null, material: animation?.material ?? null, texCoord: texCoordAnimation };
     }
-    const rendererOptions: MPHRendererOptions = { ...(typeof options === 'function' ? options(animation) : options) };
-    if (animationFile !== null && spec.additionalAnimationIds !== undefined) {
-        rendererOptions.additionalNodeAnimations = spec.additionalAnimationIds.map((animationId) =>
-            assertExists(parseMPHAnimation(animationFile, animationId, model.nodes.length).node));
-    }
+    const additionalAnimations = animationFile !== null && spec.additionalAnimationIds !== undefined ?
+        spec.additionalAnimationIds.map((animationId) =>
+            parseMPHAnimation(animationFile, animationId, model.nodes.length)) : [];
+    const rendererOptions: MPHRendererOptions = { ...(typeof options === 'function' ? options(animation, additionalAnimations) : options) };
+    if (additionalAnimations.length > 0 && rendererOptions.additionalNodeAnimations === undefined)
+        rendererOptions.additionalNodeAnimations = additionalAnimations.map((animation) => animation.node);
     if (animationFile !== null && spec.additionalMaterialAnimationIds !== undefined) {
         rendererOptions.additionalMaterialAnimations = spec.additionalMaterialAnimationIds.map((animationId) =>
             assertExists(parseMPHAnimation(animationFile, animationId).material));
@@ -919,6 +929,60 @@ function setPlatformKey(dstPosition: vec3, dstRotation: quat, platform: MPHPlatf
     quat.copy(dstRotation, platform.rotations[index]);
 }
 
+function getPlatformActivationDelayMilliseconds(platform: MPHPlatformEntity): number {
+    if (platform.active)
+        return 0;
+    const phaseFrames = (platform.entityId * 17 % 31) * 0.2 * 30;
+    return (4 * 30 + phaseFrames) * 1000 / 30;
+}
+
+interface MPHPlatformAnimationSample {
+    index: number;
+    timeInAnimation: number;
+}
+
+function samplePlatformAnimation(platform: MPHPlatformEntity, metadata: MPHPlatformMetadata, spec: MPHEntityModelSpec,
+    primaryAnimation: MPHAnimation | null, additionalAnimations: readonly MPHAnimation[], timeInMilliseconds: number): MPHPlatformAnimationSample {
+    const animationIds = metadata.animationIds;
+    if (spec.additionalAnimationIds === undefined || spec.animationId === undefined)
+        return { index: 0, timeInAnimation: timeInMilliseconds };
+
+    const getAnimationIndex = (animationId: number): number => {
+        if (animationId === spec.animationId)
+            return 0;
+        const index = assertExists(spec.additionalAnimationIds).indexOf(animationId);
+        assert(index >= 0);
+        return 1 + index;
+    };
+    const getAnimationDuration = (index: number): number => {
+        const frameCount = index === 0 ? primaryAnimation?.node?.frameCount :
+            additionalAnimations[index - 1]?.node?.frameCount ??
+            additionalAnimations[index - 1]?.material?.frameCount;
+        return Math.max(0, (frameCount ?? 1) - 1) * 1000 / 30;
+    };
+
+    const elapsed = timeInMilliseconds - getPlatformActivationDelayMilliseconds(platform);
+    if (elapsed < 0) {
+        const inactiveAnimationId = animationIds[0];
+        return inactiveAnimationId < 0 ?
+            { index: 0, timeInAnimation: 0 } :
+            { index: getAnimationIndex(inactiveAnimationId), timeInAnimation: timeInMilliseconds };
+    }
+
+    // SetPlatformActiveAnimation @ 0x0216F208 selects the +0x10 activation
+    // clip as a one-shot. UpdatePlatformEntity @ 0x0216C4E8 replaces it with
+    // the queued +0x14 active clip only after the animation reports completion.
+    const activateAnimationId = animationIds[1];
+    if (!platform.active && activateAnimationId >= 0) {
+        const activateIndex = getAnimationIndex(activateAnimationId);
+        const activateDuration = getAnimationDuration(activateIndex);
+        if (elapsed < activateDuration)
+            return { index: activateIndex, timeInAnimation: elapsed };
+        return { index: getAnimationIndex(animationIds[2]), timeInAnimation: elapsed - activateDuration };
+    }
+    return { index: getAnimationIndex(animationIds[2]), timeInAnimation: elapsed };
+}
+
 function samplePlatformPath(dstPosition: vec3, dstRotation: quat, platform: MPHPlatformEntity, timeInMilliseconds: number): void {
     if (platform.positions.length === 0) {
         vec3.copy(dstPosition, platform.position);
@@ -937,8 +1001,7 @@ function samplePlatformPath(dstPosition: vec3, dstRotation: quat, platform: MPHP
     // movement state 0 until ActivatePlatformMovement @ 0x0216EF40 is called.
     // The passive viewer supplies that absent gameplay message after a
     // deterministic per-entity dwell.
-    const inactiveActivationDelayFrames = platform.active ? 0 :
-        4 * 30 + (platform.entityId * 17 % 31) * 0.2 * 30;
+    const inactiveActivationDelayFrames = getPlatformActivationDelayMilliseconds(platform) * 30 / 1000;
     const activeFrameTime = frameTime - inactiveActivationDelayFrames;
     if (activeFrameTime < 0) {
         setPlatformKey(dstPosition, dstRotation, platform, 0);
@@ -1203,15 +1266,29 @@ export class MPHEntityFile {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
                 continue;
-            const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, baseOptions);
+            const platform_ = this.metadata.platforms[platform.modelId];
+            const platformRenderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation, additionalAnimations) => {
+                const hasStateAnimations = spec.additionalAnimationIds !== undefined;
+                return {
+                    ...baseOptions,
+                    selectNodeAnimation: hasStateAnimations ?
+                        (time) => samplePlatformAnimation(platform, platform_, spec, animation, additionalAnimations, time).index : undefined,
+                    additionalMaterialAnimations: hasStateAnimations ?
+                        additionalAnimations.map((animation) => animation.material) : undefined,
+                    selectMaterialAnimation: hasStateAnimations ?
+                        (time) => samplePlatformAnimation(platform, platform_, spec, animation, additionalAnimations, time).index : undefined,
+                    mapAnimationTime: hasStateAnimations ?
+                        (time) => samplePlatformAnimation(platform, platform_, spec, animation, additionalAnimations, time).timeInAnimation : undefined,
+                };
+            });
             if (platform.positions.length > 1)
-                this.movers.push((time) => calcPlatformModelMatrix(renderer.modelMatrix, platform, time, renderer.modelScale));
+                this.movers.push((time) => calcPlatformModelMatrix(platformRenderer.modelMatrix, platform, time, platformRenderer.modelScale));
             else
-                setupPlatformModelMatrix(renderer.modelMatrix, platform, renderer.modelScale);
-            renderers.push(renderer);
+                setupPlatformModelMatrix(platformRenderer.modelMatrix, platform, platformRenderer.modelScale);
+            renderers.push(platformRenderer);
             if (platform.modelId === 23 || platform.modelId === 44) {
                 for (const nodeName of ['R_Turret', 'R_Turret1', 'R_Turret2', 'R_Turret3'])
-                    renderers.push(...createSamusShipExhaustRenderers(device, this.cache, renderCache, renderer, nodeName, baseOptions, this.movers));
+                    renderers.push(...createSamusShipExhaustRenderers(device, this.cache, renderCache, platformRenderer, nodeName, baseOptions, this.movers));
             }
         }
         for (const object of this.entities.objects) {
