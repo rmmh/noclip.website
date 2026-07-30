@@ -733,7 +733,15 @@ const itemSpawnBaseModelSpec: MPHEntityModelSpec = {
 };
 
 function getArtifactModelSpec(artifact: MPHArtifactEntity): MPHEntityModelSpec {
-    assert(artifact.artifactId < 8);
+    // CreateArtifactPickupEntity @ 0x0212D908 uses the eight numbered
+    // Artifact models for IDs 0..7 and the Octolith model for later IDs.
+    if (artifact.artifactId >= 8) {
+        return {
+            modelFilename: 'Octolith_Model.bin',
+            animationFilename: 'Octolith_Anim.bin',
+            animationId: 0,
+        };
+    }
     const modelNumber = String(artifact.artifactId + 1).padStart(2, '0');
     return {
         modelFilename: `Artifact${modelNumber}_mdl_Model.bin`,
@@ -1349,10 +1357,13 @@ function calcEnemyModelMatrix(dst: mat4, enemy: MPHEnemySpawnEntity, simulation:
 }
 
 const ARTIFACT_MODEL_OFFSET = (0x1800 - 1843) / 0x1000;
+const OCTOLITH_MODEL_OFFSET = 0x1C00 / 0x1000;
 
 function calcArtifactModelMatrix(dst: mat4, artifact: MPHArtifactEntity, modelScale: number): void {
     const position = vec3.clone(artifact.position);
-    position[1] += ARTIFACT_MODEL_OFFSET;
+    // CreateArtifactPickupEntity @ 0x0212D908 adds the numbered model's
+    // authored root height, while Octoliths receive a fixed 0x1C00 lift.
+    position[1] += artifact.artifactId < 8 ? ARTIFACT_MODEL_OFFSET : OCTOLITH_MODEL_OFFSET;
     calcOrientedModelMatrix(dst, position, artifact.facing, artifact.up, modelScale);
 }
 
@@ -1552,10 +1563,12 @@ interface MPHDoorStatePlan extends MPHEnemyActivationPlan {
 const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
 const EVENT_FLAG_PREVIEW_DWELL_MS = 4000;
 const FORCE_FIELD_FADE_DURATION_MS = 31 * 1000 / 30;
+const ARTIFACT_DEACTIVATION_DURATION_MS = 2 * 1000 / 30;
 
 interface MPHEntityActivationPlans {
     enemies: Map<number, MPHEnemyActivationPlan[]>;
     items: Map<number, MPHEnemyActivationPlan[]>;
+    artifacts: Map<number, MPHForceFieldTransitionPlan[]>;
     forceFields: Map<number, MPHForceFieldTransitionPlan[]>;
     objects: Map<number, MPHObjectStatePlan[]>;
     platforms: Map<number, MPHPlatformStatePlan[]>;
@@ -1619,6 +1632,7 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
     const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
     const enemyById = new Map(entities.enemySpawns.map((enemy) => [enemy.entityId, enemy]));
     const itemById = new Map(entities.itemSpawns.map((item) => [item.entityId, item]));
+    const artifactById = new Map(entities.artifacts.map((artifact) => [artifact.entityId, artifact]));
     const forceFieldById = new Map(entities.forceFields.map((forceField) => [forceField.entityId, forceField]));
     const objectById = new Map(entities.objects.map((object) => [object.entityId, object]));
     const platformById = new Map(entities.platforms.map((platform) => [platform.entityId, platform]));
@@ -1627,6 +1641,7 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
     const result: MPHEntityActivationPlans = {
         enemies: new Map(),
         items: new Map(),
+        artifacts: new Map(),
         forceFields: new Map(),
         objects: new Map(),
         platforms: new Map(),
@@ -1684,6 +1699,14 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
             // messages as the EnemySpawn controller.
             if (item !== undefined && isEnemySpawnActivationMessage(event.message, event.messageParam)) {
                 addEntityActivationPlan(result.items, item.entityId, rootVolume, event.waveDepth);
+                continue;
+            }
+            const artifact = artifactById.get(event.targetId);
+            if (artifact !== undefined && (event.message === 0x12 || event.message === 5)) {
+                // HandleArtifactPickupMessage @ 0x0212E4B4. Deactivation
+                // spends two 30 Hz updates in its removal countdown.
+                addForceFieldTransitionPlan(result.artifacts, artifact.entityId,
+                    rootVolume, event.waveDepth, event.message === 0x12 || event.messageParam !== 0);
                 continue;
             }
             const forceField = forceFieldById.get(event.targetId);
@@ -1890,8 +1913,6 @@ export class MPHEntityFile {
                 requestEntityModel(this.cache, enemySpawnerModelSpec);
         }
         for (const artifact of this.entities.artifacts) {
-            if (!artifact.active)
-                continue;
             requestEntityModel(this.cache, getArtifactModelSpec(artifact));
         }
         for (const jumpPad of this.entities.jumpPads) {
@@ -2547,8 +2568,6 @@ export class MPHEntityFile {
             }
         }
         for (const artifact of this.entities.artifacts) {
-            if (!artifact.active)
-                continue;
             const colors: [vec3, vec3] = [vec3.clone(lighting.colors[0]), vec3.clone(lighting.colors[1])];
             const directions: [vec3, vec3] = [vec3.clone(lighting.directions[0]), vec3.clone(lighting.directions[1])];
             for (const light of this.entities.lightSources) {
@@ -2563,12 +2582,40 @@ export class MPHEntityFile {
                     vec3.negate(directions[1], light.light1Direction);
                 }
             }
+            const statePlans = entityActivationPlans.artifacts.get(artifact.entityId) ?? [];
+            const rootActivationTimes = new Map<number, number>();
+            const cameraRoomPosition = vec3.create();
+            let sceneStartTime: number | null = null;
+            const updateArtifactState: NonNullable<MPHRendererOptions['isVisibleAtTime']> = (time, viewerInput) => {
+                if (sceneStartTime === null)
+                    sceneStartTime = time;
+                const cameraMatrix = viewerInput.camera.worldMatrix;
+                vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                if (inverseSceneTransform !== null)
+                    vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+
+                let active = artifact.active;
+                let latestTransitionTime = sceneStartTime;
+                for (const plan of statePlans) {
+                    const transitionTime = getPlannedActivationTime(
+                        [plan], time, sceneStartTime, cameraRoomPosition, rootActivationTimes);
+                    const effectiveTransitionTime = transitionTime === null ? null :
+                        transitionTime + (plan.active ? 0 : ARTIFACT_DEACTIVATION_DURATION_MS);
+                    if (effectiveTransitionTime !== null && time >= effectiveTransitionTime &&
+                        effectiveTransitionTime >= latestTransitionTime) {
+                        active = plan.active;
+                        latestTransitionTime = effectiveTransitionTime;
+                    }
+                }
+                return active;
+            };
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getArtifactModelSpec(artifact), (animation) => {
                 const duration = getAnimationLoopDuration(animation);
                 return {
                     ...baseOptions,
                     lighting: { colors, directions },
                     mapAnimationTime: (time) => time % duration,
+                    isVisibleAtTime: updateArtifactState,
                 };
             });
             calcArtifactModelMatrix(renderer.modelMatrix, artifact, renderer.modelScale);
