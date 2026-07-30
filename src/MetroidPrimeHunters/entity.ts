@@ -1499,6 +1499,7 @@ interface MPHPlatformStatePlan extends MPHEnemyActivationPlan {
 }
 
 const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
+const EVENT_FLAG_PREVIEW_DWELL_MS = 4000;
 const FORCE_FIELD_FADE_DURATION_MS = 31 * 1000 / 30;
 
 interface MPHEntityActivationPlans {
@@ -1690,8 +1691,10 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
 
     for (const trigger of entities.triggerVolumes) {
         // UpdateTriggerVolumeEntity @ 0x0210AA84 performs player-volume
-        // intersection only for active mode-0 triggers.
-        if (trigger.mode !== 0 || trigger.initialState === 0)
+        // intersection for mode 0, timed dispatch for mode 3, and one-shot
+        // event-flag dispatch for mode 4.
+        if ((trigger.mode !== 0 && trigger.mode !== 3 && trigger.mode !== 4) ||
+            trigger.initialState === 0)
             continue;
         const events: MessageEvent[] = [];
         for (let i = 0; i < trigger.targetEntityIds.length; i++) {
@@ -1721,9 +1724,21 @@ function getPlannedActivationTime(plans: readonly MPHEnemyActivationPlan[], time
         let rootActivationTime = sceneStartTime;
         if (plan.rootVolume !== null) {
             rootActivationTime = rootActivationTimes.get(plan.rootVolume.entityId) ?? -1;
-            if (rootActivationTime < 0 && pointInsideVolume(plan.rootVolume.volume, cameraRoomPosition)) {
+            if (rootActivationTime < 0 && plan.rootVolume.mode === 0 &&
+                pointInsideVolume(plan.rootVolume.volume, cameraRoomPosition)) {
                 rootActivationTime = time;
                 rootActivationTimes.set(plan.rootVolume.entityId, time);
+            } else if (rootActivationTime < 0 && plan.rootVolume.mode === 3) {
+                // DispatchTriggerVolumeMessages @ 0x0210AD58 counts the
+                // authored cooldown down once per 30 Hz update.
+                rootActivationTime = sceneStartTime + plan.rootVolume.cooldown * 1000 / 30;
+                rootActivationTimes.set(plan.rootVolume.entityId, rootActivationTime);
+            } else if (rootActivationTime < 0 && plan.rootVolume.mode === 4) {
+                // Mode 4 waits for an external story/event bit. The passive
+                // viewer has no save-game event state, so preview it after a
+                // named dwell while preserving the authored downstream graph.
+                rootActivationTime = sceneStartTime + EVENT_FLAG_PREVIEW_DWELL_MS;
+                rootActivationTimes.set(plan.rootVolume.entityId, rootActivationTime);
             }
         }
         if (rootActivationTime < 0)
