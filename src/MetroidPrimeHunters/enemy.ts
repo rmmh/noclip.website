@@ -37,6 +37,7 @@ export interface MPHEnemySpawnEntity extends MPHEnemySpawnEntry {
     guardBotRoamingCenter: vec3 | null;
     guardBotRoamingRadius: number;
     guardBotConfigId: number;
+    alimbicTurretConfigId: number;
 }
 
 export class MPHGameplayRandom {
@@ -271,6 +272,7 @@ export function parseEnemySpawn(entry: MPHEnemySpawnEntry, view: DataView, rando
         guardBotRoamingCenter,
         guardBotRoamingRadius,
         guardBotConfigId,
+        alimbicTurretConfigId: enemyType === 0x12 ? Math.min(view.getUint32(offs + 0x2C, true), 2) : 0,
     };
 }
 
@@ -680,7 +682,20 @@ function sampleReflectedRange(min: number, max: number, initial: number, step: n
     return min + phase;
 }
 
-export function sampleAlimbicTurretScan(timeInMilliseconds: number): { yaw: number, pitch: number } {
+interface MPHAlimbicTurretConfig {
+    fireIntervalTicks: number;
+    trackingDelayTicks: number;
+    minBurstShots: number;
+    maxBurstShots: number;
+}
+
+const alimbicTurretConfigs: readonly MPHAlimbicTurretConfig[] = [
+    { fireIntervalTicks: 5, trackingDelayTicks: 40, minBurstShots: 1, maxBurstShots: 2 },
+    { fireIntervalTicks: 3, trackingDelayTicks: 30, minBurstShots: 3, maxBurstShots: 5 },
+    { fireIntervalTicks: 3, trackingDelayTicks: 90, minBurstShots: 1, maxBurstShots: 1 },
+];
+
+function sampleAlimbicTurretScan(timeInMilliseconds: number): { yaw: number, pitch: number } {
     const ticks = Math.max(0, timeInMilliseconds * 30 / 1000);
     // InitializeAlimbicTurret @ 0x0211EF44 uses parameter table
     // 0x02122D64: yaw -45..45 degrees and pitch 0..60 degrees, with both
@@ -688,6 +703,48 @@ export function sampleAlimbicTurretScan(timeInMilliseconds: number): { yaw: numb
     return {
         yaw: sampleReflectedRange(-45, 45, 0, 1, ticks) * Math.PI / 180,
         pitch: sampleReflectedRange(0, 60, 0, 1, ticks) * Math.PI / 180,
+    };
+}
+
+export function sampleAlimbicTurretAim(timeInMilliseconds: number, enemy: MPHEnemySpawnEntity): { yaw: number, pitch: number, state: number } {
+    const config = alimbicTurretConfigs[enemy.alimbicTurretConfigId];
+    const burstShots = config.minBurstShots +
+        (enemy.entityId * 13 & 0x7FFFFFFF) % (config.maxBurstShots - config.minBurstShots + 1);
+    // The original target-dependent trigger is supplied periodically by the
+    // passive viewer. State order comes from the table at 0x02122CC4:
+    // ProcessAlimbicTurretScanState @ 0x0211F51C,
+    // ProcessAlimbicTurretAimingState @ 0x0211F4F8,
+    // ProcessAlimbicTurretTrackingState @ 0x0211F498,
+    // ProcessAlimbicTurretFiringState @ 0x0211F2D0, and
+    // ProcessAlimbicTurretRecenterState @ 0x0211F2AC.
+    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
+        { id: 0, durationTicks: 240, animationIndex: 0 },
+        { id: 1, durationTicks: 30, animationIndex: 0 },
+        { id: 2, durationTicks: config.trackingDelayTicks, animationIndex: 0 },
+        { id: 3, durationTicks: burstShots * config.fireIntervalTicks, animationIndex: 0 },
+        { id: 4, durationTicks: 30, animationIndex: 0 },
+    ]);
+    const targetYaw = ((enemy.entityId & 1) === 0 ? 25 : -25) * Math.PI / 180;
+    const targetPitch = 25 * Math.PI / 180;
+    if (sample.state.id === 0) {
+        const scan = sampleAlimbicTurretScan(sample.timeInStateTicks * 1000 / 30);
+        return { ...scan, state: 0 };
+    }
+    const t = smoothstep(0, 1, sample.timeInStateTicks / sample.state.durationTicks);
+    if (sample.state.id === 1) {
+        const scanExit = sampleAlimbicTurretScan(240 * 1000 / 30);
+        return {
+            yaw: scanExit.yaw + (targetYaw - scanExit.yaw) * t,
+            pitch: scanExit.pitch + (targetPitch - scanExit.pitch) * t,
+            state: 1,
+        };
+    }
+    if (sample.state.id === 4)
+        return { yaw: targetYaw * (1 - t), pitch: targetPitch * (1 - t), state: 4 };
+    return {
+        yaw: targetYaw + Math.sin(sample.timeInStateTicks * Math.PI / 30) * 2 * Math.PI / 180,
+        pitch: targetPitch,
+        state: sample.state.id,
     };
 }
 

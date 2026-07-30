@@ -7,7 +7,7 @@ import { fx32, TEX0 } from '../nns_g3d/NNS_G3D.js';
 import { MPHAnimation, parseMPHAnimation } from './mph_anim.js';
 import { fxAngle, MPHbin, parseMPH_Model, parseTEX0Texture } from './mph_binModel.js';
 import { MPHFogConfig, MPHLighting, MPHRenderer, MPHRendererOptions, MPHSceneMode } from './render.js';
-import { ENTITY_TYPE_ENEMY_SPAWN, getEnemyAnimationPhaseMilliseconds, getEnemyModelSpecs, isWaspEnemy, MPHEnemySpawnEntity, parseEnemySpawn, sampleEnemyPose, MPHGameplayRandom, SurfaceCrawlerSimulation, sampleBlastcapAnimation, sampleMochtroidType03Animation, MPHEnemySimulation, sampleMochtroidType06Animation, samplePsychoBitAnimation, sampleSphinkTickAnimation, sampleAlimbicTurretScan, sampleDripStankAnimation, sampleGuardBot1Animation, GuardBotSimulation, sampleGuardBot2Animation, sampleAlimbicStatueAnimation, sampleLavaDemonAnimation, sampleBigEyeTurretAnimation, sampleBigEyeBossAnimation, sampleCylinderBossEyeAnimation, sampleShriekbatAnimation, MochtroidRoamingSimulation, sampleMochtroidType05Animation, sampleMochtroidType04Animation, sampleWarWaspAnimation, sampleGorea2Animation, sampleGorea1AAnimation, sampleBarbedWarWaspAnimation, sampleGeemerAnimation, sampleCylinderBossAnimation } from './enemy.js';
+import { ENTITY_TYPE_ENEMY_SPAWN, getEnemyAnimationPhaseMilliseconds, getEnemyModelSpecs, isWaspEnemy, MPHEnemySpawnEntity, parseEnemySpawn, sampleEnemyPose, MPHGameplayRandom, SurfaceCrawlerSimulation, sampleBlastcapAnimation, sampleMochtroidType03Animation, MPHEnemySimulation, sampleMochtroidType06Animation, samplePsychoBitAnimation, sampleSphinkTickAnimation, sampleDripStankAnimation, sampleGuardBot1Animation, GuardBotSimulation, sampleGuardBot2Animation, sampleAlimbicStatueAnimation, sampleLavaDemonAnimation, sampleBigEyeTurretAnimation, sampleBigEyeBossAnimation, sampleCylinderBossEyeAnimation, sampleShriekbatAnimation, MochtroidRoamingSimulation, sampleMochtroidType05Animation, sampleMochtroidType04Animation, sampleWarWaspAnimation, sampleGorea2Animation, sampleGorea1AAnimation, sampleBarbedWarWaspAnimation, sampleGeemerAnimation, sampleCylinderBossAnimation, sampleAlimbicTurretAim } from './enemy.js';
 import { MPHCollisionData } from './mph_collision.js';
 
 const ENTITY_HEADER_SIZE = 0x24;
@@ -1372,7 +1372,7 @@ export class MPHEntityFile {
                             (dst, nodeName, time) => {
                                 if (nodeName !== 'Door_Rot')
                                     return;
-                                const scan = sampleAlimbicTurretScan(getPreviewTime(time));
+                                const scan = sampleAlimbicTurretAim(getPreviewTime(time), enemy);
                                 mat4.rotateY(dst, dst, scan.yaw);
                                 mat4.rotateX(dst, dst, scan.pitch);
                             } : undefined,
