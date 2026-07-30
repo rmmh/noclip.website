@@ -1305,8 +1305,13 @@ function setupPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, modelS
 }
 
 function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInMilliseconds: number,
-        modelScale: number, activeFrameTimeOverride: number | null = null): void {
-    samplePlatformPath(scratchPosition, scratchRotation, platform, timeInMilliseconds, activeFrameTimeOverride);
+        modelScale: number, activeFrameTimeOverride: number | null = null, pathPointOverride: number | null = null): void {
+    if (pathPointOverride !== null) {
+        vec3.copy(scratchPosition, assertExists(platform.positions[pathPointOverride]));
+        quat.copy(scratchRotation, assertExists(platform.rotations[pathPointOverride]));
+    } else {
+        samplePlatformPath(scratchPosition, scratchRotation, platform, timeInMilliseconds, activeFrameTimeOverride);
+    }
     vec3.add(scratchPosition, scratchPosition, platform.positionOffset);
     vec3.set(scratchScale, modelScale, modelScale, modelScale);
     mat4.fromRotationTranslationScale(dst, scratchRotation, scratchPosition, scratchScale);
@@ -1535,8 +1540,9 @@ interface MPHObjectStatePlan extends MPHEnemyActivationPlan {
 }
 
 interface MPHPlatformStatePlan extends MPHEnemyActivationPlan {
-    animationActive: boolean;
+    animationActive: boolean | null;
     movementActive: boolean;
+    pathPoint?: number;
 }
 
 interface MPHDoorStatePlan extends MPHEnemyActivationPlan {
@@ -1587,14 +1593,15 @@ function addObjectStatePlan(plansByEntityId: Map<number, MPHObjectStatePlan[]>,
 
 function addPlatformStatePlan(plansByEntityId: Map<number, MPHPlatformStatePlan[]>,
         entityId: number, rootVolume: MPHTriggerVolumeEntity | null, waveDepth: number,
-        animationActive: boolean, movementActive: boolean): void {
+        animationActive: boolean | null, movementActive: boolean, pathPoint?: number): void {
     let plans = plansByEntityId.get(entityId);
     if (plans === undefined)
         plansByEntityId.set(entityId, plans = []);
     if (!plans.some((plan) =>
         plan.rootVolume === rootVolume && plan.waveDepth === waveDepth &&
-        plan.animationActive === animationActive && plan.movementActive === movementActive))
-        plans.push({ rootVolume, waveDepth, animationActive, movementActive });
+        plan.animationActive === animationActive && plan.movementActive === movementActive &&
+        plan.pathPoint === pathPoint))
+        plans.push({ rootVolume, waveDepth, animationActive, movementActive, pathPoint });
 }
 
 function addDoorStatePlan(plansByEntityId: Map<number, MPHDoorStatePlan[]>,
@@ -1706,6 +1713,10 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
                 else if (event.message === 0x2D)
                     addPlatformStatePlan(result.platforms, platform.entityId,
                         rootVolume, event.waveDepth, false, false);
+                else if (event.message === 0x35 && event.messageParam >= 1 &&
+                    event.messageParam <= platform.positions.length)
+                    addPlatformStatePlan(result.platforms, platform.entityId,
+                        rootVolume, event.waveDepth, null, false, event.messageParam - 1);
                 else
                     continue;
                 continue;
@@ -1912,12 +1923,15 @@ export class MPHEntityFile {
             const platform_ = assertExists(this.metadata.platforms[platform.modelId]);
             const statePlans = entityActivationPlans.platforms.get(platform.entityId) ?? [];
             let activeFrameTimeOverride: number | null = null;
+            let pathPointOverride: number | null = null;
             let playbackState: MPHPlatformPlaybackState | null = null;
             const platformRenderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation, additionalAnimations) => {
                 const hasStateAnimations = spec.additionalAnimationIds !== undefined;
                 const rootActivationTimes = new Map<number, number>();
                 const cameraRoomPosition = vec3.create();
                 let sceneStartTime: number | null = null;
+                let activeFrameTimeOverride: number | null = null;
+                let playbackState: MPHPlatformPlaybackState | null = null;
                 let platformVisible = true;
                 const animations = [animation, ...additionalAnimations];
                 const animationIds = [spec.animationId, ...(spec.additionalAnimationIds ?? [])];
@@ -1958,9 +1972,15 @@ export class MPHEntityFile {
                                 movementElapsed += event.time - movementStartTime;
                             movementStartTime = event.time;
                             movementActive = event.plan.movementActive;
-                            previousAnimationActive = animationActive;
-                            animationActive = event.plan.animationActive;
-                            animationTransitionTime = event.time;
+                            if (event.plan.movementActive)
+                                pathPointOverride = null;
+                            if (event.plan.pathPoint !== undefined)
+                                pathPointOverride = event.plan.pathPoint;
+                            if (event.plan.animationActive !== null) {
+                                previousAnimationActive = animationActive;
+                                animationActive = event.plan.animationActive;
+                                animationTransitionTime = event.time;
+                            }
                         }
                         if (movementActive)
                             movementElapsed += time - movementStartTime;
@@ -2008,8 +2028,8 @@ export class MPHEntityFile {
                 };
             });
             if (platform.positions.length > 1)
-                this.movers.push((time) => calcPlatformModelMatrix(
-                    platformRenderer.modelMatrix, platform, time, platformRenderer.modelScale, activeFrameTimeOverride));
+                this.movers.push((time) => calcPlatformModelMatrix(platformRenderer.modelMatrix, platform, time,
+                    platformRenderer.modelScale, activeFrameTimeOverride, pathPointOverride));
             else
                 setupPlatformModelMatrix(platformRenderer.modelMatrix, platform, platformRenderer.modelScale);
             renderers.push(platformRenderer);
