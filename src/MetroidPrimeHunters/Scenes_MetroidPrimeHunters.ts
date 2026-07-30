@@ -7,15 +7,16 @@ import * as ARC from './mph_arc.js';
 import * as UI from '../ui.js';
 import { parseMPH_Model, parseTEX0Texture } from './mph_binModel.js';
 import { parseMPHAnimation } from './mph_anim.js';
-import { findAreaMetadata, MPHMetadata, sceneIdToModelStem } from './area_metadata.js';
+import { findAreaMetadata, MPHAreaMetadata, MPHMetadata, sceneIdToModelStem } from './area_metadata.js';
 import { MPHEntityFile, parseMPHEntities } from './entity.js';
 import { parseMPHCollision } from './mph_collision.js';
+import { findExteriorNodes, MPHStitchedExteriorRoom, MPHStitchController, StitchedSceneDesc } from './stitch.js';
 
 import { DataFetcher } from '../DataFetcher.js';
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
 import { GfxDevice } from '../gfx/platform/GfxPlatform.js';
-import { MPHFogConfig, MPHLighting, MPHRenderer, MPHSceneMode } from './render.js';
-import { assertExists } from '../util.js';
+import { MPHFogConfig, MPHLighting, MPHRenderer, MPHRendererOptions, MPHSceneMode } from './render.js';
+import { assert, assertExists } from '../util.js';
 import { makeBackbufferDescSimple, opaqueBlackFullClearRenderPassDescriptor } from '../gfx/helpers/RenderGraphHelpers.js';
 import { FakeTextureHolder } from '../TextureHolder.js';
 import { SceneContext } from '../SceneBase.js';
@@ -25,10 +26,11 @@ import { GfxRenderHelper } from '../gfx/render/GfxRenderHelper.js';
 import { GfxRenderCache } from '../gfx/render/GfxRenderCache.js';
 import { GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
 import { colorNewFromRGBA } from '../Color.js';
+import { mat4, vec3 } from 'gl-matrix';
 
 const pathBase = `MetroidPrimeHunters`;
 
-class ModelCache {
+export class ModelCache {
     private filePromiseCache = new Map<string, Promise<ArrayBufferSlice>>();
     private arcPromiseCache = new Map<string, Promise<void>>();
     private fileDataCache = new Map<string, ArrayBufferSlice>();
@@ -90,12 +92,20 @@ export class MPHSceneRenderer implements Viewer.SceneGfx {
     private renderHelper: GfxRenderHelper;
     private renderInstListMain = new GfxRenderInstList();
 
-    public stageRenderer: MPHRenderer;
+    public stageRenderers: MPHRenderer[] = [];
     public objectRenderers: MPHRenderer[] = [];
-    public entities: MPHEntityFile | null = null;
+    public entities: MPHEntityFile[] = [];
+    public stitch = new MPHStitchController();
+    public modelCache: ModelCache;
+    public metadata!: MPHMetadata;
 
-    constructor(device: GfxDevice) {
+    constructor(device: GfxDevice, dataFetcher: DataFetcher) {
         this.renderHelper = new GfxRenderHelper(device);
+        this.modelCache = new ModelCache(dataFetcher);
+    }
+
+    public async fetchMetadata(): Promise<void> {
+        this.metadata = await this.modelCache.fetchJSON<MPHMetadata>('metadata.json');
     }
 
     public getCache(): GfxRenderCache {
@@ -113,8 +123,7 @@ export class MPHSceneRenderer implements Viewer.SceneGfx {
 
         const fog = new UI.Checkbox('Area Fog', true);
         fog.onchanged = () => {
-            this.stageRenderer.setFogEnabled(fog.checked);
-            for (const renderer of this.objectRenderers)
+            for (const renderer of [...this.stageRenderers, ...this.objectRenderers])
                 renderer.setFogEnabled(fog.checked);
         };
         panel.contents.appendChild(fog.elem);
@@ -127,8 +136,11 @@ export class MPHSceneRenderer implements Viewer.SceneGfx {
         this.renderHelper.pushTemplateRenderInst();
         const renderInstManager = this.renderHelper.renderInstManager;
         renderInstManager.setCurrentList(this.renderInstListMain);
-        this.stageRenderer.prepareToRender(renderInstManager, viewerInput);
-        this.entities?.update(viewerInput.time);
+        this.stitch.prepareToRender(viewerInput);
+        for (const stageRenderer of this.stageRenderers)
+            stageRenderer.prepareToRender(renderInstManager, viewerInput);
+        for (const entities of this.entities)
+            entities.update(viewerInput.time);
         for (let i = 0; i < this.objectRenderers.length; i++)
             this.objectRenderers[i].prepareToRender(renderInstManager, viewerInput);
         renderInstManager.popTemplate();
@@ -165,7 +177,8 @@ export class MPHSceneRenderer implements Viewer.SceneGfx {
     public destroy(device: GfxDevice) {
         this.renderHelper.destroy();
 
-        this.stageRenderer.destroy(device);
+        for (const stageRenderer of this.stageRenderers)
+            stageRenderer.destroy(device);
         for (let i = 0; i < this.objectRenderers.length; i++)
             this.objectRenderers[i].destroy(device);
     }
@@ -181,24 +194,53 @@ const standaloneEntityFiles = new Map<string, string>([
     ['mp_fh_data/levels/models/testLevel_Model', 'testlevel_Ent.bin'],
 ]);
 
-class SceneDesc implements Viewer.SceneDesc {
-    constructor(public id: string, public name: string, public sceneMode: MPHSceneMode = { kind: 'singlePlayer', geometrySet: 1 }) {
+export interface MPHAddToSceneOptions {
+    sceneTransform: mat4;
+    splitExterior?: boolean;
+    renderEntities?: boolean;
+}
+
+export interface MPHAddedScene {
+    renderers: MPHRenderer[];
+    doorRenderers: Map<number, MPHRenderer>;
+    visibilityRoom: MPHStitchedExteriorRoom | null;
+}
+
+export class SceneDesc implements Viewer.SceneDesc {
+    constructor(
+        public id: string,
+        public name: string,
+        public sceneMode: MPHSceneMode = { kind: 'singlePlayer', geometrySet: 1 },
+        private areaOverride: MPHAreaMetadata | null = null,
+        public modelId: string = sceneIdToModelStem(id),
+        private archiveOverride: string | null = null,
+    ) {
     }
 
     public async createScene(device: GfxDevice, context: SceneContext): Promise<Viewer.SceneGfx> {
-        const dataFetcher = context.dataFetcher;
-        const modelCache = new ModelCache(dataFetcher);
-        const { areas, entities: entityMetadata, archiveTextures, modelArchives } = await modelCache.fetchJSON<MPHMetadata>('metadata.json');
-        const modelId = sceneIdToModelStem(this.id);
-        const area = this.id.startsWith('mp_fh_data/') ? null :
-            findAreaMetadata(areas, modelId, this.sceneMode.kind === 'multiplayer');
+        const renderer = new MPHSceneRenderer(device, context.dataFetcher);
+        await renderer.fetchMetadata();
+        await this.addToScene(device, renderer, { sceneTransform: mat4.create() });
+        return renderer;
+    }
+
+    public async addToScene(device: GfxDevice, renderer: MPHSceneRenderer, options: MPHAddToSceneOptions): Promise<MPHAddedScene> {
+        const { sceneTransform } = options;
+        const splitExterior = options.splitExterior ?? false;
+        const renderEntities = options.renderEntities ?? true;
+        const modelCache = renderer.modelCache;
+        const { areas, entities: entityMetadata, archiveTextures, modelArchives } = renderer.metadata;
+        const modelId = this.modelId;
+        const area = this.areaOverride ?? (this.id.startsWith('mp_fh_data/') ? null :
+            findAreaMetadata(areas, modelId, this.sceneMode.kind === 'multiplayer'));
         const sceneMode: MPHSceneMode = this.sceneMode.kind === 'singlePlayer' && area !== null ?
             { kind: 'singlePlayer', geometrySet: area.geometrySet ?? 1 } : this.sceneMode;
         const modelFilename = area?.modelFilename ?? `${modelId}.bin`;
-        const archiveName = modelArchives[modelFilename] ?? null;
+        const archiveName = this.archiveOverride ?? modelArchives[modelFilename.toLowerCase()] ?? null;
         const textureFilename = archiveName !== null ? archiveTextures[archiveName] ?? null : null;
         const animationFilename = area?.animationFilename ?? `${modelId.replace(/_model$/, '_anim')}.bin`;
-        const entityFilename = area?.entityFilename ?? standaloneEntityFiles.get(this.id) ?? null;
+        const entityFilename = renderEntities ?
+            area?.entityFilename ?? standaloneEntityFiles.get(this.id) ?? null : null;
 
         if (archiveName !== null) {
             modelCache.fetchMPHARC(`archives/${archiveName}.arc`);
@@ -215,13 +257,13 @@ class SceneDesc implements Viewer.SceneDesc {
         const stageBin = parseMPH_Model(assertExists(bin_Model));
         const entityLayerId = sceneMode.kind === 'multiplayer' && sceneMode.captureTheFlag === true ? 12 : 0;
         const entityFile = entityFilename !== null ? assertExists(modelCache.getFileData(`levels/entities/${entityFilename}`)) : null;
-        const entities = entityFile !== null ? new MPHEntityFile(parseMPHEntities(entityFile, entityLayerId), entityMetadata, modelCache, sceneMode) : null;
+        const entities = entityFile !== null ? new MPHEntityFile(
+            parseMPHEntities(entityFile, entityLayerId), entityMetadata, modelCache, sceneMode, assertExists(entityFilename)) : null;
         if (entities !== null) {
             entities.requestResources();
             await modelCache.waitForLoad();
         }
 
-        const renderer = new MPHSceneRenderer(device);
         const lighting: MPHLighting = area !== null ? {
             colors: [
                 [area.lightColor0[0] / 31, area.lightColor0[1] / 31, area.lightColor0[2] / 31],
@@ -259,17 +301,48 @@ class SceneDesc implements Viewer.SceneDesc {
         const animation = animationFile !== null ? parseMPHAnimation(animationFile) : null;
         const collisionFile = area !== null ? modelCache.getFileData(area.collisionFilename) : null;
         const collision = collisionFile !== null ? parseMPHCollision(collisionFile) : null;
-        renderer.stageRenderer = new MPHRenderer(device, renderer.getCache(), stageBin, stageBin.tex0 !== null ? stageBin.tex0 : assertExists(stageTex), animation, {
-            sceneMode,
-            fog,
-            collision,
+        const stageOptions: MPHRendererOptions = { sceneMode, fog, collision, sceneTransform };
+        const stageTexture = stageBin.tex0 !== null ? stageBin.tex0 : assertExists(stageTex);
+        const exteriorNodes = splitExterior ? findExteriorNodes(stageBin, collision) : null;
+        const stageRenderer = new MPHRenderer(device, renderer.getCache(), stageBin, stageTexture, animation, {
+            ...stageOptions,
+            nodeFilter: exteriorNodes !== null ? (name) => !exteriorNodes.has(name) : undefined,
         });
-        if (entities !== null) {
-            renderer.objectRenderers.push(...entities.createRenderers(device, renderer.getCache(), lighting, fog));
-            renderer.entities = entities;
+        renderer.stageRenderers.push(stageRenderer);
+        const addedRenderers = [stageRenderer];
+
+        // Backdrop geometry stays visible from neighbouring rooms, so it is split
+        // into its own renderer that the stitch controller can keep drawing.
+        let visibilityRoom: MPHStitchedExteriorRoom | null = null;
+        if (exteriorNodes !== null) {
+            const exteriorRenderer = new MPHRenderer(device, renderer.getCache(), stageBin, stageTexture, animation, {
+                ...stageOptions,
+                nodeFilter: (name) => exteriorNodes.has(name),
+            });
+            renderer.stageRenderers.push(exteriorRenderer);
+            addedRenderers.push(exteriorRenderer);
+            if (collision !== null) {
+                const inverseTransform = mat4.invert(mat4.create(), sceneTransform);
+                assert(inverseTransform !== null);
+                const center = vec3.create();
+                collision.bounds.centerPoint(center);
+                visibilityRoom = { active: true, inverseTransform, center, exteriorRenderer };
+                renderer.stitch.exteriorRooms.push(visibilityRoom);
+            }
         }
 
-        return renderer;
+        const entityRenderers = entities?.createRenderers(
+            device, renderer.getCache(), lighting, fog, sceneTransform, splitExterior) ?? null;
+        if (entities !== null && entityRenderers !== null) {
+            renderer.objectRenderers.push(...entityRenderers.renderers);
+            renderer.entities.push(entities);
+            addedRenderers.push(...entityRenderers.renderers);
+        }
+        return {
+            renderers: addedRenderers,
+            doorRenderers: entityRenderers?.doorRenderers ?? new Map(),
+            visibilityRoom,
+        };
     }
 }
 
@@ -278,6 +351,8 @@ const mp_ctf: MPHSceneMode = { kind: 'multiplayer', layout: 0, captureTheFlag: t
 
 const id = 'mph';
 const name = 'Metroid Prime: Hunters';
+const campaignAreas = (prefix: string) => (area: MPHAreaMetadata): boolean =>
+    area.name.toUpperCase().startsWith(prefix);
 const sceneDescs = [
     "Multiplayer",
     new SceneDesc("mp3_Model", "Combat Hall", mp),
@@ -307,6 +382,7 @@ const sceneDescs = [
     new SceneDesc("unit4_land_model_mp", "Arcterra Base", mp_ctf),
     new SceneDesc("gorea_b2_Model_mp", "Oubliette", mp),
     "Celestial Archives",
+    new StitchedSceneDesc("Celestial Archives (all)", "unit2_Land_Ent.bin", campaignAreas("UNIT2_")),
     new SceneDesc("unit2_Land_model", "Celestial Gateway"),
     new SceneDesc("unit2_c0_model", "Helm Room"),
     new SceneDesc("unit2_c1_model", "Meditation Room"),
@@ -321,6 +397,7 @@ const sceneDescs = [
     new SceneDesc("unit2_cx_model", "1_CX"),
     new SceneDesc("unit2_cz_model", "1_CZ"),
     "Alinos",
+    new StitchedSceneDesc("Alinos (all)", "Unit1_Land_Ent.bin", campaignAreas("UNIT1_")),
     new SceneDesc("unit1_land_model", "Alinos Gateway"),
     new SceneDesc("unit1_c0_model", "Echo Hall"),
     new SceneDesc("unit1_RM1_model", "High Ground"),
@@ -339,6 +416,7 @@ const sceneDescs = [
     new SceneDesc("unit1_morph_cz_model", "1_morphCZ"),
     new SceneDesc("unit1_rm1_cx_model", "1_RM_CX"),
     "Vesper Defense Outpost",
+    new StitchedSceneDesc("Vesper Defense Outpost (all)", "unit3_Land_Ent.bin", campaignAreas("UNIT3_")),
     new SceneDesc("unit3_land_model", "VDO Gateway"),
     new SceneDesc("unit3_c0_model", "Bioweaponry Lab"),
     new SceneDesc("unit3_rm1_model", "Weapons Complex"),
@@ -350,6 +428,7 @@ const sceneDescs = [
     new SceneDesc("unit3_cz_model", "3_CZ"),
     new SceneDesc("unit3_morph_cz_model", "3_morphCZ"),
     "Arcterra",
+    new StitchedSceneDesc("Arcterra (all)", "unit4_Land_Ent.bin", campaignAreas("UNIT4_")),
     new SceneDesc("unit4_land_model", "Arcterra Gateway"),
     new SceneDesc("unit4_rm1_model", "Ice Hive"),
     new SceneDesc("unit4_c0_model", "Frost Labyrinth"),
@@ -359,12 +438,14 @@ const sceneDescs = [
     new SceneDesc("unit4_cx_model", "4_CX"),
     new SceneDesc("unit4_cz_model", "4_CZ"),
     "Stronghold Void",
+    new StitchedSceneDesc("Stronghold Void (all)", "Unit1_TP1_Ent.bin", (area) => campaignAreas("UNIT1_")(area) && /_(?:TP|B)\d$/i.test(area.name)),
     new SceneDesc("TeleportRoom_model", "Stronghold Gateway"),
     new SceneDesc("Cylinder_C1_model", "Biodefense Chamber A Connect"),
     new SceneDesc("cylinderroom_model", "Biodefense Chamber A"),
     new SceneDesc("bigeye_c1_model", "Biodefense Chamber B Connect"),
     new SceneDesc("bigeyeroom_model", "Biodefense Chamber B"),
     "Oubliette",
+    new StitchedSceneDesc("Oubliette (all)", "Gorea_Land_Ent.bin", campaignAreas("GOREA_")),
     new SceneDesc("Gorea_Land_Model", "Oubliette Gateway"),
     new SceneDesc("Gorea_b1_Model", "Gorea Room"),
     new SceneDesc("gorea_b2_Model", "Gorea Soul Room"),

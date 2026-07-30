@@ -6,6 +6,7 @@ import { Format } from "../SuperMario64DS/nitro_tex.js";
 import { readString } from "../util.js";
 import { Color, colorNewFromRGBA } from "../Color.js";
 import { MathConstants } from "../MathHelpers.js";
+import { AABB } from "../Geometry.js";
 
 export function fxAngle(n: number): number {
     return n / 0x10000 * MathConstants.TAU;
@@ -64,6 +65,7 @@ export interface MPHNode {
     rotation: vec3;
     translation: vec3;
     billboardType: number;
+    bbox: AABB;
 }
 
 interface MPHPal {
@@ -165,8 +167,6 @@ function parseNode(buffer: ArrayBufferSlice): MPHNode {
     const scale = vec3.create();
     const rotation = vec3.create();
     const translation = vec3.create();
-    let vec1 = vec3.create();
-    let vec2 = vec3.create();
     const name = readString(buffer, 0x00, 0x40, true);
     const parent = view.getInt16(0x40, true);
     const child = view.getInt16(0x42, true);
@@ -181,8 +181,9 @@ function parseNode(buffer: ArrayBufferSlice): MPHNode {
     vec3.set(translation, fx32(view.getInt32(0x64, true)), fx32(view.getInt32(0x68, true)), fx32(view.getInt32(0x6C, true)));
     const cull_radius = view.getInt32(0x70, true);
 
-    vec3.set(vec1, fx32(view.getInt32(0x74, true)), fx32(view.getInt32(0x78, true)), fx32(view.getInt32(0x7C, true)));
-    vec3.set(vec2, fx32(view.getInt32(0x80, true)), fx32(view.getInt32(0x84, true)), fx32(view.getInt32(0x88, true)));
+    const bbox = new AABB(
+        fx32(view.getInt32(0x74, true)), fx32(view.getInt32(0x78, true)), fx32(view.getInt32(0x7C, true)),
+        fx32(view.getInt32(0x80, true)), fx32(view.getInt32(0x84, true)), fx32(view.getInt32(0x88, true)));
 
     const billboardType = view.getUint8(0x8C);
     const field_8D = view.getInt8(0x8D);
@@ -203,7 +204,7 @@ function parseNode(buffer: ArrayBufferSlice): MPHNode {
     const field_0xEC = view.getInt32(0xEC, true);
 
     // From RenderEnabledModelNodes @ 0x02047808.
-    return { name, parent, child, next, meshCount: mesh_count, meshStart: meshID >>> 1, scale, rotation, translation, billboardType };
+    return { name, parent, child, next, meshCount: mesh_count, meshStart: meshID >>> 1, scale, rotation, translation, billboardType, bbox };
 }
 
 function parseMesh(buffer: ArrayBufferSlice): MPHMesh {

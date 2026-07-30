@@ -68,12 +68,19 @@ interface MPHObjectEntity extends MPHEntityEntry {
     initialState: number;
 }
 
-interface MPHDoorEntity extends MPHEntityEntry {
+export interface MPHDoorEntity extends MPHEntityEntry {
     position: ReadonlyVec3;
     up: ReadonlyVec3;
     facing: ReadonlyVec3;
     subtype: number;
     doorType: number;
+    connectorLevelId: number;
+    connectionId: number;
+    destinationEntityFilename: string;
+}
+
+export function normalizeEntityFilename(filename: string): string {
+    return filename.trim().toLowerCase().replace(/_ent\.(?:b(?:i)?)?$/, '_ent.bin');
 }
 
 interface MPHItemSpawnEntity extends MPHEntityEntry {
@@ -131,11 +138,16 @@ interface MPHArtifactEntity extends MPHEntityEntry {
     active: boolean;
 }
 
-interface MPHTeleporterEntity extends MPHEntityEntry {
+export interface MPHTeleporterEntity extends MPHEntityEntry {
     position: vec3;
     up: vec3;
     facing: vec3;
+    destinationRoom: number;
+    destinationEntity: number;
+    paletteId: number;
+    active: boolean;
     invisible: boolean;
+    destinationEntityFilename: string;
 }
 
 interface MPHForceFieldEntity extends MPHEntityEntry {
@@ -241,7 +253,7 @@ function parseObject(entry: MPHEntityEntry, view: DataView): MPHObjectEntity {
     };
 }
 
-function parseDoor(entry: MPHEntityEntry, view: DataView): MPHDoorEntity {
+function parseDoor(entry: MPHEntityEntry, view: DataView, buffer: ArrayBufferSlice): MPHDoorEntity {
     assert(entry.dataLength === DOOR_DATA_SIZE);
     const offs = entry.dataOffset;
     return {
@@ -251,6 +263,9 @@ function parseDoor(entry: MPHEntityEntry, view: DataView): MPHDoorEntity {
         facing: readVec3Fx(view, offs + 0x1C),
         subtype: view.getUint32(offs + 0x38, true),
         doorType: view.getUint32(offs + 0x3C, true),
+        connectorLevelId: view.getUint32(offs + 0x40, true),
+        connectionId: view.getUint8(offs + 0x46),
+        destinationEntityFilename: normalizeEntityFilename(readString(buffer, offs + 0x48, 0x10, true)),
     };
 }
 
@@ -387,7 +402,7 @@ function pointInsideLightSource(light: MPHLightSourceEntity, point: vec3): boole
     }
 }
 
-function parseTeleporter(entry: MPHEntityEntry, view: DataView): MPHTeleporterEntity {
+function parseTeleporter(entry: MPHEntityEntry, view: DataView, buffer: ArrayBufferSlice): MPHTeleporterEntity {
     assert(entry.dataLength === TELEPORTER_DATA_SIZE);
     const offs = entry.dataOffset;
     return {
@@ -395,7 +410,12 @@ function parseTeleporter(entry: MPHEntityEntry, view: DataView): MPHTeleporterEn
         position: readVec3Fx(view, offs + 0x04),
         up: readVec3Fx(view, offs + 0x10),
         facing: readVec3Fx(view, offs + 0x1C),
+        destinationRoom: view.getUint8(offs + 0x28),
+        destinationEntity: view.getUint8(offs + 0x29),
+        paletteId: view.getUint8(offs + 0x2A),
+        active: view.getUint8(offs + 0x2B) !== 0,
         invisible: view.getUint8(offs + 0x2C) !== 0,
+        destinationEntityFilename: normalizeEntityFilename(readString(buffer, offs + 0x2D, 0x13, true)),
     };
 }
 
@@ -456,7 +476,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
         else if (entry.type === ENTITY_TYPE_OBJECT)
             objects.push(parseObject(entry, view));
         else if (entry.type === ENTITY_TYPE_DOOR)
-            doors.push(parseDoor(entry, view));
+            doors.push(parseDoor(entry, view, buffer));
         else if (entry.type === ENTITY_TYPE_ITEM_SPAWN)
             itemSpawns.push(parseItemSpawn(entry, view));
         else if (entry.type === ENTITY_TYPE_JUMP_PAD)
@@ -470,7 +490,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
         else if (entry.type === ENTITY_TYPE_ARTIFACT)
             artifacts.push(parseArtifact(entry, view));
         else if (entry.type === ENTITY_TYPE_TELEPORTER)
-            teleporters.push(parseTeleporter(entry, view));
+            teleporters.push(parseTeleporter(entry, view, buffer));
         else if (entry.type === ENTITY_TYPE_FORCE_FIELD)
             forceFields.push(parseForceField(entry, view));
     }
@@ -676,6 +696,7 @@ function createSamusShipExhaustRenderers(device: GfxDevice, cache: MPHEntityReso
         const radialY = Math.sin(angle) * 0.125;
         const renderer = new MPHRenderer(device, renderCache, model, texture, null, {
             ...baseOptions,
+            sceneTransform: undefined,
             entityModel: true,
             nodeFilter: (name) => name === 'Flame',
             forceBillboard: true,
@@ -961,7 +982,15 @@ function getAnimationLoopDuration(animation: MPHAnimation | null): number {
 export class MPHEntityFile {
     private movers: ((timeInMilliseconds: number) => void)[] = [];
 
-    constructor(private entities: MPHEntities, private metadata: MPHEntityMetadata, private cache: MPHEntityResourceCache, private sceneMode: MPHSceneMode) {
+    constructor(private entities: MPHEntities, private metadata: MPHEntityMetadata, private cache: MPHEntityResourceCache, private sceneMode: MPHSceneMode, private entityFilename: string) {
+    }
+
+    public get doors(): readonly MPHDoorEntity[] {
+        return this.entities.doors;
+    }
+
+    public get teleporters(): readonly MPHTeleporterEntity[] {
+        return this.entities.teleporters;
     }
 
     public requestResources(): void {
@@ -1007,9 +1036,11 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, forceFieldModelSpec);
     }
 
-    public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting, fog: MPHFogConfig | null): MPHRenderer[] {
+    public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting, fog: MPHFogConfig | null, sceneTransform?: mat4, staggerDoorCycles: boolean = false): { renderers: MPHRenderer[], doorRenderers: Map<number, MPHRenderer> } {
         const renderers: MPHRenderer[] = [];
-        const baseOptions: MPHRendererOptions = { sceneMode: this.sceneMode, lighting, fog };
+        const doorRenderers = new Map<number, MPHRenderer>();
+        const baseOptions: MPHRendererOptions = { sceneMode: this.sceneMode, lighting, fog, sceneTransform };
+        const normalizedEntityFilename = normalizeEntityFilename(this.entityFilename);
         for (const platform of this.entities.platforms) {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
@@ -1038,13 +1069,17 @@ export class MPHEntityFile {
         for (let index = 0; index < this.entities.doors.length; index++) {
             const door = this.entities.doors[index];
             const spec = getDoorModelSpec(this.metadata, door);
-            const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation) => {
+            const doorRenderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation) => {
                 const animationDuration = Math.max(0, (animation?.node?.frameCount ?? 1) - 1) * 1000 / 30;
+                const cycleOffset = staggerDoorCycles && door.connectionId !== 0xFF && door.destinationEntityFilename !== '' ?
+                    (normalizedEntityFilename > door.destinationEntityFilename ? DOOR_HALF_CYCLE_DURATION : 0) :
+                    (index & 1) * DOOR_HALF_CYCLE_DURATION;
                 return {
                     sceneMode: this.sceneMode,
                     fog,
+                    sceneTransform,
                     mapAnimationTime: (time) => {
-                        let phase = (time + (index & 1) * DOOR_HALF_CYCLE_DURATION) % (DOOR_HALF_CYCLE_DURATION * 2);
+                        let phase = (time + cycleOffset) % (DOOR_HALF_CYCLE_DURATION * 2);
                         if (phase < DOOR_OPEN_HOLD_DURATION)
                             return animationDuration;
                         phase -= DOOR_OPEN_HOLD_DURATION;
@@ -1059,8 +1094,9 @@ export class MPHEntityFile {
                     },
                 };
             });
-            calcOrientedModelMatrix(renderer.modelMatrix, door.position, door.facing, door.up, renderer.modelScale);
-            renderers.push(renderer);
+            calcOrientedModelMatrix(doorRenderer.modelMatrix, door.position, door.facing, door.up, doorRenderer.modelScale);
+            renderers.push(doorRenderer);
+            doorRenderers.set(door.entityId, doorRenderer);
         }
         for (let index = 0; index < this.entities.itemSpawns.length; index++) {
             const item = this.entities.itemSpawns[index];
@@ -1164,7 +1200,7 @@ export class MPHEntityFile {
             calcForceFieldModelMatrix(renderer.modelMatrix, forceField, renderer.modelScale);
             renderers.push(renderer);
         }
-        return renderers;
+        return { renderers, doorRenderers };
     }
 
     public update(timeInMilliseconds: number): void {

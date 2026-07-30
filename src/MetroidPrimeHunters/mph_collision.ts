@@ -1,4 +1,6 @@
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
+import { vec3 } from 'gl-matrix';
+import { AABB } from '../Geometry.js';
 import { assert, readString } from '../util.js';
 
 export interface MPHCollisionPortal {
@@ -8,6 +10,7 @@ export interface MPHCollisionPortal {
 
 export interface MPHCollisionData {
     portals: MPHCollisionPortal[];
+    bounds: AABB;  // collision-file units, multiply by MPH_VIEWER_SCALE for viewer space.
 }
 
 const PORTAL_RECORD_SIZE = 0xE0;
@@ -20,6 +23,23 @@ export function parseMPHCollision(buffer: ArrayBufferSlice): MPHCollisionData {
     const portalCount = view.getUint32(0x4C, true);
     const portalOffset = view.getUint32(0x50, true);
     assert(portalOffset + portalCount * PORTAL_RECORD_SIZE <= buffer.byteLength);
+
+    // From RelocateAndFilterCollisionData @ 0x0211C1A0
+    // Use the collision vertex table as a reachable-room volume for
+    // stitched scene visibility.
+    const vertexCount = view.getUint32(0x04, true);
+    const vertexOffset = view.getUint32(0x08, true);
+    assert(vertexOffset + vertexCount * 0x0C <= buffer.byteLength);
+    const bounds = new AABB();
+    const vertex = vec3.create();
+    for (let i = 0; i < vertexCount; i++) {
+        const offs = vertexOffset + i * 0x0C;
+        vec3.set(vertex,
+            view.getInt32(offs + 0x00, true) / FX32_SCALE,
+            view.getInt32(offs + 0x04, true) / FX32_SCALE,
+            view.getInt32(offs + 0x08, true) / FX32_SCALE);
+        bounds.unionPoint(vertex);
+    }
 
     const portals: MPHCollisionPortal[] = [];
     for (let i = 0; i < portalCount; i++) {
@@ -44,5 +64,5 @@ export function parseMPHCollision(buffer: ArrayBufferSlice): MPHCollisionData {
         portals.push({ geometryNodeName, centroid: vertexCount !== 0 ? centroid : null });
     }
 
-    return { portals };
+    return { portals, bounds };
 }

@@ -253,6 +253,7 @@ function calcAxialParticleBillboardMatrix(dst: mat4): void {
 }
 
 const scratchViewMatrix = mat4.create();
+const scratchRootMatrix = mat4.create();
 const scratchLightDirection = vec4.create();
 const scratchLightViewMatrix = mat4.create();
 const MAX_MATRICES = 32;
@@ -330,6 +331,7 @@ export interface MPHRendererOptions {
     forceTwoSided?: boolean;
     fog?: MPHFogConfig | null;
     collision?: MPHCollisionData | null;
+    sceneTransform?: mat4;
 }
 
 function nodeIsVisibleInMode(name: string, mode: MPHSceneMode): boolean {
@@ -361,6 +363,7 @@ function nodeIsVisibleInMode(name: string, mode: MPHSceneMode): boolean {
 export class MPHRenderer {
     public modelMatrix = mat4.create();
     public isSkybox: boolean = false;
+    public visible: boolean = true;
     public animationController = new AnimationController();
 
     private gfxProgram: GfxProgram;
@@ -373,6 +376,7 @@ export class MPHRenderer {
     private sceneMode: MPHSceneMode;
     private lighting: MPHLighting | undefined;
     private mapAnimationTime: MPHRendererOptions['mapAnimationTime'];
+    private sceneTransform: mat4 | null;
     public viewerTextures: Viewer.Texture[] = [];
 
     public getNodeModelMatrix(name: string): mat4 | null {
@@ -386,6 +390,7 @@ export class MPHRenderer {
         this.sceneMode = options.sceneMode ?? { kind: 'singlePlayer', geometrySet: 1 };
         this.lighting = options.lighting;
         this.mapAnimationTime = options.mapAnimationTime;
+        this.sceneTransform = options.sceneTransform !== undefined ? mat4.clone(options.sceneTransform) : null;
         const entityModel = options.entityModel ?? false;
         const collision = options.collision ?? null;
         const program = new MPHProgram();
@@ -463,11 +468,17 @@ export class MPHRenderer {
     }
 
     public prepareToRender(renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput): void {
+        if (!this.visible)
+            return;
         this.animationController.setTimeInMilliseconds(this.mapAnimationTime !== undefined ?
             this.mapAnimationTime(viewerInput.time) : viewerInput.time);
         computeViewMatrix(scratchViewMatrix, viewerInput.camera);
+        if (this.sceneTransform !== null)
+            mat4.mul(scratchRootMatrix, this.sceneTransform, this.modelMatrix);
+        else
+            mat4.copy(scratchRootMatrix, this.modelMatrix);
         for (const node of this.nodeDrawOrder)
-            node.calcMatrix(this.modelMatrix, scratchViewMatrix, this.nodeAnimator);
+            node.calcMatrix(scratchRootMatrix, scratchViewMatrix, this.nodeAnimator);
 
         const template = renderInstManager.pushTemplate();
         template.setBindingLayouts(bindingLayouts);
@@ -481,6 +492,8 @@ export class MPHRenderer {
             const source = this.lighting?.directions[i];
             if (source !== undefined) {
                 vec4.set(scratchLightDirection, source[0], source[1], source[2], 0);
+                if (this.sceneTransform !== null)
+                    vec4.transformMat4(scratchLightDirection, scratchLightDirection, this.sceneTransform);
                 vec4.transformMat4(scratchLightDirection, scratchLightDirection, scratchLightViewMatrix);
             } else {
                 vec4.zero(scratchLightDirection);
