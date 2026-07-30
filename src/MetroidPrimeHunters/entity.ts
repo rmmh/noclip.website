@@ -1560,6 +1560,7 @@ interface MPHEntityActivationPlans {
     objects: Map<number, MPHObjectStatePlan[]>;
     platforms: Map<number, MPHPlatformStatePlan[]>;
     doors: Map<number, MPHDoorStatePlan[]>;
+    jumpPads: Map<number, MPHForceFieldTransitionPlan[]>;
 }
 
 function addEntityActivationPlan(plansByEntityId: Map<number, MPHEnemyActivationPlan[]>,
@@ -1622,6 +1623,7 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
     const objectById = new Map(entities.objects.map((object) => [object.entityId, object]));
     const platformById = new Map(entities.platforms.map((platform) => [platform.entityId, platform]));
     const doorById = new Map(entities.doors.map((door) => [door.entityId, door]));
+    const jumpPadById = new Map(entities.jumpPads.map((jumpPad) => [jumpPad.entityId, jumpPad]));
     const result: MPHEntityActivationPlans = {
         enemies: new Map(),
         items: new Map(),
@@ -1629,6 +1631,7 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
         objects: new Map(),
         platforms: new Map(),
         doors: new Map(),
+        jumpPads: new Map(),
     };
 
     interface MessageEvent {
@@ -1731,6 +1734,13 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
                 // the same door represented by this graph edge.
                 addDoorStatePlan(result.doors, door.entityId, rootVolume, event.waveDepth,
                     event.message === 0x11 || event.message === 0x22);
+                continue;
+            }
+            const jumpPad = jumpPadById.get(event.targetId);
+            if (jumpPad !== undefined && (event.message === 0x12 || event.message === 5)) {
+                // HandleJumpPadMessage @ 0x0210C02C.
+                addForceFieldTransitionPlan(result.jumpPads, jumpPad.entityId,
+                    rootVolume, event.waveDepth, event.message === 0x12 || event.messageParam !== 0);
                 continue;
             }
 
@@ -1886,8 +1896,7 @@ export class MPHEntityFile {
         }
         for (const jumpPad of this.entities.jumpPads) {
             requestEntityModel(this.cache, getJumpPadModelSpec(jumpPad));
-            if (jumpPad.active)
-                requestEntityModel(this.cache, getJumpPadBeamModelSpec(jumpPad));
+            requestEntityModel(this.cache, getJumpPadBeamModelSpec(jumpPad));
         }
         const captureTheFlag = this.sceneMode.kind === 'multiplayer' && this.sceneMode.captureTheFlag === true;
         for (const flagBase of this.entities.flagBases) {
@@ -2566,15 +2575,39 @@ export class MPHEntityFile {
             renderers.push(renderer);
         }
         for (const jumpPad of this.entities.jumpPads) {
+            const statePlans = entityActivationPlans.jumpPads.get(jumpPad.entityId) ?? [];
+            const rootActivationTimes = new Map<number, number>();
+            const cameraRoomPosition = vec3.create();
+            let sceneStartTime: number | null = null;
+            let active = jumpPad.active;
+            const updateJumpPadState: NonNullable<MPHRendererOptions['isVisibleAtTime']> = (time, viewerInput) => {
+                if (sceneStartTime === null)
+                    sceneStartTime = time;
+                const cameraMatrix = viewerInput.camera.worldMatrix;
+                vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                if (inverseSceneTransform !== null)
+                    vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+
+                active = jumpPad.active;
+                let latestTransitionTime = sceneStartTime;
+                for (const plan of statePlans) {
+                    const transitionTime = getPlannedActivationTime(
+                        [plan], time, sceneStartTime, cameraRoomPosition, rootActivationTimes);
+                    if (transitionTime !== null && transitionTime >= latestTransitionTime) {
+                        active = plan.active;
+                        latestTransitionTime = transitionTime;
+                    }
+                }
+                return active;
+            };
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getJumpPadModelSpec(jumpPad), {
                 ...baseOptions,
             });
             calcJumpPadModelMatrix(renderer.modelMatrix, jumpPad, renderer.modelScale);
             renderers.push(renderer);
-            if (!jumpPad.active)
-                continue;
             const beamRenderer = createEntityModelRenderer(device, this.cache, renderCache, getJumpPadBeamModelSpec(jumpPad), {
                 ...baseOptions,
+                isVisibleAtTime: updateJumpPadState,
             });
             calcJumpPadBeamModelMatrix(beamRenderer.modelMatrix, jumpPad, beamRenderer.modelScale);
             renderers.push(beamRenderer);
