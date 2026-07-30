@@ -173,6 +173,7 @@ interface MPHEntityModelSpec {
 
 export interface MPHEntityResourceCache {
     fetchMPFile(path: string): Promise<void>;
+    fetchMPHARC(path: string): Promise<void>;
     getFileData(path: string): ArrayBufferSlice | null;
 }
 
@@ -655,6 +656,57 @@ function getDoorModelSpec(metadata: MPHEntityMetadata, door: MPHDoorEntity): MPH
     };
 }
 
+function createSamusShipExhaustRenderers(device: GfxDevice, cache: MPHEntityResourceCache, renderCache: GfxRenderCache, shipRenderer: MPHRenderer, attachmentNodeName: string, baseOptions: MPHRendererOptions, movers: ((timeInMilliseconds: number) => void)[]): MPHRenderer[] {
+    const modelFile = assertExists(cache.getFileData('particles_Model.bin'));
+    const textureFile = assertExists(cache.getFileData('models/particles_Tex.bin'));
+    const model = parseMPH_Model(modelFile);
+    // Models store particle descriptors. Pixel/palette data is in particles_Tex.bin
+    const texture = parseTEX0Texture(textureFile, model.mphTex);
+    const attachmentMatrix = mat4.create();
+    const particleScale = vec3.create();
+    const particleOffset = vec3.create();
+    const renderers: MPHRenderer[] = [];
+    const spawnInterval = 1000 / 15;
+    const lifetime = 250;
+    const particlesPerNozzle = Math.ceil(lifetime / spawnInterval);
+    for (let i = 0; i < particlesPerNozzle; i++) {
+        // Stable randomization across respawns
+        const angle = i * 2.399963229728653 + attachmentNodeName.length;
+        const radialX = Math.cos(angle) * 0.125;
+        const radialY = Math.sin(angle) * 0.125;
+        const renderer = new MPHRenderer(device, renderCache, model, texture, null, {
+            ...baseOptions,
+            entityModel: true,
+            nodeFilter: (name) => name === 'Flame',
+            forceBillboard: true,
+            forceTwoSided: true,
+        });
+        renderers.push(renderer);
+        movers.push((time) => {
+            const dst = renderer.modelMatrix;
+            const nodeMatrix = shipRenderer.getNodeModelMatrix(attachmentNodeName);
+            if (nodeMatrix === null) {
+                mat4.identity(dst);
+                return;
+            }
+            const ageMs = (time + i * spawnInterval) % (spawnInterval * particlesPerNozzle);
+            const age = ageMs / lifetime;
+            vec3.set(particleOffset, radialX * age, radialY * age, 0x1800 / 0x1000 + age);
+            mat4.translate(attachmentMatrix, nodeMatrix, particleOffset);
+            mat4.copy(dst, attachmentMatrix);
+            // Particles expand until 0x385 and shrink after 0xE1C
+            const envelope = age >= 1 ? 0 :
+                age < 0x385 / 0x1000 ? age / (0x385 / 0x1000) :
+                age < 0xE1C / 0x1000 ? 1 :
+                (1 - age) / (1 - 0xE1C / 0x1000);
+            const scale = 0.5 * Math.max(0, envelope);
+            vec3.set(particleScale, scale, scale, scale);
+            mat4.scale(dst, dst, particleScale);
+        });
+    }
+    return renderers;
+}
+
 function requestEntityModel(cache: MPHEntityResourceCache, spec: MPHEntityModelSpec): void {
     cache.fetchMPFile(`models/${spec.modelFilename}`);
     if (spec.animationFilename !== undefined)
@@ -918,6 +970,10 @@ export class MPHEntityFile {
             if (spec !== null)
                 requestEntityModel(this.cache, spec);
         }
+        if (this.entities.platforms.some((platform) => platform.modelId === 23 || platform.modelId === 44)) {
+            this.cache.fetchMPHARC('archives/effectsBase.arc');
+            this.cache.fetchMPFile('models/particles_Tex.bin');
+        }
         for (const object of this.entities.objects) {
             const spec = getObjectModelSpec(this.metadata, object);
             if (spec !== null)
@@ -953,19 +1009,21 @@ export class MPHEntityFile {
 
     public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting): MPHRenderer[] {
         const renderers: MPHRenderer[] = [];
+        const baseOptions: MPHRendererOptions = { sceneMode: this.sceneMode, lighting };
         for (const platform of this.entities.platforms) {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
                 continue;
-            const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, {
-                sceneMode: this.sceneMode,
-                lighting,
-            });
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, baseOptions);
             if (platform.positions.length > 1)
                 this.movers.push((time) => calcPlatformModelMatrix(renderer.modelMatrix, platform, time, renderer.modelScale));
             else
                 setupPlatformModelMatrix(renderer.modelMatrix, platform, renderer.modelScale);
             renderers.push(renderer);
+            if (platform.modelId === 23 || platform.modelId === 44) {
+                for (const nodeName of ['R_Turret', 'R_Turret1', 'R_Turret2', 'R_Turret3'])
+                    renderers.push(...createSamusShipExhaustRenderers(device, this.cache, renderCache, renderer, nodeName, baseOptions, this.movers));
+            }
         }
         for (const object of this.entities.objects) {
             const spec = getObjectModelSpec(this.metadata, object);

@@ -1,6 +1,6 @@
 
 import { mat4, mat2d, ReadonlyVec3, vec3, vec4 } from "gl-matrix";
-import { GfxFormat, GfxDevice, GfxProgram, GfxBindingLayoutDescriptor, GfxTexture, GfxBlendMode, GfxBlendFactor, GfxMipFilterMode, GfxTexFilterMode, GfxSampler, GfxMegaStateDescriptor, makeTextureDescriptor2D, GfxWrapMode } from '../gfx/platform/GfxPlatform.js';
+import { GfxFormat, GfxDevice, GfxProgram, GfxBindingLayoutDescriptor, GfxTexture, GfxBlendMode, GfxBlendFactor, GfxMipFilterMode, GfxTexFilterMode, GfxSampler, GfxMegaStateDescriptor, makeTextureDescriptor2D, GfxWrapMode, GfxCullMode } from '../gfx/platform/GfxPlatform.js';
 import * as Viewer from '../viewer.js';
 import * as NITRO_GX from '../SuperMario64DS/nitro_gx.js';
 import { readTexture, getFormatName, Texture, textureFormatIsTranslucent } from "../SuperMario64DS/nitro_tex.js";
@@ -58,7 +58,7 @@ class MaterialInstance {
     public specularColor = colorNewCopy(White);
     public emissionColor = colorNewCopy(White);
 
-    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimator: MPHTexCoordAnimator | null, entityModel: boolean) {
+    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimator: MPHTexCoordAnimator | null, entityModel: boolean, forceTwoSided: boolean) {
         const device = cache.device;
         const texData = tex0.textures.find((t) => t.name === this.material.textureName);
         this.texture = texData !== undefined ? texData: null;
@@ -100,7 +100,7 @@ class MaterialInstance {
         this.sortKey = makeSortKeyOpaque(layer, 0);
         this.megaStateFlags = {
             depthWrite: depthWrite,
-            cullMode: this.material.cullMode,
+            cullMode: forceTwoSided ? GfxCullMode.None : this.material.cullMode,
         };
 
         setAttachmentStateSimple(this.megaStateFlags, {
@@ -204,7 +204,42 @@ class Node {
             calcBillboardMatrix(this.drawMatrix, this.drawMatrix, CalcBillboardFlags.UseRollLocal | CalcBillboardFlags.PriorityZ | CalcBillboardFlags.UseZPlane);
         else if (this.billboardMode === BillboardMode.BBY)
             calcBillboardMatrix(this.drawMatrix, this.drawMatrix, CalcBillboardFlags.UseRollLocal | CalcBillboardFlags.PriorityY | CalcBillboardFlags.UseZPlane);
+        else if (this.billboardMode === BillboardMode.PARTICLE)
+            calcAxialParticleBillboardMatrix(this.drawMatrix);
     }
+}
+
+const scratchParticleAxis = vec3.create();
+const scratchParticleNormal = vec3.create();
+const scratchParticleCross = vec3.create();
+
+function calcAxialParticleBillboardMatrix(dst: mat4): void {
+    const scaleX = Math.hypot(dst[0], dst[1], dst[2]);
+    const scaleY = Math.hypot(dst[4], dst[5], dst[6]);
+    const scaleZ = Math.hypot(dst[8], dst[9], dst[10]);
+
+    // Keep particles parallel to nozzle axis
+    vec3.set(scratchParticleAxis, dst[8], dst[9], dst[10]);
+    vec3.normalize(scratchParticleAxis, scratchParticleAxis);
+    vec3.set(scratchParticleNormal, -dst[12], -dst[13], -dst[14]);
+    vec3.scaleAndAdd(scratchParticleNormal, scratchParticleNormal, scratchParticleAxis, -vec3.dot(scratchParticleNormal, scratchParticleAxis));
+    if (vec3.squaredLength(scratchParticleNormal) < 0.000001) {
+        vec3.set(scratchParticleNormal, dst[4], dst[5], dst[6]);
+        vec3.scaleAndAdd(scratchParticleNormal, scratchParticleNormal, scratchParticleAxis, -vec3.dot(scratchParticleNormal, scratchParticleAxis));
+    }
+    vec3.normalize(scratchParticleNormal, scratchParticleNormal);
+    vec3.cross(scratchParticleCross, scratchParticleNormal, scratchParticleAxis);
+    vec3.normalize(scratchParticleCross, scratchParticleCross);
+
+    dst[0] = scratchParticleCross[0] * scaleX;
+    dst[1] = scratchParticleCross[1] * scaleX;
+    dst[2] = scratchParticleCross[2] * scaleX;
+    dst[4] = scratchParticleNormal[0] * scaleY;
+    dst[5] = scratchParticleNormal[1] * scaleY;
+    dst[6] = scratchParticleNormal[2] * scaleY;
+    dst[8] = scratchParticleAxis[0] * scaleZ;
+    dst[9] = scratchParticleAxis[1] * scaleZ;
+    dst[10] = scratchParticleAxis[2] * scaleZ;
 }
 
 const scratchViewMatrix = mat4.create();
@@ -247,7 +282,7 @@ class ShapeInstance {
 const bindingLayouts: GfxBindingLayoutDescriptor[] = [{ numUniformBuffers: 3, numSamplers: 1 }];
 
 enum BillboardMode {
-    NONE, BB, BBY,
+    NONE, BB, BBY, PARTICLE,
 }
 
 export type MPHSceneMode =
@@ -264,6 +299,9 @@ export interface MPHRendererOptions {
     entityModel?: boolean;
     lighting?: MPHLighting;
     mapAnimationTime?: (timeInMilliseconds: number) => number;
+    nodeFilter?: (name: string) => boolean;
+    forceBillboard?: boolean;
+    forceTwoSided?: boolean;
 }
 
 function nodeIsVisibleInMode(name: string, mode: MPHSceneMode): boolean {
@@ -309,6 +347,13 @@ export class MPHRenderer {
     private mapAnimationTime: MPHRendererOptions['mapAnimationTime'];
     public viewerTextures: Viewer.Texture[] = [];
 
+    public getNodeModelMatrix(name: string): mat4 | null {
+        for (const node of this.nodes)
+            if (node.node.name === name)
+                return node.modelMatrix;
+        return null;
+    }
+
     constructor(device: GfxDevice, cache: GfxRenderCache, public mphModel: MPHbin, private tex0: TEX0, mphAnimation: MPHAnimation | null, options: MPHRendererOptions) {
         this.sceneMode = options.sceneMode ?? { kind: 'singlePlayer', geometrySet: 1 };
         this.lighting = options.lighting;
@@ -329,11 +374,15 @@ export class MPHRenderer {
             const material = mphModel.materials[i];
             const texCoordAnimator = texCoordAnimation !== null ?
                 bindMPHT(this.animationController, texCoordAnimation, material.name) : null;
-            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimator, entityModel));
+            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimator, entityModel, options.forceTwoSided === true));
         }
 
-        for (let i = 0; i < mphModel.nodes.length; i++)
-            this.nodes.push(new Node(mphModel.nodes[i], i));
+        for (let i = 0; i < mphModel.nodes.length; i++) {
+            const node = new Node(mphModel.nodes[i], i);
+            if (options.forceBillboard === true)
+                node.billboardMode = BillboardMode.PARTICLE;
+            this.nodes.push(node);
+        }
         const addNodeDrawOrder = (index: number, parent: Node | null): void => {
             for (let i = index; i !== -1; i = mphModel.nodes[i].next) {
                 const node = this.nodes[i];
@@ -359,6 +408,8 @@ export class MPHRenderer {
                 this.viewerTextures.push(this.materialInstances[i].viewerTextures[0]);
 
         for (const node of this.nodeDrawOrder) {
+            if (options.nodeFilter !== undefined && !options.nodeFilter(node.node.name))
+                continue;
             if (!nodeIsVisibleInMode(node.node.name, this.sceneMode))
                 continue;
 
