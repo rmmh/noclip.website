@@ -6,6 +6,7 @@ import { computeModelMatrixSRT, lerp, lerpAngle } from '../MathHelpers.js';
 import { fx32 } from '../nns_g3d/NNS_G3D.js';
 import { assert, readString } from '../util.js';
 import { calcMPHTexMtx, fxAngle } from './mph_binModel.js';
+import type { Color } from '../Color.js';
 
 interface AnimationChannel {
     interpolation: number;
@@ -33,7 +34,29 @@ export interface MPHTexCoordAnimation {
 
 export interface MPHAnimation {
     node: MPHNodeAnimation | null;
+    material: MPHMaterialAnimation | null;
     texCoord: MPHTexCoordAnimation | null;
+}
+
+interface MPHMaterialAnimationEntry {
+    name: string;
+    diffuseR: AnimationChannel;
+    diffuseG: AnimationChannel;
+    diffuseB: AnimationChannel;
+    ambientR: AnimationChannel;
+    ambientG: AnimationChannel;
+    ambientB: AnimationChannel;
+    specularR: AnimationChannel;
+    specularG: AnimationChannel;
+    specularB: AnimationChannel;
+    alpha: AnimationChannel;
+}
+
+export interface MPHMaterialAnimation {
+    frameCount: number;
+    sampleDataOffset: number;
+    entries: MPHMaterialAnimationEntry[];
+    buffer: ArrayBufferSlice;
 }
 
 interface MPHNodeAnimationEntry {
@@ -121,22 +144,55 @@ function parseNodeAnimation(buffer: ArrayBufferSlice, trackOffset: number, nodeC
     };
 }
 
+function parseMaterialAnimation(buffer: ArrayBufferSlice, trackOffset: number): MPHMaterialAnimation {
+    const view = buffer.createDataView();
+    const entryCount = view.getUint32(trackOffset + 0x08, true);
+    const entriesOffset = view.getUint32(trackOffset + 0x0C, true);
+    const entries: MPHMaterialAnimationEntry[] = [];
+    for (let i = 0; i < entryCount; i++) {
+        const entryOffset = entriesOffset + i * 0x8C;
+        entries.push({
+            name: readString(buffer, entryOffset + 0x00, 0x40, true),
+            diffuseR: parseChannel(view, entryOffset, 0x44, 0x48, 0x4E),
+            diffuseG: parseChannel(view, entryOffset, 0x45, 0x4A, 0x50),
+            diffuseB: parseChannel(view, entryOffset, 0x46, 0x4C, 0x52),
+            ambientR: parseChannel(view, entryOffset, 0x54, 0x58, 0x5E),
+            ambientG: parseChannel(view, entryOffset, 0x55, 0x5A, 0x60),
+            ambientB: parseChannel(view, entryOffset, 0x56, 0x5C, 0x62),
+            specularR: parseChannel(view, entryOffset, 0x64, 0x68, 0x6E),
+            specularG: parseChannel(view, entryOffset, 0x65, 0x6A, 0x70),
+            specularB: parseChannel(view, entryOffset, 0x66, 0x6C, 0x72),
+            alpha: parseChannel(view, entryOffset, 0x84, 0x86, 0x88),
+        });
+    }
+    return {
+        frameCount: view.getUint32(trackOffset + 0x00, true),
+        sampleDataOffset: view.getUint32(trackOffset + 0x04, true),
+        entries,
+        buffer,
+    };
+}
+
 export function parseMPHAnimation(buffer: ArrayBufferSlice, animationIndex: number = 0, nodeCount: number = 0): MPHAnimation {
     const view = buffer.createDataView();
     const animationCount = view.getUint16(0x14, true);
     if (animationCount === 0)
-        return { node: null, texCoord: null };
+        return { node: null, material: null, texCoord: null };
     if (animationIndex >= animationCount)
         animationIndex = 0;
 
     // SetModelAnimation @ 0x02044CDC indexes five parallel pointer tables.
-    // Tables 0 and 3 contain node and texture-coordinate animation.
+    // Tables 0, 2, and 3 contain node, material-color, and
+    // texture-coordinate animation.
     const nodeTableOffset = view.getUint32(0x00, true);
+    const materialTableOffset = view.getUint32(0x08, true);
     const texCoordTableOffset = view.getUint32(0x0C, true);
     const nodeTrackOffset = nodeTableOffset !== 0 ? view.getUint32(nodeTableOffset + animationIndex * 4, true) : 0;
+    const materialTrackOffset = materialTableOffset !== 0 ? view.getUint32(materialTableOffset + animationIndex * 4, true) : 0;
     const texCoordTrackOffset = texCoordTableOffset !== 0 ? view.getUint32(texCoordTableOffset + animationIndex * 4, true) : 0;
     return {
         node: nodeTrackOffset !== 0 && nodeCount !== 0 ? parseNodeAnimation(buffer, nodeTrackOffset, nodeCount) : null,
+        material: materialTrackOffset !== 0 ? parseMaterialAnimation(buffer, materialTrackOffset) : null,
         texCoord: texCoordTrackOffset !== 0 ? parseTexCoordAnimation(buffer, texCoordTrackOffset) : null,
     };
 }
@@ -174,6 +230,8 @@ function sampleChannelFrame(view: DataView, dataOffset: number, channel: Animati
         const offset = dataOffset + index * stride;
         if (stride === 4)
             return view.getInt32(offset, true);
+        if (stride === 1)
+            return view.getUint8(offset);
         return signed ? view.getInt16(offset, true) : view.getUint16(offset, true);
     };
 
@@ -250,9 +308,39 @@ export class MPHTexCoordAnimator {
     }
 }
 
+export class MPHMaterialAnimator {
+    constructor(private animationController: AnimationController, private animation: MPHMaterialAnimation, private entry: MPHMaterialAnimationEntry) {
+    }
+
+    public calcColors(diffuse: Color, ambient: Color, specular: Color): number {
+        const view = this.animation.buffer.createDataView();
+        const frame = Math.floor(this.animationController.getTimeInFrames()) % this.animation.frameCount;
+        const sample = (channel: AnimationChannel): number =>
+            sampleChannelFrame(view, this.animation.sampleDataOffset, channel, frame, this.animation.frameCount, 1, false) / 31;
+        diffuse.r = sample(this.entry.diffuseR);
+        diffuse.g = sample(this.entry.diffuseG);
+        diffuse.b = sample(this.entry.diffuseB);
+        ambient.r = sample(this.entry.ambientR);
+        ambient.g = sample(this.entry.ambientG);
+        ambient.b = sample(this.entry.ambientB);
+        specular.r = sample(this.entry.specularR);
+        specular.g = sample(this.entry.specularG);
+        specular.b = sample(this.entry.specularB);
+        return sampleChannelFrame(view, this.animation.sampleDataOffset, this.entry.alpha, frame, this.animation.frameCount, 1, false) / 31;
+    }
+}
+
 export function bindMPHT(animationController: AnimationController, animation: MPHTexCoordAnimation, materialName: string): MPHTexCoordAnimator | null {
     const entry = animation.entries.find((entry) => entry.name === materialName);
     if (entry === undefined)
         return null;
     return new MPHTexCoordAnimator(animationController, animation, entry);
+}
+
+export function bindMPHMaterial(animationController: AnimationController, animation: MPHMaterialAnimation, materialName: string): MPHMaterialAnimator | null {
+    // The resource loader resolves the entry name to a model material index
+    // at +0x8A; FindMaterialAnimationEntry @ 0x02052404 then compares it
+    // against the material being drawn.
+    const entry = animation.entries.find((entry) => entry.name === materialName);
+    return entry !== undefined ? new MPHMaterialAnimator(animationController, animation, entry) : null;
 }

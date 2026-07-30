@@ -185,6 +185,7 @@ export class MPHSceneRenderer implements Viewer.SceneGfx {
 }
 
 const standaloneEntityFiles = new Map<string, string>([
+    ['cylinderroom_model', 'Unit1_b2_Ent.bin'],
     ['mp_fh_data/levels/models/blueRoom_Model', 'regulator_Ent.bin'],
     ['mp_fh_data/levels/models/e3Level_Model', 'morphBall_Ent.bin'],
     ['mp_fh_data/levels/models/mp1_Model', 'mp1_Ent.bin'],
@@ -332,7 +333,7 @@ export class SceneDesc implements Viewer.SceneDesc {
         }
 
         const entityRenderers = entities?.createRenderers(
-            device, renderer.getCache(), lighting, fog, sceneTransform, splitExterior) ?? null;
+            device, renderer.getCache(), lighting, fog, sceneTransform, splitExterior, collision) ?? null;
         if (entities !== null && entityRenderers !== null) {
             renderer.objectRenderers.push(...entityRenderers.renderers);
             renderer.entities.push(entities);

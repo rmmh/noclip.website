@@ -7,6 +7,8 @@ import { fx32, TEX0 } from '../nns_g3d/NNS_G3D.js';
 import { MPHAnimation, parseMPHAnimation } from './mph_anim.js';
 import { fxAngle, MPHbin, parseMPH_Model, parseTEX0Texture } from './mph_binModel.js';
 import { MPHFogConfig, MPHLighting, MPHRenderer, MPHRendererOptions, MPHSceneMode } from './render.js';
+import { ENTITY_TYPE_ENEMY_SPAWN, getEnemyAnimationPhaseMilliseconds, getEnemyModelSpecs, isWaspEnemy, MPHEnemySpawnEntity, parseEnemySpawn, sampleEnemyPose, MPHGameplayRandom, SurfaceCrawlerSimulation, sampleBlastcapAnimation, sampleMochtroidType03Animation, MPHEnemySimulation, sampleMochtroidType06Animation, samplePsychoBitAnimation, sampleSphinkTickAnimation, sampleAlimbicTurretScan, sampleDripStankAnimation, sampleGuardBot1Animation, GuardBotSimulation, sampleGuardBot2Animation, sampleAlimbicStatueAnimation, sampleLavaDemonAnimation, sampleBigEyeTurretAnimation, sampleBigEyeBossAnimation, sampleCylinderBossEyeAnimation, sampleShriekbatAnimation, MochtroidRoamingSimulation, sampleMochtroidType05Animation, sampleMochtroidType04Animation, sampleWarWaspAnimation, sampleGorea2Animation, sampleGorea1AAnimation, sampleBarbedWarWaspAnimation, sampleGeemerAnimation, sampleCylinderBossAnimation } from './enemy.js';
+import { MPHCollisionData } from './mph_collision.js';
 
 const ENTITY_HEADER_SIZE = 0x24;
 const ENTITY_ENTRY_SIZE = 0x18;
@@ -18,6 +20,7 @@ const ENTITY_TYPE_JUMP_PAD = 9;
 const ENTITY_TYPE_OCTOLITH_FLAG = 12;
 const ENTITY_TYPE_FLAG_BASE = 13;
 const ENTITY_TYPE_TELEPORTER = 14;
+const ENTITY_TYPE_NODE_DEFENSE = 15;
 const ENTITY_TYPE_LIGHT_SOURCE = 16;
 const ENTITY_TYPE_ARTIFACT = 17;
 const ENTITY_TYPE_FORCE_FIELD = 19;
@@ -29,6 +32,7 @@ const JUMP_PAD_DATA_SIZE = 0x94;
 const OCTOLITH_FLAG_DATA_SIZE = 0x29;
 const FLAG_BASE_DATA_SIZE = 0x6C;
 const TELEPORTER_DATA_SIZE = 0x5C;
+const NODE_DEFENSE_DATA_SIZE = 0x68;
 const LIGHT_SOURCE_DATA_SIZE = 0x88;
 const ARTIFACT_DATA_SIZE = 0x46;
 const FORCE_FIELD_DATA_SIZE = 0x35;
@@ -115,6 +119,13 @@ interface MPHFlagBaseEntity extends MPHEntityEntry {
     active: boolean;
 }
 
+interface MPHNodeDefenseEntity extends MPHEntityEntry {
+    position: vec3;
+    up: vec3;
+    facing: vec3;
+    radius: number;
+}
+
 type MPHLightVolume =
     { kind: 'box', axes: readonly [vec3, vec3, vec3], origin: vec3, extents: vec3 } |
     { kind: 'cylinder', axis: vec3, origin: vec3, radius: number, length: number } |
@@ -165,9 +176,11 @@ export interface MPHEntities {
     objects: MPHObjectEntity[];
     doors: MPHDoorEntity[];
     itemSpawns: MPHItemSpawnEntity[];
+    enemySpawns: MPHEnemySpawnEntity[];
     jumpPads: MPHJumpPadEntity[];
     octolithFlags: MPHOctolithFlagEntity[];
     flagBases: MPHFlagBaseEntity[];
+    nodeDefenses: MPHNodeDefenseEntity[];
     lightSources: MPHLightSourceEntity[];
     artifacts: MPHArtifactEntity[];
     teleporters: MPHTeleporterEntity[];
@@ -181,6 +194,10 @@ interface MPHEntityModelSpec {
     paletteFilename?: string;
     paletteOverrides?: readonly { target: number; source: number }[];
     animationId?: number;
+    additionalAnimationIds?: number[];
+    additionalMaterialAnimationIds?: number[];
+    texCoordAnimationId?: number;
+    animationLoop?: boolean;
 }
 
 export interface MPHEntityResourceCache {
@@ -321,6 +338,20 @@ function parseFlagBase(entry: MPHEntityEntry, view: DataView): MPHFlagBaseEntity
     };
 }
 
+function parseNodeDefense(entry: MPHEntityEntry, view: DataView): MPHNodeDefenseEntity {
+    assert(entry.dataLength === NODE_DEFENSE_DATA_SIZE);
+    const offs = entry.dataOffset;
+    return {
+        ...entry,
+        position: readVec3Fx(view, offs + 0x04),
+        up: readVec3Fx(view, offs + 0x10),
+        facing: readVec3Fx(view, offs + 0x1C),
+        // RenderNodeDefenseEntity @ 0x0212E4A4 uses runtime +0x60,
+        // copied directly from the authored record.
+        radius: readFx32(view, offs + 0x44),
+    };
+}
+
 function parseLightSource(entry: MPHEntityEntry, view: DataView): MPHLightSourceEntity {
     assert(entry.dataLength === LIGHT_SOURCE_DATA_SIZE);
     const offs = entry.dataOffset;
@@ -443,13 +474,16 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     const objects: MPHObjectEntity[] = [];
     const doors: MPHDoorEntity[] = [];
     const itemSpawns: MPHItemSpawnEntity[] = [];
+    const enemySpawns: MPHEnemySpawnEntity[] = [];
     const jumpPads: MPHJumpPadEntity[] = [];
     const octolithFlags: MPHOctolithFlagEntity[] = [];
     const flagBases: MPHFlagBaseEntity[] = [];
+    const nodeDefenses: MPHNodeDefenseEntity[] = [];
     const lightSources: MPHLightSourceEntity[] = [];
     const artifacts: MPHArtifactEntity[] = [];
     const teleporters: MPHTeleporterEntity[] = [];
     const forceFields: MPHForceFieldEntity[] = [];
+    const gameplayRandom = new MPHGameplayRandom();
     let entryCount = 0;
     for (let offs = ENTITY_HEADER_SIZE; offs + ENTITY_ENTRY_SIZE <= view.byteLength; offs += ENTITY_ENTRY_SIZE) {
         const dataOffset = view.getUint32(offs + 0x14, true);
@@ -479,12 +513,16 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
             doors.push(parseDoor(entry, view, buffer));
         else if (entry.type === ENTITY_TYPE_ITEM_SPAWN)
             itemSpawns.push(parseItemSpawn(entry, view));
+        else if (entry.type === ENTITY_TYPE_ENEMY_SPAWN)
+            enemySpawns.push(parseEnemySpawn(entry, view, gameplayRandom));
         else if (entry.type === ENTITY_TYPE_JUMP_PAD)
             jumpPads.push(parseJumpPad(entry, view));
         else if (entry.type === ENTITY_TYPE_OCTOLITH_FLAG)
             octolithFlags.push(parseOctolithFlag(entry, view));
         else if (entry.type === ENTITY_TYPE_FLAG_BASE)
             flagBases.push(parseFlagBase(entry, view));
+        else if (entry.type === ENTITY_TYPE_NODE_DEFENSE)
+            nodeDefenses.push(parseNodeDefense(entry, view));
         else if (entry.type === ENTITY_TYPE_LIGHT_SOURCE)
             lightSources.push(parseLightSource(entry, view));
         else if (entry.type === ENTITY_TYPE_ARTIFACT)
@@ -496,7 +534,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     }
 
     assert(entryCount === view.getUint16(0x04 + layerId * 2, true));
-    return { platforms, objects, doors, itemSpawns, jumpPads, octolithFlags, flagBases, lightSources, artifacts, teleporters, forceFields };
+    return { platforms, objects, doors, itemSpawns, enemySpawns, jumpPads, octolithFlags, flagBases, nodeDefenses, lightSources, artifacts, teleporters, forceFields };
 }
 
 export interface MPHObjectMetadata {
@@ -629,6 +667,14 @@ function getOctolithFlagModelSpec(flag: MPHOctolithFlagEntity): MPHEntityModelSp
         animationId: 0,
     };
 }
+
+const nodeDefenseTerminalModelSpec: MPHEntityModelSpec = {
+    modelFilename: 'koth_terminal_Model.bin',
+};
+
+const nodeDefenseDataFlowModelSpec: MPHEntityModelSpec = {
+    modelFilename: 'koth_data_flow_Model.bin',
+};
 
 function getTeleporterModelSpec(sceneMode: MPHSceneMode): MPHEntityModelSpec {
     const name = sceneMode.kind === 'multiplayer' ? 'TeleporterMP' : 'Teleporter_mdl';
@@ -768,13 +814,27 @@ function createEntityModelRenderer(device: GfxDevice, cache: MPHEntityResourceCa
     }
     const animationFile = spec.animationFilename !== undefined ?
         cache.getFileData(`models/${spec.animationFilename}`) : null;
-    const animation = animationFile !== null && spec.animationId !== undefined ?
+    let animation = animationFile !== null && spec.animationId !== undefined ?
         parseMPHAnimation(animationFile, spec.animationId, model.nodes.length) : null;
-    const rendererOptions = typeof options === 'function' ? options(animation) : options;
+    if (animationFile !== null && spec.texCoordAnimationId !== undefined) {
+        const texCoordAnimation = parseMPHAnimation(animationFile, spec.texCoordAnimationId).texCoord;
+        animation = { node: animation?.node ?? null, material: animation?.material ?? null, texCoord: texCoordAnimation };
+    }
+    const rendererOptions: MPHRendererOptions = { ...(typeof options === 'function' ? options(animation) : options) };
+    if (animationFile !== null && spec.additionalAnimationIds !== undefined) {
+        rendererOptions.additionalNodeAnimations = spec.additionalAnimationIds.map((animationId) =>
+            assertExists(parseMPHAnimation(animationFile, animationId, model.nodes.length).node));
+    }
+    if (animationFile !== null && spec.additionalMaterialAnimationIds !== undefined) {
+        rendererOptions.additionalMaterialAnimations = spec.additionalMaterialAnimationIds.map((animationId) =>
+            assertExists(parseMPHAnimation(animationFile, animationId).material));
+    }
     return new MPHRenderer(device, renderCache, model, texture, animation, { entityModel: true, ...rendererOptions });
 }
 
 const scratchPosition = vec3.create();
+const scratchDirection = vec3.create();
+const scratchUp = vec3.create();
 const scratchRotation = quat.create();
 const scratchScale = vec3.create();
 
@@ -912,6 +972,20 @@ function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInM
 // Stagger spawning to avoid synchronized bobs.
 const ITEM_SPAWN_PREVIEW_PHASE_STEP = 0x2000;
 
+function calcEnemyModelMatrix(dst: mat4, enemy: MPHEnemySpawnEntity, simulation: MPHEnemySimulation | null, timeInMilliseconds: number, modelScale: number, localYawRadians = 0): void {
+    if (simulation !== null)
+        simulation.sample(scratchPosition, scratchDirection, scratchUp, timeInMilliseconds);
+    else {
+        sampleEnemyPose(scratchPosition, scratchDirection, enemy, timeInMilliseconds);
+        vec3.copy(scratchUp, enemy.up);
+    }
+    if (localYawRadians !== 0) {
+        quat.setAxisAngle(scratchRotation, scratchUp, localYawRadians);
+        vec3.transformQuat(scratchDirection, scratchDirection, scratchRotation);
+    }
+    calcOrientedModelMatrix(dst, scratchPosition, scratchDirection, scratchUp, modelScale);
+}
+
 const ARTIFACT_MODEL_OFFSET = (0x1800 - 1843) / 0x1000;
 
 function calcArtifactModelMatrix(dst: mat4, artifact: MPHArtifactEntity, modelScale: number): void {
@@ -942,6 +1016,72 @@ function calcFlagBaseModelMatrix(dst: mat4, flagBase: MPHFlagBaseEntity, modelSc
 function calcOctolithFlagModelMatrix(dst: mat4, flag: MPHOctolithFlagEntity, modelScale: number): void {
     const position = vec3.scaleAndAdd(vec3.create(), flag.position, flag.up, 2);
     calcOrientedModelMatrix(dst, position, flag.facing, flag.up, modelScale);
+}
+
+interface NodeDefensePreviewSample {
+    angle: number;
+    team: number | null;
+}
+
+function sampleNodeDefensePreview(timeInMilliseconds: number): NodeDefensePreviewSample {
+    const ticks = Math.max(0, timeInMilliseconds * 30 / 1000);
+    const cycleTicks = 600;
+    const idleTicks = 180;
+    const captureTicks = 300;
+    const decelerationTicks = 100;
+    const cycle = Math.floor(ticks / cycleTicks);
+    const timeInCycle = ticks - cycle * cycleTicks;
+
+    // UpdateNodeDefenseCaptureState @ 0x0212EA38 advances capture progress by
+    // two per tick, maps it to angular speed with 0x1B4E81B5, then subtracts
+    // 614.4 fixed-angle units per unoccupied tick until the terminal stops.
+    const captureAngle = 204.8 * captureTicks * (captureTicks + 1) / 2;
+    const decelerationAngle = 614.4 * decelerationTicks * (decelerationTicks - 1) / 2;
+    let angleFX = cycle * (captureAngle + decelerationAngle);
+    let team: number | null = cycle === 0 ? null : (cycle - 1) & 1;
+    if (timeInCycle >= idleTicks) {
+        const captureTime = Math.min(timeInCycle - idleTicks, captureTicks);
+        angleFX += 204.8 * captureTime * (captureTime + 1) / 2;
+        team = cycle & 1;
+        if (timeInCycle >= idleTicks + captureTicks) {
+            const decelerationTime = Math.min(timeInCycle - idleTicks - captureTicks, decelerationTicks);
+            angleFX += 614.4 * decelerationTime * (2 * decelerationTicks - decelerationTime - 1) / 2;
+        }
+    }
+    return {
+        angle: angleFX / (360 * 0x1000) * Math.PI * 2,
+        team,
+    };
+}
+
+function calcNodeDefenseTerminalModelMatrix(dst: mat4, nodeDefense: MPHNodeDefenseEntity, timeInMilliseconds: number, modelScale: number): void {
+    // RenderNodeDefenseEntity @ 0x0212E4A4 rotates and uniformly scales the
+    // terminal by the authored volume radius before placing it at +0x30.
+    calcOrientedModelMatrix(dst, nodeDefense.position, nodeDefense.facing, nodeDefense.up, modelScale * nodeDefense.radius);
+    mat4.rotateY(dst, dst, sampleNodeDefensePreview(timeInMilliseconds).angle);
+}
+
+function calcNodeDefenseDataFlowModelMatrix(dst: mat4, nodeDefense: MPHNodeDefenseEntity, modelScale: number): void {
+    mat4.fromTranslation(dst, nodeDefense.position);
+    mat4.scale(dst, dst, vec3.set(scratchScale, modelScale, modelScale, modelScale));
+}
+
+function modifyNodeDefenseMaterialColor(dst: { r: number, g: number, b: number, a: number }, materialName: string, timeInMilliseconds: number): void {
+    if (materialName !== 'lambert2' && materialName !== 'lambert4')
+        return;
+
+    // RenderNodeDefenseEntity @ 0x0212E4A4 uses white for neutral, then the
+    // capturing team's color while contested and the owner's color afterward.
+    const team = sampleNodeDefensePreview(timeInMilliseconds).team;
+    if (team === null) {
+        dst.r = dst.g = dst.b = 1;
+    } else if (team === 0) {
+        dst.r = 1;
+        dst.g = dst.b = 0;
+    } else {
+        dst.r = dst.g = 15 / 31;
+        dst.b = 1;
+    }
 }
 
 function calcTeleporterModelMatrix(dst: mat4, teleporter: MPHTeleporterEntity, modelScale: number): void {
@@ -975,7 +1115,7 @@ const DOOR_OPEN_HOLD_DURATION = 2000;
 const DOOR_HALF_CYCLE_DURATION = 6050;
 
 function getAnimationLoopDuration(animation: MPHAnimation | null): number {
-    const frameCount = animation?.node?.frameCount ?? animation?.texCoord?.frameCount ?? 1;
+    const frameCount = animation?.node?.frameCount ?? animation?.material?.frameCount ?? animation?.texCoord?.frameCount ?? 1;
     return Math.max(1, frameCount - 1) * 1000 / 30;
 }
 
@@ -1012,6 +1152,9 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getDoorModelSpec(this.metadata, door));
         for (const item of this.entities.itemSpawns)
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
+        for (const enemy of this.entities.enemySpawns)
+            for (const spec of getEnemyModelSpecs(enemy))
+                requestEntityModel(this.cache, spec);
         for (const artifact of this.entities.artifacts) {
             if (!artifact.active)
                 continue;
@@ -1030,13 +1173,18 @@ export class MPHEntityFile {
         }
         for (const flag of this.entities.octolithFlags)
             requestEntityModel(this.cache, getOctolithFlagModelSpec(flag));
+        if (this.entities.nodeDefenses.length > 0) {
+            // RegisterAndLoadNodeDefenseEntityType @ 0x0212F760
+            requestEntityModel(this.cache, nodeDefenseTerminalModelSpec);
+            requestEntityModel(this.cache, nodeDefenseDataFlowModelSpec);
+        }
         if (this.entities.teleporters.some((teleporter) => !teleporter.invisible))
             requestEntityModel(this.cache, getTeleporterModelSpec(this.sceneMode));
         if (this.entities.forceFields.some((forceField) => forceField.active))
             requestEntityModel(this.cache, forceFieldModelSpec);
     }
 
-    public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting, fog: MPHFogConfig | null, sceneTransform?: mat4, staggerDoorCycles: boolean = false): { renderers: MPHRenderer[], doorRenderers: Map<number, MPHRenderer> } {
+    public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting, fog: MPHFogConfig | null, sceneTransform?: mat4, staggerDoorCycles: boolean = false, collision: MPHCollisionData | null = null): { renderers: MPHRenderer[], doorRenderers: Map<number, MPHRenderer> } {
         const renderers: MPHRenderer[] = [];
         const doorRenderers = new Map<number, MPHRenderer>();
         const baseOptions: MPHRendererOptions = { sceneMode: this.sceneMode, lighting, fog, sceneTransform };
@@ -1107,6 +1255,205 @@ export class MPHEntityFile {
             this.movers.push((time) => calcItemSpawnModelMatrix(renderer.modelMatrix, item, phaseAngle, time, renderer.modelScale));
             renderers.push(renderer);
         }
+        for (const enemy of this.entities.enemySpawns) {
+            const simulation: MPHEnemySimulation | null =
+                (enemy.enemyType === 0x01 || enemy.enemyType === 0x0C) && collision !== null ?
+                    new SurfaceCrawlerSimulation(enemy, collision) :
+                    enemy.enemyType === 0x23 || enemy.enemyType === 0x24 ?
+                        new GuardBotSimulation(enemy, collision, getEnemyAnimationPhaseMilliseconds(enemy) %
+                            (enemy.enemyType === 0x23 ? 445 * 1000 / 30 : 12 * 1000)) :
+                    enemy.enemyType === 0x05 ? new MochtroidRoamingSimulation(enemy, 20) :
+                    enemy.enemyType === 0x06 ? new MochtroidRoamingSimulation(enemy, 10) : null;
+            let spawnTime: number | null = null;
+            const getEnemyTime = (time: number): number => {
+                if (spawnTime === null)
+                    spawnTime = time;
+                return time - spawnTime;
+            };
+            const enemyModelSpecs = getEnemyModelSpecs(enemy);
+            let primaryEnemyRenderer: MPHRenderer | null = null;
+            for (let specIndex = 0; specIndex < enemyModelSpecs.length; specIndex++) {
+                const spec = enemyModelSpecs[specIndex];
+                const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation) => {
+                    const duration = getAnimationLoopDuration(animation);
+                    const animationLoop = spec.animationLoop !== false;
+                    const getPreviewTime = (time: number): number =>
+                        getEnemyTime(time) + getEnemyAnimationPhaseMilliseconds(enemy);
+                    return {
+                        ...baseOptions,
+                        modifyNodeMatrix: enemy.enemyType === 0x12 ?
+                            (dst, nodeName, time) => {
+                                if (nodeName !== 'Door_Rot')
+                                    return;
+                                const scan = sampleAlimbicTurretScan(getPreviewTime(time));
+                                mat4.rotateY(dst, dst, scan.yaw);
+                                mat4.rotateX(dst, dst, scan.pitch);
+                            } : undefined,
+                        selectNodeAnimation: enemy.enemyType === 0x03 ?
+                            (time) => sampleMochtroidType03Animation(getEnemyTime(time), enemy).index :
+                            enemy.enemyType === 0x00 ?
+                                (time) => sampleWarWaspAnimation(getPreviewTime(time)).index :
+                            enemy.enemyType === 0x0A ?
+                                (time) => sampleBarbedWarWaspAnimation(getPreviewTime(time)).index :
+                            enemy.enemyType === 0x04 ?
+                                (time) => sampleMochtroidType04Animation(getEnemyTime(time)).index :
+                            enemy.enemyType === 0x05 ?
+                                (time) => sampleMochtroidType05Animation(getEnemyTime(time)).index :
+                            enemy.enemyType === 0x0B ?
+                                (time) => sampleShriekbatAnimation(getPreviewTime(time)).index :
+                            enemy.enemyType === 0x10 ?
+                                (time) => sampleBlastcapAnimation(getPreviewTime(time)).index :
+                            enemy.enemyType === 0x0C ?
+                                (time) => sampleGeemerAnimation(getPreviewTime(time)).index :
+                            enemy.enemyType === 0x13 && specIndex === 0 ?
+                                (time) => sampleCylinderBossAnimation(getPreviewTime(time)).index :
+                                enemy.enemyType === 0x17 ?
+                                    (time) => samplePsychoBitAnimation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x2E || enemy.enemyType === 0x2F ?
+                                        (time) => sampleSphinkTickAnimation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x25 ?
+                                        (time) => sampleDripStankAnimation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x24 ?
+                                        (time) => sampleGuardBot1Animation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x23 ?
+                                        (time) => sampleGuardBot2Animation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x26 ?
+                                        (time) => sampleAlimbicStatueAnimation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x27 ?
+                                        (time) => sampleLavaDemonAnimation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x18 && specIndex === 0 ?
+                                        (time) => sampleGorea1AAnimation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x1F ?
+                                        (time) => sampleGorea2Animation(getPreviewTime(time)).index :
+                                    enemy.enemyType === 0x29 && spec.modelFilename === 'BigEyeBall_Model.bin' ?
+                                        (time) => sampleBigEyeBossAnimation(getPreviewTime(time)).index :
+                                enemy.enemyType === 0x06 ?
+                                    (time) => sampleMochtroidType06Animation(getEnemyTime(time)).index : undefined,
+                        selectMaterialAnimation: enemy.enemyType === 0x13 && specIndex === 0 ?
+                            (time) => sampleCylinderBossAnimation(getPreviewTime(time)).materialIndex :
+                            enemy.enemyType === 0x13 && spec.attachmentNodeName !== undefined ?
+                                (time) => sampleCylinderBossEyeAnimation(getPreviewTime(time) + specIndex * 500).index :
+                            enemy.enemyType === 0x18 && specIndex === 0 ? () => 1 : undefined,
+                        // InitializeGorea1A @ 0x02133A18 starts material
+                        // animation 26 independently at frame 8.
+                        mapMaterialAnimationTime: enemy.enemyType === 0x18 && specIndex === 0 ?
+                            (time) => getEnemyTime(time) + 8 * 1000 / 30 : undefined,
+                        mapAnimationTime: (time) => {
+                            const elapsed = getEnemyTime(time);
+                            if (enemy.enemyType === 0x03) {
+                                const sample = sampleMochtroidType03Animation(elapsed, enemy);
+                                // ApplyMochtroidType03State @ 0x02164968 starts
+                                // one-shot animations 3/4 and loops animation 0.
+                                return sample.state === 1 ? sample.timeInState :
+                                    Math.min(sample.timeInState, 19 * 1000 / 30);
+                            }
+                            if (enemy.enemyType === 0x00) {
+                                const sample = sampleWarWaspAnimation(getPreviewTime(time));
+                                return sample.state === 3 ?
+                                    sample.timeInState + 8 * 1000 / 30 :
+                                    sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x0A) {
+                                const sample = sampleBarbedWarWaspAnimation(getPreviewTime(time));
+                                return sample.state === 2 ?
+                                    sample.timeInState + 8 * 1000 / 30 :
+                                    sample.state === 3 ?
+                                        sample.timeInState + 10 * 1000 / 30 :
+                                        sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x04) {
+                                const sample = sampleMochtroidType04Animation(elapsed);
+                                return sample.state === 0 ?
+                                    Math.min(sample.timeInState, 29 * 1000 / 30) :
+                                    sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x05) {
+                                const sample = sampleMochtroidType05Animation(elapsed);
+                                return sample.state === 0 ?
+                                    Math.min(sample.timeInState, 19 * 1000 / 30) :
+                                    sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x10) {
+                                const sample = sampleBlastcapAnimation(getPreviewTime(time));
+                                return sample.state === 0 ? sample.timeInState :
+                                    Math.min(sample.timeInState, 19 * 1000 / 30);
+                            }
+                            if (enemy.enemyType === 0x0C)
+                                return sampleGeemerAnimation(getPreviewTime(time)).timeInState;
+                            if (enemy.enemyType === 0x13 && specIndex === 0)
+                                return sampleCylinderBossAnimation(getPreviewTime(time)).timeInState;
+                            if (enemy.enemyType === 0x0B)
+                                return sampleShriekbatAnimation(getPreviewTime(time)).timeInState;
+                            if (enemy.enemyType === 0x17) {
+                                const sample = samplePsychoBitAnimation(getPreviewTime(time));
+                                return sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x2E || enemy.enemyType === 0x2F) {
+                                const sample = sampleSphinkTickAnimation(getPreviewTime(time));
+                                return sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x25) {
+                                const sample = sampleDripStankAnimation(getPreviewTime(time));
+                                return sample.state === 9 || sample.state === 10 ?
+                                    sample.timeInState + 8 * 1000 / 30 :
+                                    sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x24) {
+                                const sample = sampleGuardBot1Animation(getPreviewTime(time));
+                                return sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x23) {
+                                const sample = sampleGuardBot2Animation(getPreviewTime(time));
+                                return sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x26) {
+                                const sample = sampleAlimbicStatueAnimation(getPreviewTime(time));
+                                return sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x27) {
+                                const sample = sampleLavaDemonAnimation(getPreviewTime(time));
+                                // ProcessLavaDemonDormantState @ 0x0215F464
+                                // retains the final concealed pose until the
+                                // activation-volume transition occurs.
+                                return sample.state === 0 || sample.state === 1 ?
+                                    89 * 1000 / 30 : sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x18 && specIndex === 0) {
+                                const sample = sampleGorea1AAnimation(getPreviewTime(time));
+                                return sample.state === 8 ?
+                                    sample.timeInState + 8 * 1000 / 30 :
+                                    sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x1F) {
+                                const sample = sampleGorea2Animation(getPreviewTime(time));
+                                return sample.state === 9 ?
+                                    sample.timeInState + 8 * 1000 / 30 :
+                                    sample.timeInState;
+                            }
+                            if (enemy.enemyType === 0x29 && spec.modelFilename === 'BigEyeBall_Model.bin')
+                                return sampleBigEyeBossAnimation(getPreviewTime(time)).timeInState;
+                            if (enemy.enemyType === 0x13 && spec.attachmentNodeName !== undefined)
+                                return sampleCylinderBossEyeAnimation(getPreviewTime(time) + specIndex * 500).timeInState;
+                            if (enemy.enemyType === 0x2D)
+                                return sampleBigEyeTurretAnimation(getPreviewTime(time)).timeInAnimation;
+                            if (enemy.enemyType === 0x06) {
+                                const sample = sampleMochtroidType06Animation(elapsed);
+                                return sample.state === 0 ?
+                                    Math.min(sample.timeInState, 9 * 1000 / 30) :
+                                    sample.timeInState;
+                            }
+                            if (!animationLoop)
+                                return Math.min(elapsed, duration);
+                            return (elapsed + (isWaspEnemy(enemy) ? 0 : getEnemyAnimationPhaseMilliseconds(enemy))) % duration;
+                        },
+                    };
+                });
+                this.movers.push((time) => calcEnemyModelMatrix(renderer.modelMatrix, enemy, simulation, getEnemyTime(time), renderer.modelScale, spec.localYawRadians));
+                renderers.push(renderer);
+                if (specIndex === 0)
+                    primaryEnemyRenderer = renderer;
+            }
+        }
         for (const artifact of this.entities.artifacts) {
             if (!artifact.active)
                 continue;
@@ -1172,6 +1519,18 @@ export class MPHEntityFile {
                 };
             });
             calcOctolithFlagModelMatrix(renderer.modelMatrix, flag, renderer.modelScale);
+            renderers.push(renderer);
+        }
+        for (const nodeDefense of this.entities.nodeDefenses) {
+            renderers.push(createEntityModelRenderer(device, this.cache, renderCache, nodeDefenseTerminalModelSpec, {
+                ...baseOptions,
+                modifyMaterialColor: modifyNodeDefenseMaterialColor,
+            }));
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, nodeDefenseDataFlowModelSpec, {
+                ...baseOptions,
+                modifyMaterialColor: modifyNodeDefenseMaterialColor,
+            });
+            calcNodeDefenseDataFlowModelMatrix(renderer.modelMatrix, nodeDefense, renderer.modelScale);
             renderers.push(renderer);
         }
         for (const teleporter of this.entities.teleporters) {

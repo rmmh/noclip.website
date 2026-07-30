@@ -10,14 +10,14 @@ import { TextureMapping } from "../TextureHolder.js";
 import { fillMatrix4x3, fillMatrix4x4, fillMatrix3x2, fillColor, fillVec4, fillVec4v } from "../gfx/helpers/UniformBufferHelpers.js";
 import { computeViewMatrix } from "../Camera.js";
 import AnimationController from "../AnimationController.js";
-import { bindMPHT, MPHAnimation, MPHNodeAnimator, MPHTexCoordAnimator } from "./mph_anim.js";
+import { bindMPHMaterial, bindMPHT, MPHAnimation, MPHMaterialAnimation, MPHMaterialAnimator, MPHNodeAnimation, MPHNodeAnimator, MPHTexCoordAnimator } from "./mph_anim.js";
 import { nArray, assertExists } from "../util.js";
 import { TEX0Texture, PAT0TexAnimator, TEX0, expand5to8 } from "../nns_g3d/NNS_G3D.js";
 import { setAttachmentStateSimple } from "../gfx/helpers/GfxMegaStateDescriptorHelpers.js";
 import { MPHbin, MPHMaterial, MPHNode, MPHShape } from "./mph_binModel.js";
 import { CalcBillboardFlags, Vec3Zero, calcBillboardMatrix, computeModelMatrixSRT } from "../MathHelpers.js";
 import { GfxRenderCache } from "../gfx/render/GfxRenderCache.js";
-import { White, colorNewCopy } from "../Color.js";
+import { Color, White, colorNewCopy } from "../Color.js";
 import { MPHCollisionData, MPHCollisionPortal } from "./mph_collision.js";
 
 function translateWrapMode(repeat: boolean, flip: boolean): GfxWrapMode {
@@ -67,12 +67,16 @@ class MaterialInstance {
     public emissionColor = colorNewCopy(White);
     public fogEnabled = true;
 
-    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimator: MPHTexCoordAnimator | null, entityModel: boolean, forceTwoSided: boolean, private fog: MPHFogConfig | null) {
+    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimator: MPHTexCoordAnimator | null, private materialAnimators: readonly (MPHMaterialAnimator | null)[], private selectMaterialAnimation: MPHRendererOptions['selectMaterialAnimation'], private modifyMaterialColor: MPHRendererOptions['modifyMaterialColor'], entityModel: boolean, forceTwoSided: boolean, private fog: MPHFogConfig | null) {
         const device = cache.device;
         const texData = tex0.textures.find((t) => t.name === this.material.textureName);
         this.texture = texData !== undefined ? texData: null;
         this.translateTexture(device, tex0, this.material.textureName, this.material.paletteName, entityModel);
-        this.baseCtx = { color: White, alpha: expand5to8(this.material.alpha) };
+        // ApplyMaterialAnimation @ 0x02052200 overwrites the copied material's
+        // alpha before drawing. Keep animated material alpha out of the baked
+        // vertex colors so the per-frame shader value can replace it.
+        const hasMaterialAnimation = this.materialAnimators.some((animator) => animator !== null);
+        this.baseCtx = { color: White, alpha: hasMaterialAnimation ? 0xFF : expand5to8(this.material.alpha) };
         if (entityModel) {
             this.diffuseColor = colorNewCopy(this.material.diffuseColor);
             this.ambientColor = colorNewCopy(this.material.ambientColor);
@@ -152,6 +156,28 @@ class MaterialInstance {
     }
 
     public setOnRenderInst(template: GfxRenderInst, viewerInput: Viewer.ViewerRenderInput, alphaMultiplier: number = 1, forceTranslucent: boolean = false): void {
+        const materialAnimationIndex = this.selectMaterialAnimation?.(viewerInput.time) ?? 0;
+        const materialAnimator = this.materialAnimators[materialAnimationIndex] ?? null;
+        if (materialAnimator !== null) {
+            const animatedAlpha = materialAnimator.calcColors(this.diffuseColor, this.ambientColor, this.specularColor);
+            alphaMultiplier *= animatedAlpha;
+            forceTranslucent ||= animatedAlpha < 1;
+            // RenderModelMaterial @ 0x02045B04 requests that MATERIAL_COLOR0
+            // also set the current vertex color. With lighting disabled, MPH
+            // therefore displays the animated diffuse color directly.
+            if (this.lightMask === 0) {
+                this.emissionColor.r = this.diffuseColor.r;
+                this.emissionColor.g = this.diffuseColor.g;
+                this.emissionColor.b = this.diffuseColor.b;
+            }
+        }
+        this.modifyMaterialColor?.(this.diffuseColor, this.material.name, viewerInput.time);
+        if (this.modifyMaterialColor !== undefined && this.lightMask === 0) {
+            this.emissionColor.r = this.diffuseColor.r;
+            this.emissionColor.g = this.diffuseColor.g;
+            this.emissionColor.b = this.diffuseColor.b;
+        }
+
         if (this.texCoordAnimator !== null) {
             this.texCoordAnimator.calcTexMtx(scratchTexMatrix, this.material.texScaleS, this.material.texScaleT);
         } else {
@@ -202,11 +228,12 @@ class Node {
             node.translation[0], node.translation[1], node.translation[2]);
     }
 
-    public calcMatrix(baseModelMatrix: mat4, viewMatrix: mat4, nodeAnimator: MPHNodeAnimator | null): void {
+    public calcMatrix(baseModelMatrix: mat4, viewMatrix: mat4, nodeAnimator: MPHNodeAnimator | null, timeInMilliseconds: number, modifyNodeMatrix: MPHRendererOptions['modifyNodeMatrix']): void {
         if (nodeAnimator !== null)
             nodeAnimator.calcNodeMatrix(this.localMatrix, this.index);
         else
             mat4.copy(this.localMatrix, this.bindMatrix);
+        modifyNodeMatrix?.(this.localMatrix, this.node.name, timeInMilliseconds);
         mat4.mul(this.modelMatrix, this.parent !== null ? this.parent.modelMatrix : baseModelMatrix, this.localMatrix);
 
         mat4.mul(this.drawMatrix, viewMatrix, this.modelMatrix);
@@ -326,6 +353,13 @@ export interface MPHRendererOptions {
     entityModel?: boolean;
     lighting?: MPHLighting;
     mapAnimationTime?: (timeInMilliseconds: number) => number;
+    mapMaterialAnimationTime?: (timeInMilliseconds: number) => number;
+    additionalNodeAnimations?: MPHNodeAnimation[];
+    additionalMaterialAnimations?: MPHMaterialAnimation[];
+    selectNodeAnimation?: (timeInMilliseconds: number) => number;
+    selectMaterialAnimation?: (timeInMilliseconds: number) => number;
+    modifyMaterialColor?: (dst: Color, materialName: string, timeInMilliseconds: number) => void;
+    modifyNodeMatrix?: (dst: mat4, nodeName: string, timeInMilliseconds: number) => void;
     nodeFilter?: (name: string) => boolean;
     forceBillboard?: boolean;
     forceTwoSided?: boolean;
@@ -365,6 +399,7 @@ export class MPHRenderer {
     public isSkybox: boolean = false;
     public visible: boolean = true;
     public animationController = new AnimationController();
+    private materialAnimationController = new AnimationController();
 
     private gfxProgram: GfxProgram;
     private materialInstances: MaterialInstance[] = [];
@@ -373,9 +408,13 @@ export class MPHRenderer {
     public modelScale: number;
     private nodeDrawOrder: Node[] = [];
     private nodeAnimator: MPHNodeAnimator | null;
+    private nodeAnimators: MPHNodeAnimator[];
+    private selectNodeAnimation: MPHRendererOptions['selectNodeAnimation'];
+    private modifyNodeMatrix: MPHRendererOptions['modifyNodeMatrix'];
     private sceneMode: MPHSceneMode;
     private lighting: MPHLighting | undefined;
     private mapAnimationTime: MPHRendererOptions['mapAnimationTime'];
+    private mapMaterialAnimationTime: MPHRendererOptions['mapMaterialAnimationTime'];
     private sceneTransform: mat4 | null;
     public viewerTextures: Viewer.Texture[] = [];
 
@@ -390,6 +429,9 @@ export class MPHRenderer {
         this.sceneMode = options.sceneMode ?? { kind: 'singlePlayer', geometrySet: 1 };
         this.lighting = options.lighting;
         this.mapAnimationTime = options.mapAnimationTime;
+        this.mapMaterialAnimationTime = options.mapMaterialAnimationTime;
+        this.selectNodeAnimation = options.selectNodeAnimation;
+        this.modifyNodeMatrix = options.modifyNodeMatrix;
         this.sceneTransform = options.sceneTransform !== undefined ? mat4.clone(options.sceneTransform) : null;
         const entityModel = options.entityModel ?? false;
         const collision = options.collision ?? null;
@@ -400,16 +442,25 @@ export class MPHRenderer {
         this.gfxProgram = cache.createProgram(program);
         const nodeAnimation = mphAnimation?.node ?? null;
         this.nodeAnimator = nodeAnimation !== null ? new MPHNodeAnimator(this.animationController, nodeAnimation) : null;
+        this.nodeAnimators = this.nodeAnimator !== null ? [this.nodeAnimator] : [];
+        for (const animation of options.additionalNodeAnimations ?? [])
+            this.nodeAnimators.push(new MPHNodeAnimator(this.animationController, animation));
         this.modelScale = mphModel.posScale * (1 << mphModel.scaleFactor);
         mat4.fromScaling(this.modelMatrix, [this.modelScale, this.modelScale, this.modelScale]);
 
         const texCoordAnimation = mphAnimation?.texCoord ?? null;
+        const materialAnimations = [
+            mphAnimation?.material ?? null,
+            ...(options.additionalMaterialAnimations ?? []),
+        ];
 
         for (let i = 0; i < mphModel.materials.length; i++) {
             const material = mphModel.materials[i];
             const texCoordAnimator = texCoordAnimation !== null ?
                 bindMPHT(this.animationController, texCoordAnimation, material.name) : null;
-            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimator, entityModel, options.forceTwoSided === true, options.fog ?? null));
+            const materialAnimators = materialAnimations.map((animation) =>
+                animation !== null ? bindMPHMaterial(this.materialAnimationController, animation, material.name) : null);
+            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimator, materialAnimators, options.selectMaterialAnimation, options.modifyMaterialColor, entityModel, options.forceTwoSided === true, options.fog ?? null));
         }
 
         for (let i = 0; i < mphModel.nodes.length; i++) {
@@ -472,13 +523,18 @@ export class MPHRenderer {
             return;
         this.animationController.setTimeInMilliseconds(this.mapAnimationTime !== undefined ?
             this.mapAnimationTime(viewerInput.time) : viewerInput.time);
+        this.materialAnimationController.setTimeInMilliseconds(this.mapMaterialAnimationTime !== undefined ?
+            this.mapMaterialAnimationTime(viewerInput.time) :
+            this.mapAnimationTime !== undefined ? this.mapAnimationTime(viewerInput.time) : viewerInput.time);
+        if (this.selectNodeAnimation !== undefined)
+            this.nodeAnimator = this.nodeAnimators[this.selectNodeAnimation(viewerInput.time)] ?? null;
         computeViewMatrix(scratchViewMatrix, viewerInput.camera);
         if (this.sceneTransform !== null)
             mat4.mul(scratchRootMatrix, this.sceneTransform, this.modelMatrix);
         else
             mat4.copy(scratchRootMatrix, this.modelMatrix);
         for (const node of this.nodeDrawOrder)
-            node.calcMatrix(scratchRootMatrix, scratchViewMatrix, this.nodeAnimator);
+            node.calcMatrix(scratchRootMatrix, scratchViewMatrix, this.nodeAnimator, viewerInput.time, this.modifyNodeMatrix);
 
         const template = renderInstManager.pushTemplate();
         template.setBindingLayouts(bindingLayouts);
