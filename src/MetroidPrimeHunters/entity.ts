@@ -184,6 +184,7 @@ type MPHTriggerVolume = MPHLightVolume;
 interface MPHTriggerVolumeEntity extends MPHEntityEntry {
     mode: number;
     initialState: number;
+    counter: number;
     volume: MPHTriggerVolume;
     targetEntityIds: readonly [number, number];
     messages: readonly [number, number];
@@ -531,6 +532,7 @@ function parseTriggerVolume(entry: MPHEntityEntry, view: DataView): MPHTriggerVo
         ...entry,
         mode: view.getUint32(offs + 0x28, true),
         initialState: view.getUint8(offs + 0x6E),
+        counter: view.getUint32(offs + 0x7C, true),
         volume,
         targetEntityIds: [
             view.getInt16(offs + 0x80, true),
@@ -1435,23 +1437,98 @@ function isEnemySpawnActivationMessage(message: number, messageParam: number): b
     return message === 0x12 || message === 5 && messageParam !== 0;
 }
 
-function findEnemyActivationVolumes(entities: MPHEntities, enemy: MPHEnemySpawnEntity): MPHTriggerVolumeEntity[] {
-    const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
-    const result = new Set<MPHTriggerVolumeEntity>();
+interface MPHEnemyActivationPlan {
+    rootVolume: MPHTriggerVolumeEntity | null;
+    waveDepth: number;
+}
 
-    const visitTarget = (source: MPHTriggerVolumeEntity, targetId: number,
-            message: number, messageParam: number, visited: Set<number>): void => {
-        if (targetId === enemy.entityId && isEnemySpawnActivationMessage(message, messageParam))
-            result.add(source);
-        const relay = triggerById.get(targetId);
-        if (relay === undefined || relay.mode !== 2 || visited.has(relay.entityId))
-            return;
-        visited.add(relay.entityId);
-        // HandleTriggerVolumeMessage @ 0x0210B348 forwards the incoming
-        // message unchanged through both targets for mode 2.
-        for (const relayTarget of relay.targetEntityIds)
-            if (relayTarget !== -1)
-                visitTarget(source, relayTarget, message, messageParam, visited);
+const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
+
+function buildEnemyActivationPlans(entities: MPHEntities): Map<number, MPHEnemyActivationPlan[]> {
+    const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
+    const enemyById = new Map(entities.enemySpawns.map((enemy) => [enemy.entityId, enemy]));
+    const result = new Map<number, MPHEnemyActivationPlan[]>();
+
+    interface MessageEvent {
+        targetId: number;
+        message: number;
+        messageParam: number;
+        waveDepth: number;
+        visitedRelays: Set<number>;
+    }
+
+    const simulate = (rootVolume: MPHTriggerVolumeEntity | null, initialEvents: MessageEvent[],
+            initiallyCompletedEnemies: MPHEnemySpawnEntity[] = []): void => {
+        const events = initialEvents;
+        const remainingCounters = new Map(entities.triggerVolumes.map((trigger) =>
+            [trigger.entityId, trigger.counter]));
+        const completedEnemies = new Set<number>();
+
+        const enqueueCompletion = (enemy: MPHEnemySpawnEntity, waveDepth: number): void => {
+            if (enemy.totalSpawnLimit === 0 || completedEnemies.has(enemy.entityId))
+                return;
+            completedEnemies.add(enemy.entityId);
+            // CompleteEnemySpawnController @ 0x0211DA14 sends param0 = -1
+            // and param1 = 0 after the finite wave has exhausted its spawn
+            // count and all live children are gone.
+            for (let i = 0; i < enemy.completionTargetEntityIds.length; i++) {
+                const targetId = enemy.completionTargetEntityIds[i];
+                const message = enemy.completionMessages[i];
+                if (targetId !== -1 && message !== 0)
+                    events.push({ targetId, message, messageParam: -1, waveDepth: waveDepth + 1, visitedRelays: new Set() });
+            }
+        };
+
+        for (const enemy of initiallyCompletedEnemies)
+            enqueueCompletion(enemy, 0);
+
+        for (let eventIndex = 0; eventIndex < events.length && eventIndex < 10000; eventIndex++) {
+            const event = events[eventIndex];
+            const enemy = enemyById.get(event.targetId);
+            if (enemy !== undefined && isEnemySpawnActivationMessage(event.message, event.messageParam)) {
+                let plans = result.get(enemy.entityId);
+                if (plans === undefined)
+                    result.set(enemy.entityId, plans = []);
+                if (!plans.some((plan) => plan.rootVolume === rootVolume && plan.waveDepth === event.waveDepth))
+                    plans.push({ rootVolume, waveDepth: event.waveDepth });
+                enqueueCompletion(enemy, event.waveDepth);
+                continue;
+            }
+
+            const trigger = triggerById.get(event.targetId);
+            if (trigger === undefined)
+                continue;
+            if (trigger.mode === 2) {
+                if (event.visitedRelays.has(trigger.entityId))
+                    continue;
+                const visitedRelays = new Set(event.visitedRelays);
+                visitedRelays.add(trigger.entityId);
+                // HandleTriggerVolumeMessage @ 0x0210B348 forwards the
+                // incoming message unchanged through both mode-2 targets.
+                for (const targetId of trigger.targetEntityIds)
+                    if (targetId !== -1)
+                        events.push({ ...event, targetId, visitedRelays });
+            } else if (trigger.mode === 1 && trigger.initialState !== 0 && event.message === 9) {
+                const remaining = Math.max(0, (remainingCounters.get(trigger.entityId) ?? 0) - 1);
+                remainingCounters.set(trigger.entityId, remaining);
+                if (remaining === 0) {
+                    // UpdateTriggerVolumeEntity @ 0x0210AA84 dispatches the
+                    // authored outputs once HandleTriggerVolumeMessage has
+                    // reduced the mode-1 runtime counter to zero.
+                    for (let i = 0; i < trigger.targetEntityIds.length; i++) {
+                        const targetId = trigger.targetEntityIds[i];
+                        if (targetId !== -1)
+                            events.push({
+                                targetId,
+                                message: trigger.messages[i],
+                                messageParam: trigger.messageParams[i],
+                                waveDepth: event.waveDepth,
+                                visitedRelays: new Set(),
+                            });
+                    }
+                }
+            }
+        }
     };
 
     for (const trigger of entities.triggerVolumes) {
@@ -1459,13 +1536,25 @@ function findEnemyActivationVolumes(entities: MPHEntities, enemy: MPHEnemySpawnE
         // intersection only for active mode-0 triggers.
         if (trigger.mode !== 0 || trigger.initialState === 0)
             continue;
+        const events: MessageEvent[] = [];
         for (let i = 0; i < trigger.targetEntityIds.length; i++) {
             const targetId = trigger.targetEntityIds[i];
             if (targetId !== -1)
-                visitTarget(trigger, targetId, trigger.messages[i], trigger.messageParams[i], new Set());
+                events.push({
+                    targetId,
+                    message: trigger.messages[i],
+                    messageParam: trigger.messageParams[i],
+                    waveDepth: 0,
+                    visitedRelays: new Set(),
+                });
         }
+        simulate(trigger, events);
     }
-    return [...result];
+
+    // Initially active finite controllers can also complete and advance an
+    // authored counter chain without a spatial TriggerVolume root.
+    simulate(null, [], entities.enemySpawns.filter((enemy) => enemy.initialState !== 0));
+    return result;
 }
 
 export class MPHEntityFile {
@@ -1550,6 +1639,7 @@ export class MPHEntityFile {
         const normalizedEntityFilename = normalizeEntityFilename(this.entityFilename);
         const inverseSceneTransform = sceneTransform !== undefined ?
             mat4.invert(mat4.create(), sceneTransform) : null;
+        const enemyActivationPlans = buildEnemyActivationPlans(this.entities);
         for (const platform of this.entities.platforms) {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
@@ -1666,7 +1756,8 @@ export class MPHEntityFile {
             let controllerActive = enemy.initialState !== 0;
             let enemySpawnTime: number | null = null;
             let enemyTriggered = false;
-            const activationVolumes = findEnemyActivationVolumes(this.entities, enemy);
+            const activationPlans = enemyActivationPlans.get(enemy.entityId) ?? [];
+            const rootActivationTimes = new Map<number, number>();
             const cameraRoomPosition = vec3.create();
             const getControllerTime = (time: number): number => {
                 if (controllerStartTime === null)
@@ -1711,16 +1802,35 @@ export class MPHEntityFile {
                         // create children until the controller is active and
                         // its authored initial delay has elapsed.
                         isVisibleAtTime: (time, viewerInput) => {
+                            if (controllerStartTime === null)
+                                controllerStartTime = time;
                             if (enemyTriggered)
                                 return true;
                             const cameraMatrix = viewerInput.camera.worldMatrix;
                             vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
                             if (inverseSceneTransform !== null)
                                 vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
-                            if (!controllerActive && activationVolumes.some((trigger) =>
-                                pointInsideVolume(trigger.volume, cameraRoomPosition))) {
-                                controllerActive = true;
-                                controllerActivationTime = time;
+                            if (!controllerActive) {
+                                for (const plan of activationPlans) {
+                                    let rootActivationTime: number | null = controllerStartTime;
+                                    if (plan.rootVolume !== null) {
+                                        rootActivationTime = rootActivationTimes.get(plan.rootVolume.entityId) ?? null;
+                                        if (rootActivationTime === null &&
+                                            pointInsideVolume(plan.rootVolume.volume, cameraRoomPosition)) {
+                                            rootActivationTime = time;
+                                            rootActivationTimes.set(plan.rootVolume.entityId, time);
+                                        }
+                                    }
+                                    if (rootActivationTime !== null) {
+                                        const scheduledActivationTime =
+                                            rootActivationTime + plan.waveDepth * ENEMY_PREVIEW_WAVE_DWELL_MS;
+                                        if (time >= scheduledActivationTime) {
+                                            controllerActive = true;
+                                            controllerActivationTime = scheduledActivationTime;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                             if (!controllerActive)
                                 return false;

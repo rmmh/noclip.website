@@ -29,6 +29,8 @@ export interface MPHEnemySpawnEntity extends MPHEnemySpawnEntry {
     respawnDelayTicks: number;
     initialDelayTicks: number;
     activationRadius: number;
+    completionTargetEntityIds: readonly [number, number, number];
+    completionMessages: readonly [number, number, number];
     hoverCenter: vec3 | null;
     hoverBobAngleStep: number;
     hoverBobRadius: number;
@@ -308,6 +310,19 @@ export function parseEnemySpawn(entry: MPHEnemySpawnEntry, view: DataView, rando
         respawnDelayTicks: view.getUint16(offs + 0x1C6, true),
         initialDelayTicks: view.getUint16(offs + 0x1C8, true),
         activationRadius: readFx32(view, offs + 0x1CC),
+        // CompleteEnemySpawnController @ 0x0211DA14 dispatches these three
+        // authored messages after a finite spawner has exhausted its total
+        // count and all live children are gone.
+        completionTargetEntityIds: [
+            view.getInt16(offs + 0x1E4, true),
+            view.getInt16(offs + 0x1EC, true),
+            view.getInt16(offs + 0x1F4, true),
+        ],
+        completionMessages: [
+            view.getUint32(offs + 0x1E8, true),
+            view.getUint32(offs + 0x1F0, true),
+            view.getUint32(offs + 0x1F8, true),
+        ],
         hoverCenter,
         hoverBobAngleStep,
         hoverBobRadius,
