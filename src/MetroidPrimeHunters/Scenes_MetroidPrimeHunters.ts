@@ -4,6 +4,7 @@
 import * as Viewer from '../viewer.js';
 import * as CX from '../Common/Compression/CX.js';
 import * as ARC from './mph_arc.js';
+import * as UI from '../ui.js';
 import { parseMPH_Model, parseTEX0Texture } from './mph_binModel.js';
 import { parseMPHAnimation } from './mph_anim.js';
 import { findAreaMetadata, MPHMetadata, sceneIdToModelStem } from './area_metadata.js';
@@ -12,7 +13,7 @@ import { MPHEntityFile, parseMPHEntities } from './entity.js';
 import { DataFetcher } from '../DataFetcher.js';
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
 import { GfxDevice } from '../gfx/platform/GfxPlatform.js';
-import { MPHLighting, MPHRenderer, MPHSceneMode } from './render.js';
+import { MPHFogConfig, MPHLighting, MPHRenderer, MPHSceneMode } from './render.js';
 import { assertExists } from '../util.js';
 import { makeBackbufferDescSimple, opaqueBlackFullClearRenderPassDescriptor } from '../gfx/helpers/RenderGraphHelpers.js';
 import { FakeTextureHolder } from '../TextureHolder.js';
@@ -22,6 +23,7 @@ import { GfxrAttachmentSlot } from '../gfx/render/GfxRenderGraph.js';
 import { GfxRenderHelper } from '../gfx/render/GfxRenderHelper.js';
 import { GfxRenderCache } from '../gfx/render/GfxRenderCache.js';
 import { GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
+import { colorNewFromRGBA } from '../Color.js';
 
 const pathBase = `MetroidPrimeHunters`;
 
@@ -101,6 +103,22 @@ export class MPHSceneRenderer implements Viewer.SceneGfx {
 
     public adjustCameraController(c: CameraController) {
         c.setSceneMoveSpeedMult(0.5/60);
+    }
+
+    public createPanels(): UI.Panel[] {
+        const panel = new UI.Panel();
+        panel.customHeaderBackgroundColor = UI.COOL_BLUE_COLOR;
+        panel.setTitle(UI.RENDER_HACKS_ICON, 'Render Hacks');
+
+        const fog = new UI.Checkbox('Area Fog', true);
+        fog.onchanged = () => {
+            this.stageRenderer.setFogEnabled(fog.checked);
+            for (const renderer of this.objectRenderers)
+                renderer.setFogEnabled(fog.checked);
+        };
+        panel.contents.appendChild(fog.elem);
+
+        return [panel];
     }
 
     private prepareToRender(device: GfxDevice, viewerInput: Viewer.ViewerRenderInput): void {
@@ -202,6 +220,20 @@ class SceneDesc implements Viewer.SceneDesc {
                 [-area.lightVector1[0] / 0x1000, -area.lightVector1[1] / 0x1000, -area.lightVector1[2] / 0x1000],
             ],
         } : null;
+        const fog: MPHFogConfig | null = area !== null && area.fog.enabled ? {
+            color: colorNewFromRGBA(
+                (area.fog.color & 0x1F) / 31,
+                ((area.fog.color >>> 5) & 0x1F) / 31,
+                ((area.fog.color >>> 10) & 0x1F) / 31,
+                1,
+            ),
+            offset: area.fog.offset,
+            depthShift: area.fog.depthShift,
+            densityTable: Array.from({ length: 32 }, (_, i) => i * 4),
+            depthMode: 'w',
+            near: 1,
+            far: 400,
+        } : null;
 
         const textureFile = textureFilename !== null ? modelCache.getFileData(`levels/textures/${textureFilename}`) : null;
         const stageTex = textureFile !== null ? parseTEX0Texture(textureFile, stageBin.mphTex) : parseTEX0Texture(assertExists(bin_Model), stageBin.mphTex);
@@ -209,9 +241,10 @@ class SceneDesc implements Viewer.SceneDesc {
         const animation = animationFile !== null ? parseMPHAnimation(animationFile) : null;
         renderer.stageRenderer = new MPHRenderer(device, renderer.getCache(), stageBin, stageBin.tex0 !== null ? stageBin.tex0 : assertExists(stageTex), animation, {
             sceneMode,
+            fog,
         });
         if (entities !== null) {
-            renderer.objectRenderers.push(...entities.createRenderers(device, renderer.getCache(), assertExists(lighting)));
+            renderer.objectRenderers.push(...entities.createRenderers(device, renderer.getCache(), assertExists(lighting), fog));
             renderer.entities = entities;
         }
 

@@ -6,7 +6,7 @@ import { GfxRenderCache } from '../gfx/render/GfxRenderCache.js';
 import { fx32, TEX0 } from '../nns_g3d/NNS_G3D.js';
 import { MPHAnimation, parseMPHAnimation } from './mph_anim.js';
 import { fxAngle, MPHbin, parseMPH_Model, parseTEX0Texture } from './mph_binModel.js';
-import { MPHLighting, MPHRenderer, MPHRendererOptions, MPHSceneMode } from './render.js';
+import { MPHFogConfig, MPHLighting, MPHRenderer, MPHRendererOptions, MPHSceneMode } from './render.js';
 
 const ENTITY_HEADER_SIZE = 0x24;
 const ENTITY_ENTRY_SIZE = 0x18;
@@ -1007,9 +1007,9 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, forceFieldModelSpec);
     }
 
-    public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting): MPHRenderer[] {
+    public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting, fog: MPHFogConfig | null): MPHRenderer[] {
         const renderers: MPHRenderer[] = [];
-        const baseOptions: MPHRendererOptions = { sceneMode: this.sceneMode, lighting };
+        const baseOptions: MPHRendererOptions = { sceneMode: this.sceneMode, lighting, fog };
         for (const platform of this.entities.platforms) {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
@@ -1030,8 +1030,7 @@ export class MPHEntityFile {
             if (spec === null)
                 continue;
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, {
-                sceneMode: this.sceneMode,
-                lighting,
+                ...baseOptions,
             });
             calcOrientedModelMatrix(renderer.modelMatrix, object.position, object.facing, object.up, renderer.modelScale);
             renderers.push(renderer);
@@ -1043,6 +1042,7 @@ export class MPHEntityFile {
                 const animationDuration = Math.max(0, (animation?.node?.frameCount ?? 1) - 1) * 1000 / 30;
                 return {
                     sceneMode: this.sceneMode,
+                    fog,
                     mapAnimationTime: (time) => {
                         let phase = (time + (index & 1) * DOOR_HALF_CYCLE_DURATION) % (DOOR_HALF_CYCLE_DURATION * 2);
                         if (phase < DOOR_OPEN_HOLD_DURATION)
@@ -1066,8 +1066,7 @@ export class MPHEntityFile {
             const item = this.entities.itemSpawns[index];
             const phaseAngle = index * ITEM_SPAWN_PREVIEW_PHASE_STEP;
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getItemModelSpec(this.metadata, item), {
-                sceneMode: this.sceneMode,
-                lighting,
+                ...baseOptions,
             });
             this.movers.push((time) => calcItemSpawnModelMatrix(renderer.modelMatrix, item, phaseAngle, time, renderer.modelScale));
             renderers.push(renderer);
@@ -1092,7 +1091,7 @@ export class MPHEntityFile {
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getArtifactModelSpec(artifact), (animation) => {
                 const duration = getAnimationLoopDuration(animation);
                 return {
-                    sceneMode: this.sceneMode,
+                    ...baseOptions,
                     lighting: { colors, directions },
                     mapAnimationTime: (time) => time % duration,
                 };
@@ -1102,16 +1101,14 @@ export class MPHEntityFile {
         }
         for (const jumpPad of this.entities.jumpPads) {
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getJumpPadModelSpec(jumpPad), {
-                sceneMode: this.sceneMode,
-                lighting,
+                ...baseOptions,
             });
             calcJumpPadModelMatrix(renderer.modelMatrix, jumpPad, renderer.modelScale);
             renderers.push(renderer);
             if (!jumpPad.active)
                 continue;
             const beamRenderer = createEntityModelRenderer(device, this.cache, renderCache, getJumpPadBeamModelSpec(jumpPad), {
-                sceneMode: this.sceneMode,
-                lighting,
+                ...baseOptions,
             });
             calcJumpPadBeamModelMatrix(beamRenderer.modelMatrix, jumpPad, beamRenderer.modelScale);
             renderers.push(beamRenderer);
@@ -1123,8 +1120,7 @@ export class MPHEntityFile {
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getFlagBaseModelSpec(flagBase, captureTheFlag), (animation) => {
                 const duration = getAnimationLoopDuration(animation);
                 return {
-                    sceneMode: this.sceneMode,
-                    lighting,
+                    ...baseOptions,
                     mapAnimationTime: (time) => time % duration,
                 };
             });
@@ -1135,8 +1131,7 @@ export class MPHEntityFile {
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getOctolithFlagModelSpec(flag), (animation) => {
                 const duration = getAnimationLoopDuration(animation);
                 return {
-                    sceneMode: this.sceneMode,
-                    lighting,
+                    ...baseOptions,
                     mapAnimationTime: (time) => time % duration,
                 };
             });
@@ -1149,8 +1144,7 @@ export class MPHEntityFile {
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getTeleporterModelSpec(this.sceneMode), (animation) => {
                 const duration = getAnimationLoopDuration(animation);
                 return {
-                    sceneMode: this.sceneMode,
-                    lighting,
+                    ...baseOptions,
                     mapAnimationTime: (time) => time % duration,
                 };
             });
@@ -1163,8 +1157,7 @@ export class MPHEntityFile {
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getForceFieldModelSpec(forceField), (animation) => {
                 const duration = getAnimationLoopDuration(animation);
                 return {
-                    sceneMode: this.sceneMode,
-                    lighting,
+                    ...baseOptions,
                     mapAnimationTime: (time) => time % duration,
                 };
             });

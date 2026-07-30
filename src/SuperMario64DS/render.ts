@@ -10,7 +10,7 @@ import { DeviceProgram } from '../Program.js';
 import { computeViewMatrix, computeViewMatrixSkybox } from '../Camera.js';
 import { TextureMapping } from '../TextureHolder.js';
 import { GfxFormat, GfxBufferUsage, GfxBlendMode, GfxBlendFactor, GfxDevice, GfxBuffer, GfxVertexBufferFrequency, GfxTexFilterMode, GfxMipFilterMode, GfxInputLayout, GfxVertexAttributeDescriptor, GfxSampler, makeTextureDescriptor2D, GfxMegaStateDescriptor, GfxTexture, GfxInputLayoutBufferDescriptor, GfxVertexBufferDescriptor, GfxIndexBufferDescriptor, GfxBufferFrequencyHint } from '../gfx/platform/GfxPlatform.js';
-import { fillMatrix4x3, fillMatrix4x2, fillColor } from '../gfx/helpers/UniformBufferHelpers.js';
+import { fillMatrix4x3, fillMatrix4x2, fillColor, fillVec4 } from '../gfx/helpers/UniformBufferHelpers.js';
 import { GfxRenderInstManager, GfxRenderInst, makeSortKey, GfxRendererLayer } from '../gfx/render/GfxRenderInstManager.js';
 import { parseTexImageParamWrapModeS, parseTexImageParamWrapModeT } from './nitro_tex.js';
 import { assert, nArray } from '../util.js';
@@ -19,7 +19,7 @@ import AnimationController from '../AnimationController.js';
 import { CalcBillboardFlags, calcBillboardMatrix, computeMatrixWithoutScale } from '../MathHelpers.js';
 import { GfxRenderCache } from '../gfx/render/GfxRenderCache.js';
 import { setAttachmentStateSimple } from '../gfx/helpers/GfxMegaStateDescriptorHelpers.js';
-import { White, colorNewCopy } from '../Color.js';
+import { Color, White, colorNewCopy } from '../Color.js';
 import { GfxShaderLibrary } from '../gfx/helpers/GfxShaderLibrary.js';
 import { createBufferFromData } from '../gfx/helpers/BufferHelpers.js';
 
@@ -33,6 +33,7 @@ export class NITRO_Program extends DeviceProgram {
     public static ub_SceneParams = 0;
     public static ub_MaterialParams = 1;
     public static ub_DrawParams = 2;
+    public static ub_MaterialParamsWordCount = 8 + 15 * 4;
 
     public static both = `
 precision highp float;
@@ -50,7 +51,8 @@ layout(std140) uniform ub_SceneParams {
 // Expected to change with each material.
 layout(std140) uniform ub_MaterialParams {
     Mat2x4 u_TexMtx[1];
-    vec4 u_Misc[4];
+    vec4 u_Misc[7];
+    vec4 u_FogTable[8];
 };
 #define u_DiffuseColor  (u_Misc[0].xyz)
 #define u_AmbientColor  (u_Misc[1].xyz)
@@ -58,6 +60,16 @@ layout(std140) uniform ub_MaterialParams {
 #define u_EmissionColor (u_Misc[3].xyz)
 #define u_TexCoordMode  (u_Misc[0].w)
 #define u_LightMask     (u_Misc[1].w)
+#define u_FogColor      (u_Misc[4])
+#define u_FogParams     (u_Misc[5])
+#define u_FogDepthParams (u_Misc[6])
+#define u_FogOffset     (u_FogParams.x)
+#define u_FogStep       (u_FogParams.y)
+#define u_FogEnabled    (u_FogParams.z)
+#define u_FogAlphaOnly  (u_FogParams.w)
+#define u_FogDepthMode  (u_FogDepthParams.x)
+#define u_FogNear       (u_FogDepthParams.y)
+#define u_FogFar        (u_FogDepthParams.z)
 
 layout(std140) uniform ub_DrawParams {
     Mat3x4 u_PosMtx[32];
@@ -124,6 +136,38 @@ precision highp float;
 in vec4 v_Color;
 in vec2 v_TexCoord;
 
+#ifdef USE_FOG
+float ReadFogDensity(int index) {
+    int t_VectorIndex = index / 4;
+    int t_ComponentIndex = index - t_VectorIndex * 4;
+    return u_FogTable[t_VectorIndex][t_ComponentIndex];
+}
+
+float CalcFogDepth() {
+    if (u_FogDepthMode == 1.0) {
+        float t_ClipW = 1.0 / gl_FragCoord.w;
+        return clamp((t_ClipW - u_FogNear) / (u_FogFar - u_FogNear), 0.0, 1.0) * 32767.0;
+    }
+    return gl_FragCoord.z * 32767.0;
+}
+
+float SampleFogDensity(float depth) {
+    float t_Position = (depth - u_FogOffset) / u_FogStep - 1.0;
+    int t_Index0 = int(clamp(floor(t_Position), 0.0, 31.0));
+    int t_Index1 = min(t_Index0 + 1, 31);
+    float t_Fraction = clamp(t_Position - float(t_Index0), 0.0, 1.0);
+    float t_Density = mix(ReadFogDensity(t_Index0), ReadFogDensity(t_Index1), t_Fraction);
+    return t_Density == 127.0 ? 1.0 : t_Density / 128.0;
+}
+
+void ApplyFog(inout vec4 color) {
+    float t_Density = SampleFogDensity(CalcFogDepth());
+    if (u_FogAlphaOnly == 0.0)
+        color.rgb = mix(color.rgb, u_FogColor.rgb, t_Density);
+    color.a = mix(color.a, u_FogColor.a, t_Density);
+}
+#endif
+
 void main() {
     gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
 
@@ -135,10 +179,36 @@ void main() {
     gl_FragColor *= v_Color;
 #endif
 
+#ifdef USE_FOG
+    if (u_FogEnabled != 0.0)
+        ApplyFog(gl_FragColor);
+#endif
+
     if (gl_FragColor.a == 0.0)
         discard;
 }
 `;
+}
+
+export interface NITROFogConfig {
+    color: Color;
+    offset: number;
+    depthShift: number;
+    densityTable: readonly number[];
+    depthMode: 'z' | 'w';
+    near: number;
+    far: number;
+    alphaOnly?: boolean;
+}
+
+export function fillNITROFogParams(dst: Float32Array, offs: number, fog: NITROFogConfig | null, enabled: boolean = true): number {
+    const start = offs;
+    offs += fillColor(dst, offs, fog?.color ?? White);
+    offs += fillVec4(dst, offs, fog?.offset ?? 0, 0x400 >>> (fog?.depthShift ?? 0), fog !== null && enabled ? 1 : 0, fog?.alphaOnly === true ? 1 : 0);
+    offs += fillVec4(dst, offs, fog?.depthMode === 'w' ? 1 : 0, fog?.near ?? 0, fog?.far ?? 1, 0);
+    for (let i = 0; i < 32; i++)
+        dst[offs++] = fog?.densityTable[i] ?? 0;
+    return offs - start;
 }
 
 export class VertexData {
@@ -379,13 +449,14 @@ class MaterialInstance {
             }
         }
 
-        let offs = template.allocateUniformBuffer(NITRO_Program.ub_MaterialParams, 8+16);
+        let offs = template.allocateUniformBuffer(NITRO_Program.ub_MaterialParams, NITRO_Program.ub_MaterialParamsWordCount);
         const materialParamsMapped = template.mapUniformBufferF32(NITRO_Program.ub_MaterialParams);
         offs += fillMatrix4x2(materialParamsMapped, offs, scratchMatrix);
         offs += fillColor(materialParamsMapped, offs, this.diffuseColor, this.texCoordMode);
         offs += fillColor(materialParamsMapped, offs, this.ambientColor, this.lightMask);
         offs += fillColor(materialParamsMapped, offs, this.specularColor);
         offs += fillColor(materialParamsMapped, offs, this.emissionColor);
+        offs += fillNITROFogParams(materialParamsMapped, offs, null);
 
         template.setSamplerBindingsFromTextureMappings(this.materialData.textureMapping);
     }

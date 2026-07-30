@@ -7,7 +7,7 @@ import { AABB } from "../Geometry.js";
 import { CalcBillboardFlags, calcBillboardMatrix } from "../MathHelpers.js";
 import * as NITRO_GX from '../SuperMario64DS/nitro_gx.js';
 import { Texture, getFormatName, parseTexImageParamWrapModeS, parseTexImageParamWrapModeT, readTexture, textureFormatIsTranslucent } from "../SuperMario64DS/nitro_tex.js";
-import { NITRO_Program, VertexData } from '../SuperMario64DS/render.js';
+import { fillNITROFogParams, NITRO_Program, VertexData } from '../SuperMario64DS/render.js';
 import { TextureMapping } from "../TextureHolder.js";
 import { setAttachmentStateSimple } from "../gfx/helpers/GfxMegaStateDescriptorHelpers.js";
 import { fillColor, fillMatrix3x2, fillMatrix4x3 } from "../gfx/helpers/UniformBufferHelpers.js";
@@ -149,13 +149,14 @@ class MaterialInstance {
 
         template.setSamplerBindingsFromTextureMappings(this.textureMappings);
 
-        let offs = template.allocateUniformBuffer(NITRO_Program.ub_MaterialParams, 8+16);
+        let offs = template.allocateUniformBuffer(NITRO_Program.ub_MaterialParams, NITRO_Program.ub_MaterialParamsWordCount);
         const d = template.mapUniformBufferF32(NITRO_Program.ub_MaterialParams);
         offs += fillMatrix3x2(d, offs, scratchTexMatrix);
         offs += fillColor(d, offs, this.diffuseColor, 0);
         offs += fillColor(d, offs, this.ambientColor, this.lightMask);
         offs += fillColor(d, offs, this.specularColor);
         offs += fillColor(d, offs, this.emissionColor);
+        offs += fillNITROFogParams(d, offs, null);
     }
 
     public destroy(device: GfxDevice): void {

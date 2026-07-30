@@ -4,7 +4,7 @@ import { GfxFormat, GfxDevice, GfxProgram, GfxBindingLayoutDescriptor, GfxTextur
 import * as Viewer from '../viewer.js';
 import * as NITRO_GX from '../SuperMario64DS/nitro_gx.js';
 import { readTexture, getFormatName, Texture, textureFormatIsTranslucent } from "../SuperMario64DS/nitro_tex.js";
-import { NITRO_Program, VertexData } from '../SuperMario64DS/render.js';
+import { fillNITROFogParams, NITROFogConfig, NITRO_Program, VertexData } from '../SuperMario64DS/render.js';
 import { GfxRenderInstManager, GfxRenderInst, GfxRendererLayer, makeSortKeyOpaque } from "../gfx/render/GfxRenderInstManager.js";
 import { TextureMapping } from "../TextureHolder.js";
 import { fillMatrix4x3, fillMatrix4x4, fillMatrix3x2, fillColor, fillVec4, fillVec4v } from "../gfx/helpers/UniformBufferHelpers.js";
@@ -41,6 +41,8 @@ function parseMPHTexImageParamWrapModeT(w0: number): GfxWrapMode {
 }
 
 const scratchTexMatrix = mat2d.create();
+export type MPHFogConfig = NITROFogConfig;
+
 class MaterialInstance {
     private texture: TEX0Texture | null;
     private gfxTextures: GfxTexture[] = [];
@@ -57,8 +59,9 @@ class MaterialInstance {
     public ambientColor = colorNewCopy(White);
     public specularColor = colorNewCopy(White);
     public emissionColor = colorNewCopy(White);
+    public fogEnabled = true;
 
-    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimator: MPHTexCoordAnimator | null, entityModel: boolean, forceTwoSided: boolean) {
+    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimator: MPHTexCoordAnimator | null, entityModel: boolean, forceTwoSided: boolean, private fog: MPHFogConfig | null) {
         const device = cache.device;
         const texData = tex0.textures.find((t) => t.name === this.material.textureName);
         this.texture = texData !== undefined ? texData: null;
@@ -161,13 +164,14 @@ class MaterialInstance {
 
         template.setSamplerBindingsFromTextureMappings(this.textureMappings);
 
-        let offs = template.allocateUniformBuffer(NITRO_Program.ub_MaterialParams, 8+16);
+        let offs = template.allocateUniformBuffer(NITRO_Program.ub_MaterialParams, NITRO_Program.ub_MaterialParamsWordCount);
         const materialParamsMapped = template.mapUniformBufferF32(NITRO_Program.ub_MaterialParams);
         offs += fillMatrix3x2(materialParamsMapped, offs, scratchTexMatrix);
         offs += fillColor(materialParamsMapped, offs, this.diffuseColor, 0);
         offs += fillColor(materialParamsMapped, offs, this.ambientColor, this.lightMask);
         offs += fillColor(materialParamsMapped, offs, this.specularColor);
         offs += fillColor(materialParamsMapped, offs, this.emissionColor);
+        offs += fillNITROFogParams(materialParamsMapped, offs, this.fog, this.fogEnabled);
     }
 
     public destroy(device: GfxDevice): void {
@@ -302,6 +306,7 @@ export interface MPHRendererOptions {
     nodeFilter?: (name: string) => boolean;
     forceBillboard?: boolean;
     forceTwoSided?: boolean;
+    fog?: MPHFogConfig | null;
 }
 
 function nodeIsVisibleInMode(name: string, mode: MPHSceneMode): boolean {
@@ -362,6 +367,7 @@ export class MPHRenderer {
         const program = new NITRO_Program();
         program.defines.set('USE_VERTEX_COLOR', '1');
         program.defines.set('USE_TEXTURE', '1');
+        program.defines.set('USE_FOG', '1');
         this.gfxProgram = cache.createProgram(program);
         const nodeAnimation = mphAnimation?.node ?? null;
         this.nodeAnimator = nodeAnimation !== null ? new MPHNodeAnimator(this.animationController, nodeAnimation) : null;
@@ -374,7 +380,7 @@ export class MPHRenderer {
             const material = mphModel.materials[i];
             const texCoordAnimator = texCoordAnimation !== null ?
                 bindMPHT(this.animationController, texCoordAnimation, material.name) : null;
-            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimator, entityModel, options.forceTwoSided === true));
+            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimator, entityModel, options.forceTwoSided === true, options.fog ?? null));
         }
 
         for (let i = 0; i < mphModel.nodes.length; i++) {
@@ -419,6 +425,11 @@ export class MPHRenderer {
                 this.shapeInstances.push(new ShapeInstance(cache, this.materialInstances[mesh.matID], node, shape, matrixNodes, numMatrices));
             }
         }
+    }
+
+    public setFogEnabled(enabled: boolean): void {
+        for (const material of this.materialInstances)
+            material.fogEnabled = enabled;
     }
 
     public prepareToRender(renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput): void {
