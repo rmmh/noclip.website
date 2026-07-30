@@ -1444,11 +1444,17 @@ interface MPHEnemyActivationPlan {
     waveDepth: number;
 }
 
+interface MPHForceFieldTransitionPlan extends MPHEnemyActivationPlan {
+    active: boolean;
+}
+
 const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
+const FORCE_FIELD_FADE_DURATION_MS = 31 * 1000 / 30;
 
 interface MPHEntityActivationPlans {
     enemies: Map<number, MPHEnemyActivationPlan[]>;
     items: Map<number, MPHEnemyActivationPlan[]>;
+    forceFields: Map<number, MPHForceFieldTransitionPlan[]>;
 }
 
 function addEntityActivationPlan(plansByEntityId: Map<number, MPHEnemyActivationPlan[]>,
@@ -1460,11 +1466,26 @@ function addEntityActivationPlan(plansByEntityId: Map<number, MPHEnemyActivation
         plans.push({ rootVolume, waveDepth });
 }
 
+function addForceFieldTransitionPlan(plansByEntityId: Map<number, MPHForceFieldTransitionPlan[]>,
+        entityId: number, rootVolume: MPHTriggerVolumeEntity | null, waveDepth: number, active: boolean): void {
+    let plans = plansByEntityId.get(entityId);
+    if (plans === undefined)
+        plansByEntityId.set(entityId, plans = []);
+    if (!plans.some((plan) =>
+        plan.rootVolume === rootVolume && plan.waveDepth === waveDepth && plan.active === active))
+        plans.push({ rootVolume, waveDepth, active });
+}
+
 function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationPlans {
     const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
     const enemyById = new Map(entities.enemySpawns.map((enemy) => [enemy.entityId, enemy]));
     const itemById = new Map(entities.itemSpawns.map((item) => [item.entityId, item]));
-    const result: MPHEntityActivationPlans = { enemies: new Map(), items: new Map() };
+    const forceFieldById = new Map(entities.forceFields.map((forceField) => [forceField.entityId, forceField]));
+    const result: MPHEntityActivationPlans = {
+        enemies: new Map(),
+        items: new Map(),
+        forceFields: new Map(),
+    };
 
     interface MessageEvent {
         targetId: number;
@@ -1482,7 +1503,11 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
         const completedEnemies = new Set<number>();
 
         const enqueueCompletion = (enemy: MPHEnemySpawnEntity, waveDepth: number): void => {
-            if (enemy.totalSpawnLimit === 0 || completedEnemies.has(enemy.entityId))
+            // HandleEnemySpawnControllerMessage @ 0x0211E698 also completes
+            // an unlimited controller after its destructible spawner has
+            // disabled it and its remaining live children have been defeated.
+            if ((enemy.totalSpawnLimit === 0 && enemy.spawnerHealth === 0) ||
+                completedEnemies.has(enemy.entityId))
                 return;
             completedEnemies.add(enemy.entityId);
             // CompleteEnemySpawnController @ 0x0211DA14 sends param0 = -1
@@ -1512,6 +1537,13 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
             // messages as the EnemySpawn controller.
             if (item !== undefined && isEnemySpawnActivationMessage(event.message, event.messageParam)) {
                 addEntityActivationPlan(result.items, item.entityId, rootVolume, event.waveDepth);
+                continue;
+            }
+            const forceField = forceFieldById.get(event.targetId);
+            if (forceField !== undefined && (event.message === 0x10 || event.message === 0x11)) {
+                // HandleForceFieldMessage @ 0x02169100.
+                addForceFieldTransitionPlan(result.forceFields, forceField.entityId,
+                    rootVolume, event.waveDepth, event.message === 0x11);
                 continue;
             }
 
@@ -1669,7 +1701,7 @@ export class MPHEntityFile {
         }
         if (this.entities.teleporters.some((teleporter) => !teleporter.invisible))
             requestEntityModel(this.cache, getTeleporterModelSpec(this.sceneMode));
-        if (this.entities.forceFields.some((forceField) => forceField.active))
+        if (this.entities.forceFields.length > 0)
             requestEntityModel(this.cache, forceFieldModelSpec);
     }
 
@@ -2160,13 +2192,46 @@ export class MPHEntityFile {
             renderers.push(renderer);
         }
         for (const forceField of this.entities.forceFields) {
-            if (!forceField.active)
-                continue;
+            const transitionPlans = entityActivationPlans.forceFields.get(forceField.entityId) ?? [];
+            const rootActivationTimes = new Map<number, number>();
+            const cameraRoomPosition = vec3.create();
+            let sceneStartTime: number | null = null;
+            let currentAlpha = forceField.active ? 1 : 0;
+            const updateForceFieldState: NonNullable<MPHRendererOptions['isVisibleAtTime']> = (time, viewerInput) => {
+                if (sceneStartTime === null)
+                    sceneStartTime = time;
+                const cameraMatrix = viewerInput.camera.worldMatrix;
+                vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                if (inverseSceneTransform !== null)
+                    vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+
+                let active = forceField.active;
+                let latestTransitionTime = sceneStartTime;
+                for (const plan of transitionPlans) {
+                    const transitionTime = getPlannedActivationTime(
+                        [plan], time, sceneStartTime, cameraRoomPosition, rootActivationTimes);
+                    if (transitionTime !== null && transitionTime >= latestTransitionTime) {
+                        active = plan.active;
+                        latestTransitionTime = transitionTime;
+                    }
+                }
+                const fadeProgress = Math.min(1, Math.max(0,
+                    (time - latestTransitionTime) / FORCE_FIELD_FADE_DURATION_MS));
+                currentAlpha = active ? fadeProgress : 1 - fadeProgress;
+                if (latestTransitionTime === sceneStartTime && active === forceField.active)
+                    currentAlpha = active ? 1 : 0;
+                return currentAlpha > 0;
+            };
             const renderer = createEntityModelRenderer(device, this.cache, renderCache, getForceFieldModelSpec(forceField), (animation) => {
                 const duration = getAnimationLoopDuration(animation);
                 return {
                     ...baseOptions,
                     mapAnimationTime: (time) => time % duration,
+                    isVisibleAtTime: updateForceFieldState,
+                    // UpdateForceFieldEntity @ 0x02168D48 changes the five-bit
+                    // polygon alpha by one every 30 Hz update until it reaches
+                    // zero or 31; RenderForceFieldEntity @ 0x02168B70 submits it.
+                    modifyMaterialColor: (dst) => dst.a *= currentAlpha,
                 };
             });
             calcForceFieldModelMatrix(renderer.modelMatrix, forceField, renderer.modelScale);
