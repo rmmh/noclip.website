@@ -17,6 +17,7 @@ const ENTITY_TYPE_PLATFORM = 0;
 const ENTITY_TYPE_OBJECT = 1;
 const ENTITY_TYPE_DOOR = 3;
 const ENTITY_TYPE_ITEM_SPAWN = 4;
+const ENTITY_TYPE_TRIGGER_VOLUME = 7;
 const ENTITY_TYPE_JUMP_PAD = 9;
 const ENTITY_TYPE_OCTOLITH_FLAG = 12;
 const ENTITY_TYPE_FLAG_BASE = 13;
@@ -37,6 +38,7 @@ const NODE_DEFENSE_DATA_SIZE = 0x68;
 const LIGHT_SOURCE_DATA_SIZE = 0x88;
 const ARTIFACT_DATA_SIZE = 0x46;
 const FORCE_FIELD_DATA_SIZE = 0x35;
+const TRIGGER_VOLUME_DATA_SIZE = 0xA0;
 
 interface MPHEntityEntry {
     nodeName: string;
@@ -177,6 +179,17 @@ interface MPHForceFieldEntity extends MPHEntityEntry {
     active: boolean;
 }
 
+type MPHTriggerVolume = MPHLightVolume;
+
+interface MPHTriggerVolumeEntity extends MPHEntityEntry {
+    mode: number;
+    initialState: number;
+    volume: MPHTriggerVolume;
+    targetEntityIds: readonly [number, number];
+    messages: readonly [number, number];
+    messageParams: readonly [number, number];
+}
+
 export interface MPHEntities {
     platforms: MPHPlatformEntity[];
     objects: MPHObjectEntity[];
@@ -191,6 +204,7 @@ export interface MPHEntities {
     artifacts: MPHArtifactEntity[];
     teleporters: MPHTeleporterEntity[];
     forceFields: MPHForceFieldEntity[];
+    triggerVolumes: MPHTriggerVolumeEntity[];
 }
 
 interface MPHEntityModelSpec {
@@ -424,8 +438,7 @@ function parseArtifact(entry: MPHEntityEntry, view: DataView): MPHArtifactEntity
     };
 }
 
-function pointInsideLightSource(light: MPHLightSourceEntity, point: vec3): boolean {
-    const volume = light.volume;
+function pointInsideVolume(volume: MPHLightVolume, point: vec3): boolean {
     if (volume.kind === 'box') {
         const delta = vec3.sub(vec3.create(), point, volume.origin);
         for (let i = 0; i < 3; i++) {
@@ -478,6 +491,62 @@ function parseForceField(entry: MPHEntityEntry, view: DataView): MPHForceFieldEn
     };
 }
 
+function parseTriggerVolume(entry: MPHEntityEntry, view: DataView): MPHTriggerVolumeEntity {
+    assert(entry.dataLength === TRIGGER_VOLUME_DATA_SIZE);
+    const offs = entry.dataOffset;
+    const position = readVec3Fx(view, offs + 0x04);
+    const volumeType = view.getUint32(offs + 0x2C, true);
+    let volume: MPHTriggerVolume;
+    if (volumeType === 0) {
+        volume = {
+            kind: 'box',
+            axes: [
+                readVec3Fx(view, offs + 0x30),
+                readVec3Fx(view, offs + 0x3C),
+                readVec3Fx(view, offs + 0x48),
+            ],
+            origin: readVec3Fx(view, offs + 0x54),
+            extents: readVec3Fx(view, offs + 0x60),
+        };
+    } else if (volumeType === 1) {
+        volume = {
+            kind: 'cylinder',
+            axis: readVec3Fx(view, offs + 0x30),
+            origin: readVec3Fx(view, offs + 0x3C),
+            radius: readFx32(view, offs + 0x4C),
+            length: readFx32(view, offs + 0x50),
+        };
+    } else {
+        assert(volumeType === 2);
+        volume = {
+            kind: 'sphere',
+            origin: readVec3Fx(view, offs + 0x30),
+            radius: readFx32(view, offs + 0x3C),
+        };
+    }
+    // CreateTriggerVolumeEntity @ 0x0210AFE8 applies the entity position
+    // after copying the authored volume.
+    vec3.add(volume.origin, volume.origin, position);
+    return {
+        ...entry,
+        mode: view.getUint32(offs + 0x28, true),
+        initialState: view.getUint8(offs + 0x6E),
+        volume,
+        targetEntityIds: [
+            view.getInt16(offs + 0x80, true),
+            view.getInt16(offs + 0x90, true),
+        ],
+        messages: [
+            view.getUint32(offs + 0x84, true),
+            view.getUint32(offs + 0x94, true),
+        ],
+        messageParams: [
+            view.getUint32(offs + 0x88, true),
+            view.getUint32(offs + 0x98, true),
+        ],
+    };
+}
+
 export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPHEntities {
     const view = buffer.createDataView();
     assert(view.getUint32(0x00, true) === 2);
@@ -496,6 +565,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     const artifacts: MPHArtifactEntity[] = [];
     const teleporters: MPHTeleporterEntity[] = [];
     const forceFields: MPHForceFieldEntity[] = [];
+    const triggerVolumes: MPHTriggerVolumeEntity[] = [];
     const gameplayRandom = new MPHGameplayRandom();
     let entryCount = 0;
     for (let offs = ENTITY_HEADER_SIZE; offs + ENTITY_ENTRY_SIZE <= view.byteLength; offs += ENTITY_ENTRY_SIZE) {
@@ -544,10 +614,12 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
             teleporters.push(parseTeleporter(entry, view, buffer));
         else if (entry.type === ENTITY_TYPE_FORCE_FIELD)
             forceFields.push(parseForceField(entry, view));
+        else if (entry.type === ENTITY_TYPE_TRIGGER_VOLUME)
+            triggerVolumes.push(parseTriggerVolume(entry, view));
     }
 
     assert(entryCount === view.getUint16(0x04 + layerId * 2, true));
-    return { platforms, objects, doors, itemSpawns, enemySpawns, jumpPads, octolithFlags, flagBases, nodeDefenses, lightSources, artifacts, teleporters, forceFields };
+    return { platforms, objects, doors, itemSpawns, enemySpawns, jumpPads, octolithFlags, flagBases, nodeDefenses, lightSources, artifacts, teleporters, forceFields, triggerVolumes };
 }
 
 export interface MPHObjectMetadata {
@@ -1358,6 +1430,44 @@ const enemySpawnerModelSpec: MPHEntityModelSpec = {
     sharedTextureFilename: 'AlimbicTextureShare_img_Model.bin',
 };
 
+function isEnemySpawnActivationMessage(message: number, messageParam: number): boolean {
+    // HandleEnemySpawnControllerMessage @ 0x0211E698.
+    return message === 0x12 || message === 5 && messageParam !== 0;
+}
+
+function findEnemyActivationVolumes(entities: MPHEntities, enemy: MPHEnemySpawnEntity): MPHTriggerVolumeEntity[] {
+    const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
+    const result = new Set<MPHTriggerVolumeEntity>();
+
+    const visitTarget = (source: MPHTriggerVolumeEntity, targetId: number,
+            message: number, messageParam: number, visited: Set<number>): void => {
+        if (targetId === enemy.entityId && isEnemySpawnActivationMessage(message, messageParam))
+            result.add(source);
+        const relay = triggerById.get(targetId);
+        if (relay === undefined || relay.mode !== 2 || visited.has(relay.entityId))
+            return;
+        visited.add(relay.entityId);
+        // HandleTriggerVolumeMessage @ 0x0210B348 forwards the incoming
+        // message unchanged through both targets for mode 2.
+        for (const relayTarget of relay.targetEntityIds)
+            if (relayTarget !== -1)
+                visitTarget(source, relayTarget, message, messageParam, visited);
+    };
+
+    for (const trigger of entities.triggerVolumes) {
+        // UpdateTriggerVolumeEntity @ 0x0210AA84 performs player-volume
+        // intersection only for active mode-0 triggers.
+        if (trigger.mode !== 0 || trigger.initialState === 0)
+            continue;
+        for (let i = 0; i < trigger.targetEntityIds.length; i++) {
+            const targetId = trigger.targetEntityIds[i];
+            if (targetId !== -1)
+                visitTarget(trigger, targetId, trigger.messages[i], trigger.messageParams[i], new Set());
+        }
+    }
+    return [...result];
+}
+
 export class MPHEntityFile {
     private movers: ((timeInMilliseconds: number) => void)[] = [];
 
@@ -1438,6 +1548,8 @@ export class MPHEntityFile {
         const doorRenderers = new Map<number, MPHRenderer>();
         const baseOptions: MPHRendererOptions = { sceneMode: this.sceneMode, lighting, fog, sceneTransform };
         const normalizedEntityFilename = normalizeEntityFilename(this.entityFilename);
+        const inverseSceneTransform = sceneTransform !== undefined ?
+            mat4.invert(mat4.create(), sceneTransform) : null;
         for (const platform of this.entities.platforms) {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
@@ -1550,8 +1662,12 @@ export class MPHEntityFile {
                     enemy.enemyType === 0x05 ? new MochtroidRoamingSimulation(enemy, 20) :
                     enemy.enemyType === 0x06 ? new MochtroidRoamingSimulation(enemy, 10) : null;
             let controllerStartTime: number | null = null;
+            let controllerActivationTime: number | null = null;
+            let controllerActive = enemy.initialState !== 0;
             let enemySpawnTime: number | null = null;
             let enemyTriggered = false;
+            const activationVolumes = findEnemyActivationVolumes(this.entities, enemy);
+            const cameraRoomPosition = vec3.create();
             const getControllerTime = (time: number): number => {
                 if (controllerStartTime === null)
                     controllerStartTime = time;
@@ -1560,22 +1676,20 @@ export class MPHEntityFile {
             const getEnemyTime = (time: number): number => {
                 return enemySpawnTime !== null ? time - enemySpawnTime : 0;
             };
-            const enemySpawnWorldPosition = vec3.clone(enemy.position);
-            if (sceneTransform !== undefined)
-                vec3.transformMat4(enemySpawnWorldPosition, enemySpawnWorldPosition, sceneTransform);
             if (enemy.spawnerHealth !== 0) {
                 // InitializeEnemySpawnerVisualization @ 0x0211E094 creates
                 // this subtype-0x28 proxy and selects animation 0 for War
                 // Wasps/Barbed War Wasps, otherwise 1 when active or 2 when
                 // inactive (the latter starts at authored frame 20).
-                const spawnerAnimation = enemy.enemyType === 0x00 || enemy.enemyType === 0x0A ?
-                    0 : enemy.initialState !== 0 ? 1 : 2;
+                const getSpawnerAnimation = (): number =>
+                    enemy.enemyType === 0x00 || enemy.enemyType === 0x0A ? 0 :
+                        controllerActive ? 1 : 2;
                 const spawnerRenderer = createEntityModelRenderer(device, this.cache, renderCache, enemySpawnerModelSpec, {
                     ...baseOptions,
-                    selectNodeAnimation: () => spawnerAnimation,
-                    selectTexCoordAnimation: () => spawnerAnimation,
-                    selectMaterialAnimation: () => spawnerAnimation,
-                    mapAnimationTime: (time) => spawnerAnimation === 2 ?
+                    selectNodeAnimation: getSpawnerAnimation,
+                    selectTexCoordAnimation: getSpawnerAnimation,
+                    selectMaterialAnimation: getSpawnerAnimation,
+                    mapAnimationTime: (time) => getSpawnerAnimation() === 2 ?
                         getControllerTime(time) + 20 * 1000 / 30 : getControllerTime(time),
                 });
                 this.movers.push((time) => calcEnemyModelMatrix(
@@ -1599,13 +1713,24 @@ export class MPHEntityFile {
                         isVisibleAtTime: (time, viewerInput) => {
                             if (enemyTriggered)
                                 return true;
-                            if (enemy.initialState === 0 ||
-                                getControllerTime(time) * 30 / 1000 < enemy.initialDelayTicks)
-                                return false;
                             const cameraMatrix = viewerInput.camera.worldMatrix;
-                            const dx = cameraMatrix[12] - enemySpawnWorldPosition[0];
-                            const dy = cameraMatrix[13] - enemySpawnWorldPosition[1];
-                            const dz = cameraMatrix[14] - enemySpawnWorldPosition[2];
+                            vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                            if (inverseSceneTransform !== null)
+                                vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+                            if (!controllerActive && activationVolumes.some((trigger) =>
+                                pointInsideVolume(trigger.volume, cameraRoomPosition))) {
+                                controllerActive = true;
+                                controllerActivationTime = time;
+                            }
+                            if (!controllerActive)
+                                return false;
+                            if (controllerActivationTime === null)
+                                controllerActivationTime = time;
+                            if ((time - controllerActivationTime) * 30 / 1000 < enemy.initialDelayTicks)
+                                return false;
+                            const dx = cameraRoomPosition[0] - enemy.position[0];
+                            const dy = cameraRoomPosition[1] - enemy.position[1];
+                            const dz = cameraRoomPosition[2] - enemy.position[2];
                             const radius = enemy.activationRadius;
                             enemyTriggered = radius <= 0 || dx * dx + dy * dy + dz * dz < radius * radius;
                             if (enemyTriggered)
@@ -1791,7 +1916,7 @@ export class MPHEntityFile {
             const colors: [vec3, vec3] = [vec3.clone(lighting.colors[0]), vec3.clone(lighting.colors[1])];
             const directions: [vec3, vec3] = [vec3.clone(lighting.directions[0]), vec3.clone(lighting.directions[1])];
             for (const light of this.entities.lightSources) {
-                if (!pointInsideLightSource(light, artifact.position))
+                if (!pointInsideVolume(light.volume, artifact.position))
                     continue;
                 if (light.light0Enabled) {
                     vec3.scale(colors[0], light.light0Color, 1 / 31);
