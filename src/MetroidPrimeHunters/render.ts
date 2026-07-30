@@ -10,7 +10,7 @@ import { TextureMapping } from "../TextureHolder.js";
 import { fillMatrix4x3, fillMatrix4x4, fillMatrix3x2, fillColor, fillVec4, fillVec4v } from "../gfx/helpers/UniformBufferHelpers.js";
 import { computeViewMatrix } from "../Camera.js";
 import AnimationController from "../AnimationController.js";
-import { bindMPHMaterial, bindMPHT, MPHAnimation, MPHMaterialAnimation, MPHMaterialAnimator, MPHNodeAnimation, MPHNodeAnimator, MPHTexCoordAnimator } from "./mph_anim.js";
+import { bindMPHMaterial, bindMPHT, MPHAnimation, MPHMaterialAnimation, MPHMaterialAnimator, MPHNodeAnimation, MPHNodeAnimator, MPHTexCoordAnimation, MPHTexCoordAnimator } from "./mph_anim.js";
 import { nArray, assertExists } from "../util.js";
 import { TEX0Texture, PAT0TexAnimator, TEX0, expand5to8 } from "../nns_g3d/NNS_G3D.js";
 import { setAttachmentStateSimple } from "../gfx/helpers/GfxMegaStateDescriptorHelpers.js";
@@ -67,7 +67,7 @@ class MaterialInstance {
     public emissionColor = colorNewCopy(White);
     public fogEnabled = true;
 
-    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimator: MPHTexCoordAnimator | null, private materialAnimators: readonly (MPHMaterialAnimator | null)[], private selectMaterialAnimation: MPHRendererOptions['selectMaterialAnimation'], private modifyMaterialColor: MPHRendererOptions['modifyMaterialColor'], entityModel: boolean, forceTwoSided: boolean, private fog: MPHFogConfig | null) {
+    constructor(cache: GfxRenderCache, tex0: TEX0, public material: MPHMaterial, private texCoordAnimators: readonly (MPHTexCoordAnimator | null)[], private selectTexCoordAnimation: MPHRendererOptions['selectTexCoordAnimation'], private materialAnimators: readonly (MPHMaterialAnimator | null)[], private selectMaterialAnimation: MPHRendererOptions['selectMaterialAnimation'], private modifyMaterialColor: MPHRendererOptions['modifyMaterialColor'], entityModel: boolean, forceTwoSided: boolean, private fog: MPHFogConfig | null) {
         const device = cache.device;
         const texData = tex0.textures.find((t) => t.name === this.material.textureName);
         this.texture = texData !== undefined ? texData: null;
@@ -182,8 +182,10 @@ class MaterialInstance {
             forceTranslucent ||= this.diffuseColor.a < 1;
         }
 
-        if (this.texCoordAnimator !== null) {
-            this.texCoordAnimator.calcTexMtx(scratchTexMatrix, this.material.texScaleS, this.material.texScaleT);
+        const texCoordAnimationIndex = this.selectTexCoordAnimation?.(viewerInput.time) ?? 0;
+        const texCoordAnimator = this.texCoordAnimators[texCoordAnimationIndex] ?? null;
+        if (texCoordAnimator !== null) {
+            texCoordAnimator.calcTexMtx(scratchTexMatrix, this.material.texScaleS, this.material.texScaleT);
         } else {
             mat2d.copy(scratchTexMatrix, this.material.texMatrix);
         }
@@ -377,12 +379,14 @@ export interface MPHRendererOptions {
     sceneMode?: MPHSceneMode;
     entityModel?: boolean;
     lighting?: MPHLighting;
-    isVisibleAtTime?: (timeInMilliseconds: number) => boolean;
+    isVisibleAtTime?: (timeInMilliseconds: number, viewerInput: Viewer.ViewerRenderInput) => boolean;
     mapAnimationTime?: (timeInMilliseconds: number) => number;
     mapMaterialAnimationTime?: (timeInMilliseconds: number) => number;
     additionalNodeAnimations?: (MPHNodeAnimation | null)[];
+    additionalTexCoordAnimations?: (MPHTexCoordAnimation | null)[];
     additionalMaterialAnimations?: (MPHMaterialAnimation | null)[];
     selectNodeAnimation?: (timeInMilliseconds: number) => number;
+    selectTexCoordAnimation?: (timeInMilliseconds: number) => number;
     selectMaterialAnimation?: (timeInMilliseconds: number) => number;
     modifyMaterialColor?: (dst: Color, materialName: string, timeInMilliseconds: number) => void;
     modifyNodeMatrix?: (dst: mat4, nodeName: string, timeInMilliseconds: number) => void;
@@ -476,7 +480,10 @@ export class MPHRenderer {
         this.modelScale = mphModel.posScale * (1 << mphModel.scaleFactor);
         mat4.fromScaling(this.modelMatrix, [this.modelScale, this.modelScale, this.modelScale]);
 
-        const texCoordAnimation = mphAnimation?.texCoord ?? null;
+        const texCoordAnimations = [
+            mphAnimation?.texCoord ?? null,
+            ...(options.additionalTexCoordAnimations ?? []),
+        ];
         const materialAnimations = [
             mphAnimation?.material ?? null,
             ...(options.additionalMaterialAnimations ?? []),
@@ -484,11 +491,11 @@ export class MPHRenderer {
 
         for (let i = 0; i < mphModel.materials.length; i++) {
             const material = mphModel.materials[i];
-            const texCoordAnimator = texCoordAnimation !== null ?
-                bindMPHT(this.animationController, texCoordAnimation, material.name) : null;
+            const texCoordAnimators = texCoordAnimations.map((animation) =>
+                animation !== null ? bindMPHT(this.animationController, animation, material.name) : null);
             const materialAnimators = materialAnimations.map((animation) =>
                 animation !== null ? bindMPHMaterial(this.materialAnimationController, animation, material.name) : null);
-            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimator, materialAnimators, options.selectMaterialAnimation, options.modifyMaterialColor, entityModel, options.forceTwoSided === true, options.fog ?? null));
+            this.materialInstances.push(new MaterialInstance(cache, this.tex0, material, texCoordAnimators, options.selectTexCoordAnimation, materialAnimators, options.selectMaterialAnimation, options.modifyMaterialColor, entityModel, options.forceTwoSided === true, options.fog ?? null));
         }
 
         for (let i = 0; i < mphModel.nodes.length; i++) {
@@ -549,7 +556,7 @@ export class MPHRenderer {
     }
 
     public prepareToRender(renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput): void {
-        if (!this.visible || (this.isVisibleAtTime !== undefined && !this.isVisibleAtTime(viewerInput.time)))
+        if (!this.visible || (this.isVisibleAtTime !== undefined && !this.isVisibleAtTime(viewerInput.time, viewerInput)))
             return;
         this.animationController.setTimeInMilliseconds(this.mapAnimationTime !== undefined ?
             this.mapAnimationTime(viewerInput.time) : viewerInput.time);

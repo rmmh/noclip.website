@@ -21,6 +21,14 @@ export interface MPHEnemySpawnEntity extends MPHEnemySpawnEntry {
     facing: vec3;
     enemyType: number;
     variant: number;
+    totalSpawnLimit: number;
+    liveSpawnLimit: number;
+    spawnBatchSize: number;
+    initialState: number;
+    spawnerHealth: number;
+    respawnDelayTicks: number;
+    initialDelayTicks: number;
+    activationRadius: number;
     hoverCenter: vec3 | null;
     hoverBobAngleStep: number;
     hoverBobRadius: number;
@@ -290,6 +298,16 @@ export function parseEnemySpawn(entry: MPHEnemySpawnEntry, view: DataView, rando
         facing,
         enemyType,
         variant: view.getUint32(offs + 0x30, true),
+        // CreateEnemySpawnController @ 0x0211E3B8 and
+        // UpdateEnemySpawnController @ 0x0211DCD8.
+        totalSpawnLimit: view.getUint8(offs + 0x1BE),
+        liveSpawnLimit: view.getUint8(offs + 0x1BF),
+        spawnBatchSize: view.getUint8(offs + 0x1C0),
+        initialState: view.getUint8(offs + 0x1C1),
+        spawnerHealth: view.getInt16(offs + 0x1C4, true),
+        respawnDelayTicks: view.getUint16(offs + 0x1C6, true),
+        initialDelayTicks: view.getUint16(offs + 0x1C8, true),
+        activationRadius: readFx32(view, offs + 0x1CC),
         hoverCenter,
         hoverBobAngleStep,
         hoverBobRadius,

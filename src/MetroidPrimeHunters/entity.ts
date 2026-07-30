@@ -202,7 +202,8 @@ interface MPHEntityModelSpec {
     paletteOverrides?: readonly { target: number; source: number }[];
     animationId?: number;
     additionalAnimationIds?: number[];
-    additionalMaterialAnimationIds?: number[];
+    additionalTexCoordAnimationIds?: number[];
+    additionalMaterialAnimationIds?: (number | null)[];
     texCoordAnimationId?: number;
     animationLoop?: boolean;
 }
@@ -953,7 +954,11 @@ function createEntityModelRenderer(device: GfxDevice, cache: MPHEntityResourceCa
         rendererOptions.additionalNodeAnimations = additionalAnimations.map((animation) => animation.node);
     if (animationFile !== null && spec.additionalMaterialAnimationIds !== undefined) {
         rendererOptions.additionalMaterialAnimations = spec.additionalMaterialAnimationIds.map((animationId) =>
-            assertExists(parseMPHAnimation(animationFile, animationId).material));
+            animationId !== null ? assertExists(parseMPHAnimation(animationFile, animationId).material) : null);
+    }
+    if (animationFile !== null && spec.additionalTexCoordAnimationIds !== undefined) {
+        rendererOptions.additionalTexCoordAnimations = spec.additionalTexCoordAnimationIds.map((animationId) =>
+            assertExists(parseMPHAnimation(animationFile, animationId).texCoord));
     }
     return new MPHRenderer(device, renderCache, model, texture, animation, { entityModel: true, ...rendererOptions });
 }
@@ -1342,6 +1347,17 @@ function getAnimationLoopDuration(animation: MPHAnimation | null): number {
     return Math.max(1, frameCount - 1) * 1000 / 30;
 }
 
+const enemySpawnerModelSpec: MPHEntityModelSpec = {
+    modelFilename: 'EnemySpawner_mdl_Model.bin',
+    animationFilename: 'EnemySpawner_mdl_Anim.bin',
+    animationId: 0,
+    additionalAnimationIds: [1, 2],
+    additionalTexCoordAnimationIds: [1, 2],
+    additionalMaterialAnimationIds: [null, 2],
+    // ApplySharedModelTextureBank @ 0x0205C6B4 uses shared bank zero.
+    sharedTextureFilename: 'AlimbicTextureShare_img_Model.bin',
+};
+
 export class MPHEntityFile {
     private movers: ((timeInMilliseconds: number) => void)[] = [];
 
@@ -1382,9 +1398,12 @@ export class MPHEntityFile {
             this.cache.fetchMPFile('models/particles_Tex.bin');
             this.cache.fetchMPFile('effects/artifactKeyEffect_PS.bin');
         }
-        for (const enemy of this.entities.enemySpawns)
+        for (const enemy of this.entities.enemySpawns) {
             for (const spec of getEnemyModelSpecs(enemy))
                 requestEntityModel(this.cache, spec);
+            if (enemy.spawnerHealth !== 0)
+                requestEntityModel(this.cache, enemySpawnerModelSpec);
+        }
         for (const artifact of this.entities.artifacts) {
             if (!artifact.active)
                 continue;
@@ -1530,12 +1549,39 @@ export class MPHEntityFile {
                             (enemy.enemyType === 0x23 ? 445 * 1000 / 30 : 12 * 1000)) :
                     enemy.enemyType === 0x05 ? new MochtroidRoamingSimulation(enemy, 20) :
                     enemy.enemyType === 0x06 ? new MochtroidRoamingSimulation(enemy, 10) : null;
-            let spawnTime: number | null = null;
-            const getEnemyTime = (time: number): number => {
-                if (spawnTime === null)
-                    spawnTime = time;
-                return time - spawnTime;
+            let controllerStartTime: number | null = null;
+            let enemySpawnTime: number | null = null;
+            let enemyTriggered = false;
+            const getControllerTime = (time: number): number => {
+                if (controllerStartTime === null)
+                    controllerStartTime = time;
+                return time - controllerStartTime;
             };
+            const getEnemyTime = (time: number): number => {
+                return enemySpawnTime !== null ? time - enemySpawnTime : 0;
+            };
+            const enemySpawnWorldPosition = vec3.clone(enemy.position);
+            if (sceneTransform !== undefined)
+                vec3.transformMat4(enemySpawnWorldPosition, enemySpawnWorldPosition, sceneTransform);
+            if (enemy.spawnerHealth !== 0) {
+                // InitializeEnemySpawnerVisualization @ 0x0211E094 creates
+                // this subtype-0x28 proxy and selects animation 0 for War
+                // Wasps/Barbed War Wasps, otherwise 1 when active or 2 when
+                // inactive (the latter starts at authored frame 20).
+                const spawnerAnimation = enemy.enemyType === 0x00 || enemy.enemyType === 0x0A ?
+                    0 : enemy.initialState !== 0 ? 1 : 2;
+                const spawnerRenderer = createEntityModelRenderer(device, this.cache, renderCache, enemySpawnerModelSpec, {
+                    ...baseOptions,
+                    selectNodeAnimation: () => spawnerAnimation,
+                    selectTexCoordAnimation: () => spawnerAnimation,
+                    selectMaterialAnimation: () => spawnerAnimation,
+                    mapAnimationTime: (time) => spawnerAnimation === 2 ?
+                        getControllerTime(time) + 20 * 1000 / 30 : getControllerTime(time),
+                });
+                this.movers.push((time) => calcEnemyModelMatrix(
+                    spawnerRenderer.modelMatrix, enemy, null, getControllerTime(time), spawnerRenderer.modelScale));
+                renderers.push(spawnerRenderer);
+            }
             const enemyModelSpecs = getEnemyModelSpecs(enemy);
             let primaryEnemyRenderer: MPHRenderer | null = null;
             for (let specIndex = 0; specIndex < enemyModelSpecs.length; specIndex++) {
@@ -1547,6 +1593,25 @@ export class MPHEntityFile {
                         getEnemyTime(time) + getEnemyAnimationPhaseMilliseconds(enemy);
                     return {
                         ...baseOptions,
+                        // UpdateEnemySpawnController @ 0x0211DCD8 does not
+                        // create children until the controller is active and
+                        // its authored initial delay has elapsed.
+                        isVisibleAtTime: (time, viewerInput) => {
+                            if (enemyTriggered)
+                                return true;
+                            if (enemy.initialState === 0 ||
+                                getControllerTime(time) * 30 / 1000 < enemy.initialDelayTicks)
+                                return false;
+                            const cameraMatrix = viewerInput.camera.worldMatrix;
+                            const dx = cameraMatrix[12] - enemySpawnWorldPosition[0];
+                            const dy = cameraMatrix[13] - enemySpawnWorldPosition[1];
+                            const dz = cameraMatrix[14] - enemySpawnWorldPosition[2];
+                            const radius = enemy.activationRadius;
+                            enemyTriggered = radius <= 0 || dx * dx + dy * dy + dz * dz < radius * radius;
+                            if (enemyTriggered)
+                                enemySpawnTime = time;
+                            return enemyTriggered;
+                        },
                         modifyNodeMatrix: enemy.enemyType === 0x12 ?
                             (dst, nodeName, time) => {
                                 if (nodeName !== 'Door_Rot')
