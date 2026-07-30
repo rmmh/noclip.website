@@ -8,6 +8,7 @@ import { MPHAnimation, parseMPHAnimation } from './mph_anim.js';
 import { fxAngle, MPHbin, parseMPH_Model, parseTEX0Texture } from './mph_binModel.js';
 import { MPHFogConfig, MPHLighting, MPHRenderer, MPHRendererOptions, MPHSceneMode } from './render.js';
 import { ENTITY_TYPE_ENEMY_SPAWN, getEnemyAnimationPhaseMilliseconds, getEnemyModelSpecs, isWaspEnemy, MPHEnemySpawnEntity, parseEnemySpawn, sampleEnemyPose, MPHGameplayRandom, SurfaceCrawlerSimulation, sampleBlastcapAnimation, sampleMochtroidType03Animation, MPHEnemySimulation, sampleMochtroidType06Animation, samplePsychoBitAnimation, sampleSphinkTickAnimation, sampleDripStankAnimation, sampleGuardBot1Animation, GuardBotSimulation, sampleGuardBot2Animation, sampleAlimbicStatueAnimation, sampleLavaDemonAnimation, sampleBigEyeTurretAnimation, sampleBigEyeBossAnimation, sampleCylinderBossEyeAnimation, sampleShriekbatAnimation, MochtroidRoamingSimulation, sampleMochtroidType05Animation, sampleMochtroidType04Animation, sampleWarWaspAnimation, sampleGorea2Animation, sampleGorea1AAnimation, sampleBarbedWarWaspAnimation, sampleGeemerAnimation, sampleCylinderBossAnimation, sampleAlimbicTurretAim } from './enemy.js';
+import { evaluateParticleScalar, evaluateParticleVector, MPHParticleEmitter, parseMPHParticleSystem } from './mph_particle.js';
 import { MPHCollisionData } from './mph_collision.js';
 
 const ENTITY_HEADER_SIZE = 0x24;
@@ -773,7 +774,7 @@ function createSamusShipExhaustRenderers(device: GfxDevice, cache: MPHEntityReso
             sceneTransform: undefined,
             entityModel: true,
             nodeFilter: (name) => name === 'Flame',
-            forceBillboard: true,
+            forceBillboard: 'axial',
             forceTwoSided: true,
         });
         renderers.push(renderer);
@@ -798,6 +799,104 @@ function createSamusShipExhaustRenderers(device: GfxDevice, cache: MPHEntityReso
             vec3.set(particleScale, scale, scale, scale);
             mat4.scale(dst, dst, particleScale);
         });
+    }
+    return renderers;
+}
+
+// UpdateParticleSystems @ 0x02112888 integrates each particle once per
+// engine update using this fixed FX32 time step.
+const PARTICLE_UPDATE_SECONDS = 0x88 / 0x1000;
+
+function wrapParticleEmitterAge(age: number, emitter: MPHParticleEmitter): number {
+    // UpdateParticleSystems @ 0x02112888 advances the emitter's start/end
+    // clocks by wrapEnd - wrapStart when it reaches wrapEnd.
+    if (emitter.wrapEnd <= emitter.wrapStart || age < emitter.wrapEnd)
+        return Math.min(age, emitter.duration);
+    return emitter.wrapStart + (age - emitter.wrapEnd) % (emitter.wrapEnd - emitter.wrapStart);
+}
+
+function createArtifactKeyEffectRenderers(device: GfxDevice, cache: MPHEntityResourceCache, renderCache: GfxRenderCache,
+    item: MPHItemSpawnEntity, parentPlatform: MPHPlatformEntity | null, getItemTime: (time: number) => number,
+    baseOptions: MPHRendererOptions, movers: ((timeInMilliseconds: number) => void)[]): MPHRenderer[] {
+    const modelFile = assertExists(cache.getFileData('particles_Model.bin'));
+    const textureFile = assertExists(cache.getFileData('models/particles_Tex.bin'));
+    const effectFile = assertExists(cache.getFileData('effects/artifactKeyEffect_PS.bin'));
+    const model = parseMPH_Model(modelFile);
+    const texture = parseTEX0Texture(textureFile, model.mphTex);
+    const effect = parseMPHParticleSystem(effectFile);
+    const renderers: MPHRenderer[] = [];
+
+    for (const emitter of effect.emitters) {
+        assert(emitter.velocityOverLifetime === null);
+        const lifetime = evaluateParticleScalar(emitter.lifetime, 0, emitter.duration, 0);
+        const particleCount = Math.ceil(lifetime / PARTICLE_UPDATE_SECONDS);
+        for (let slot = 0; slot < particleCount; slot++) {
+            const initialPosition = vec3.create();
+            const initialVelocity = vec3.create();
+            const particlePosition = vec3.create();
+            const worldPosition = vec3.create();
+            const particleScale = vec3.create();
+
+            const sampleParticle = (timeInMilliseconds: number): { age: number, lifetime: number, emitterAge: number } | null => {
+                const effectSeconds = getItemTime(timeInMilliseconds) / 1000 - item.initialDelayTicks / 30;
+                if (effectSeconds < 0)
+                    return null;
+                const currentTick = Math.floor(effectSeconds / PARTICLE_UPDATE_SECONDS);
+                const spawnTick = currentTick - slot;
+                if (spawnTick < 0)
+                    return null;
+                const spawnTime = spawnTick * PARTICLE_UPDATE_SECONDS;
+                const emitterAge = wrapParticleEmitterAge(spawnTime, emitter);
+                const particleLifetime = evaluateParticleScalar(emitter.lifetime, 0, emitter.duration, emitterAge);
+                const age = effectSeconds - spawnTime;
+                return age < particleLifetime ? { age, lifetime: particleLifetime, emitterAge } : null;
+            };
+
+            const renderer = new MPHRenderer(device, renderCache, model, texture, null, {
+                ...baseOptions,
+                entityModel: true,
+                nodeFilter: (name) => emitter.nodeNames.includes(name),
+                // RenderBillboardParticleQuad @ 0x021157CC constructs this
+                // type-4 quad from the full camera basis.
+                forceBillboard: 'camera',
+                forceTwoSided: true,
+                isVisibleAtTime: (time) => item.initialState !== 0 && sampleParticle(time) !== null,
+                modifyMaterialColor: (dst, _materialName, time) => {
+                    const sample = sampleParticle(time);
+                    if (sample === null) {
+                        dst.a = 0;
+                        return;
+                    }
+                    dst.r = evaluateParticleScalar(emitter.red, sample.age, sample.lifetime, sample.emitterAge);
+                    dst.g = evaluateParticleScalar(emitter.green, sample.age, sample.lifetime, sample.emitterAge);
+                    dst.b = evaluateParticleScalar(emitter.blue, sample.age, sample.lifetime, sample.emitterAge);
+                    dst.a = evaluateParticleScalar(emitter.alpha, sample.age, sample.lifetime, sample.emitterAge);
+                },
+            });
+            movers.push((time) => {
+                const sample = sampleParticle(time);
+                if (sample === null) {
+                    mat4.identity(renderer.modelMatrix);
+                    return;
+                }
+                evaluateParticleVector(initialPosition, emitter.initialPosition, sample.emitterAge, emitter.duration, sample.emitterAge);
+                evaluateParticleVector(initialVelocity, emitter.initialVelocity, sample.emitterAge, emitter.duration, sample.emitterAge);
+                vec3.scaleAndAdd(particlePosition, initialPosition, initialVelocity, sample.age);
+
+                calcItemSpawnPosition(worldPosition, item, parentPlatform, getItemTime(time));
+                worldPosition[1] += fx32(2662);
+                vec3.add(worldPosition, worldPosition, particlePosition);
+                mat4.fromTranslation(renderer.modelMatrix, worldPosition);
+                const size = evaluateParticleScalar(emitter.size, sample.age, sample.lifetime, sample.emitterAge);
+                // RenderBillboardParticleQuad @ 0x021157CC treats size as
+                // the full edge length. The particle templates span
+                // [-1, +1], so their model scale is half that value.
+                const scale = renderer.modelScale * size * 0.5;
+                vec3.set(particleScale, scale, scale, scale);
+                mat4.scale(renderer.modelMatrix, renderer.modelMatrix, particleScale);
+            });
+            renderers.push(renderer);
+        }
     }
     return renderers;
 }
@@ -1278,6 +1377,11 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
         if (this.entities.itemSpawns.some((item) => item.showBase))
             this.cache.fetchMPHARC('archives/common.arc');
+        if (this.entities.itemSpawns.some((item) => item.itemId === 19 && item.initialState !== 0)) {
+            this.cache.fetchMPHARC('archives/effectsBase.arc');
+            this.cache.fetchMPFile('models/particles_Tex.bin');
+            this.cache.fetchMPFile('effects/artifactKeyEffect_PS.bin');
+        }
         for (const enemy of this.entities.enemySpawns)
             for (const spec of getEnemyModelSpecs(enemy))
                 requestEntityModel(this.cache, spec);
@@ -1407,6 +1511,9 @@ export class MPHEntityFile {
             this.movers.push((time) => calcItemSpawnModelMatrix(
                 itemRenderer.modelMatrix, item, parentPlatform, phaseAngle, getItemTime(time), itemRenderer.modelScale));
             renderers.push(itemRenderer);
+            if (item.itemId === 19 && item.initialState !== 0)
+                renderers.push(...createArtifactKeyEffectRenderers(device, this.cache, renderCache,
+                    item, parentPlatform, getItemTime, baseOptions, this.movers));
             if (item.showBase) {
                 const baseRenderer = createEntityModelRenderer(device, this.cache, renderCache, itemSpawnBaseModelSpec, baseOptions);
                 this.movers.push((time) => calcItemSpawnBaseModelMatrix(

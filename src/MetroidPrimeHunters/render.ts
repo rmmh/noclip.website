@@ -177,6 +177,10 @@ class MaterialInstance {
             this.emissionColor.g = this.diffuseColor.g;
             this.emissionColor.b = this.diffuseColor.b;
         }
+        if (this.modifyMaterialColor !== undefined) {
+            alphaMultiplier *= this.diffuseColor.a;
+            forceTranslucent ||= this.diffuseColor.a < 1;
+        }
 
         if (this.texCoordAnimator !== null) {
             this.texCoordAnimator.calcTexMtx(scratchTexMatrix, this.material.texScaleS, this.material.texScaleT);
@@ -241,8 +245,10 @@ class Node {
             calcBillboardMatrix(this.drawMatrix, this.drawMatrix, CalcBillboardFlags.UseRollLocal | CalcBillboardFlags.PriorityZ | CalcBillboardFlags.UseZPlane);
         else if (this.billboardMode === BillboardMode.BBY)
             calcBillboardMatrix(this.drawMatrix, this.drawMatrix, CalcBillboardFlags.UseRollLocal | CalcBillboardFlags.PriorityY | CalcBillboardFlags.UseZPlane);
-        else if (this.billboardMode === BillboardMode.PARTICLE)
+        else if (this.billboardMode === BillboardMode.PARTICLE_AXIAL)
             calcAxialParticleBillboardMatrix(this.drawMatrix);
+        else if (this.billboardMode === BillboardMode.PARTICLE_CAMERA)
+            calcCameraParticleBillboardMatrix(this.drawMatrix);
     }
 }
 
@@ -277,6 +283,25 @@ function calcAxialParticleBillboardMatrix(dst: mat4): void {
     dst[8] = scratchParticleAxis[0] * scaleZ;
     dst[9] = scratchParticleAxis[1] * scaleZ;
     dst[10] = scratchParticleAxis[2] * scaleZ;
+}
+
+function calcCameraParticleBillboardMatrix(dst: mat4): void {
+    const scaleX = Math.hypot(dst[0], dst[1], dst[2]);
+    const scaleY = Math.hypot(dst[4], dst[5], dst[6]);
+    const scaleZ = Math.hypot(dst[8], dst[9], dst[10]);
+
+    // MPH's particle templates lie in the local XZ plane. In model-view
+    // space, map those axes to camera right/up and put the unused local Y
+    // axis along the view direction.
+    dst[0] = scaleX;
+    dst[1] = 0;
+    dst[2] = 0;
+    dst[4] = 0;
+    dst[5] = 0;
+    dst[6] = -scaleY;
+    dst[8] = 0;
+    dst[9] = scaleZ;
+    dst[10] = 0;
 }
 
 const scratchViewMatrix = mat4.create();
@@ -336,7 +361,7 @@ class ShapeInstance {
 const bindingLayouts: GfxBindingLayoutDescriptor[] = [{ numUniformBuffers: 3, numSamplers: 1 }];
 
 enum BillboardMode {
-    NONE, BB, BBY, PARTICLE,
+    NONE, BB, BBY, PARTICLE_AXIAL, PARTICLE_CAMERA,
 }
 
 export type MPHSceneMode =
@@ -362,7 +387,7 @@ export interface MPHRendererOptions {
     modifyMaterialColor?: (dst: Color, materialName: string, timeInMilliseconds: number) => void;
     modifyNodeMatrix?: (dst: mat4, nodeName: string, timeInMilliseconds: number) => void;
     nodeFilter?: (name: string) => boolean;
-    forceBillboard?: boolean;
+    forceBillboard?: 'axial' | 'camera';
     forceTwoSided?: boolean;
     fog?: MPHFogConfig | null;
     collision?: MPHCollisionData | null;
@@ -468,8 +493,10 @@ export class MPHRenderer {
 
         for (let i = 0; i < mphModel.nodes.length; i++) {
             const node = new Node(mphModel.nodes[i], i);
-            if (options.forceBillboard === true)
-                node.billboardMode = BillboardMode.PARTICLE;
+            if (options.forceBillboard === 'axial')
+                node.billboardMode = BillboardMode.PARTICLE_AXIAL;
+            else if (options.forceBillboard === 'camera')
+                node.billboardMode = BillboardMode.PARTICLE_CAMERA;
             this.nodes.push(node);
         }
         const addNodeDrawOrder = (index: number, parent: Node | null): void => {
