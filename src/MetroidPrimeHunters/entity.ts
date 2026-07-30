@@ -15,11 +15,13 @@ const ENTITY_TYPE_OBJECT = 1;
 const ENTITY_TYPE_DOOR = 3;
 const ENTITY_TYPE_ITEM_SPAWN = 4;
 const ENTITY_TYPE_TELEPORTER = 14;
+const ENTITY_TYPE_FORCE_FIELD = 19;
 const PLATFORM_DATA_SIZE = 0x24C;
 const OBJECT_DATA_SIZE = 0x98;
 const DOOR_DATA_SIZE = 0x68;
 const ITEM_SPAWN_DATA_SIZE = 0x48;
 const TELEPORTER_DATA_SIZE = 0x5C;
+const FORCE_FIELD_DATA_SIZE = 0x35;
 
 interface MPHEntityEntry {
     nodeName: string;
@@ -78,12 +80,23 @@ interface MPHTeleporterEntity extends MPHEntityEntry {
     invisible: boolean;
 }
 
+interface MPHForceFieldEntity extends MPHEntityEntry {
+    position: vec3;
+    up: vec3;
+    facing: vec3;
+    subtype: number;
+    width: number;
+    height: number;
+    active: boolean;
+}
+
 export interface MPHEntities {
     platforms: MPHPlatformEntity[];
     objects: MPHObjectEntity[];
     doors: MPHDoorEntity[];
     itemSpawns: MPHItemSpawnEntity[];
     teleporters: MPHTeleporterEntity[];
+    forceFields: MPHForceFieldEntity[];
 }
 
 interface MPHEntityModelSpec {
@@ -196,6 +209,21 @@ function parseTeleporter(entry: MPHEntityEntry, view: DataView): MPHTeleporterEn
     };
 }
 
+function parseForceField(entry: MPHEntityEntry, view: DataView): MPHForceFieldEntity {
+    assert(entry.dataLength === FORCE_FIELD_DATA_SIZE);
+    const offs = entry.dataOffset;
+    return {
+        ...entry,
+        position: readVec3Fx(view, offs + 0x04),
+        up: readVec3Fx(view, offs + 0x10),
+        facing: readVec3Fx(view, offs + 0x1C),
+        subtype: view.getUint32(offs + 0x28, true),
+        width: readFx32(view, offs + 0x2C),
+        height: readFx32(view, offs + 0x30),
+        active: view.getUint8(offs + 0x34) !== 0,
+    };
+}
+
 export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPHEntities {
     const view = buffer.createDataView();
     assert(view.getUint32(0x00, true) === 2);
@@ -206,6 +234,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     const doors: MPHDoorEntity[] = [];
     const itemSpawns: MPHItemSpawnEntity[] = [];
     const teleporters: MPHTeleporterEntity[] = [];
+    const forceFields: MPHForceFieldEntity[] = [];
     let entryCount = 0;
     for (let offs = ENTITY_HEADER_SIZE; offs + ENTITY_ENTRY_SIZE <= view.byteLength; offs += ENTITY_ENTRY_SIZE) {
         const dataOffset = view.getUint32(offs + 0x14, true);
@@ -237,10 +266,12 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
             itemSpawns.push(parseItemSpawn(entry, view));
         else if (entry.type === ENTITY_TYPE_TELEPORTER)
             teleporters.push(parseTeleporter(entry, view));
+        else if (entry.type === ENTITY_TYPE_FORCE_FIELD)
+            forceFields.push(parseForceField(entry, view));
     }
 
     assert(entryCount === view.getUint16(0x04 + layerId * 2, true));
-    return { platforms, objects, doors, itemSpawns, teleporters };
+    return { platforms, objects, doors, itemSpawns, teleporters, forceFields };
 }
 
 export interface MPHObjectMetadata {
@@ -324,6 +355,23 @@ function getTeleporterModelSpec(sceneMode: MPHSceneMode): MPHEntityModelSpec {
         animationFilename: `${name}_Anim.bin`,
         sharedTextureFilename: sceneMode.kind === 'multiplayer' ? undefined : 'TeleporterTextureShare_img_Model.bin',
         animationId: 1,
+    };
+}
+
+// RenderForceFieldEntity @ 0x02168B70 maps subtypes through this palette table.
+const forceFieldPaletteIds = [0, 1, 2, 7, 6, 3, 4, 5] as const;
+
+const forceFieldModelSpec: MPHEntityModelSpec = {
+    modelFilename: 'ForceField_Model.bin',
+    animationFilename: 'ForceField_Anim.bin',
+    paletteFilename: 'AlimbicPalettes_pal_Model.bin',
+    animationId: 0,
+};
+
+function getForceFieldModelSpec(forceField: MPHForceFieldEntity): MPHEntityModelSpec {
+    return {
+        ...forceFieldModelSpec,
+        paletteOverrides: [{ target: 0, source: forceFieldPaletteIds[forceField.subtype] ?? 0 }],
     };
 }
 
@@ -534,6 +582,12 @@ function calcTeleporterModelMatrix(dst: mat4, teleporter: MPHTeleporterEntity, m
     calcOrientedModelMatrix(dst, teleporter.position, teleporter.facing, teleporter.up, modelScale);
 }
 
+function calcForceFieldModelMatrix(dst: mat4, forceField: MPHForceFieldEntity, modelScale: number): void {
+    const target = vec3.sub(vec3.create(), forceField.position, forceField.facing);
+    mat4.targetTo(dst, forceField.position, target, forceField.up);
+    mat4.scale(dst, dst, [modelScale * forceField.width, modelScale * forceField.height, modelScale]);
+}
+
 function calcItemSpawnModelMatrix(dst: mat4, item: MPHItemSpawnEntity, phaseAngle: number, timeInMilliseconds: number, modelScale: number): void {
     const baseY = item.position[1] + 2662 / 0x1000;
     // UpdateItemInstance advances rotation by 0x300 angle units per tick and
@@ -582,6 +636,8 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
         if (this.entities.teleporters.some((teleporter) => !teleporter.invisible))
             requestEntityModel(this.cache, getTeleporterModelSpec(this.sceneMode));
+        if (this.entities.forceFields.some((forceField) => forceField.active))
+            requestEntityModel(this.cache, forceFieldModelSpec);
     }
 
     public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting): MPHRenderer[] {
@@ -659,6 +715,20 @@ export class MPHEntityFile {
                 };
             });
             calcTeleporterModelMatrix(renderer.modelMatrix, teleporter, renderer.modelScale);
+            renderers.push(renderer);
+        }
+        for (const forceField of this.entities.forceFields) {
+            if (!forceField.active)
+                continue;
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, getForceFieldModelSpec(forceField), (animation) => {
+                const duration = getAnimationLoopDuration(animation);
+                return {
+                    sceneMode: this.sceneMode,
+                    lighting,
+                    mapAnimationTime: (time) => time % duration,
+                };
+            });
+            calcForceFieldModelMatrix(renderer.modelMatrix, forceField, renderer.modelScale);
             renderers.push(renderer);
         }
         return renderers;
