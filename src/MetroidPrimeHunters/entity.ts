@@ -1147,8 +1147,15 @@ interface MPHPlatformAnimationSample {
     timeInAnimation: number;
 }
 
+interface MPHPlatformPlaybackState {
+    active: boolean;
+    previousActive: boolean;
+    transitionElapsed: number;
+}
+
 function samplePlatformAnimation(platform: MPHPlatformEntity, metadata: MPHPlatformMetadata, spec: MPHEntityModelSpec,
-    primaryAnimation: MPHAnimation | null, additionalAnimations: readonly MPHAnimation[], timeInMilliseconds: number): MPHPlatformAnimationSample {
+    primaryAnimation: MPHAnimation | null, additionalAnimations: readonly MPHAnimation[], timeInMilliseconds: number,
+    playbackState: MPHPlatformPlaybackState | null = null): MPHPlatformAnimationSample {
     const animationIds = metadata.animationIds;
     if (spec.additionalAnimationIds === undefined || spec.animationId === undefined)
         return { index: 0, timeInAnimation: timeInMilliseconds };
@@ -1166,6 +1173,34 @@ function samplePlatformAnimation(platform: MPHPlatformEntity, metadata: MPHPlatf
             additionalAnimations[index - 1]?.material?.frameCount;
         return Math.max(0, (frameCount ?? 1) - 1) * 1000 / 30;
     };
+
+    if (playbackState !== null) {
+        const stateAnimationId = animationIds[playbackState.active ? 2 : 0];
+        if (playbackState.active === playbackState.previousActive)
+            return stateAnimationId < 0 ?
+                { index: 0, timeInAnimation: 0 } :
+                { index: getAnimationIndex(stateAnimationId), timeInAnimation: timeInMilliseconds };
+
+        const transitionAnimationId = animationIds[playbackState.active ? 1 : 3];
+        if (transitionAnimationId >= 0) {
+            const transitionIndex = getAnimationIndex(transitionAnimationId);
+            const transitionDuration = getAnimationDuration(transitionIndex);
+            if (playbackState.transitionElapsed < transitionDuration)
+                return {
+                    index: transitionIndex,
+                    timeInAnimation: playbackState.transitionElapsed,
+                };
+            return stateAnimationId < 0 ?
+                { index: 0, timeInAnimation: 0 } :
+                {
+                    index: getAnimationIndex(stateAnimationId),
+                    timeInAnimation: playbackState.transitionElapsed - transitionDuration,
+                };
+        }
+        return stateAnimationId < 0 ?
+            { index: 0, timeInAnimation: 0 } :
+            { index: getAnimationIndex(stateAnimationId), timeInAnimation: playbackState.transitionElapsed };
+    }
 
     const elapsed = timeInMilliseconds - getPlatformActivationDelayMilliseconds(platform);
     if (elapsed < 0) {
@@ -1189,7 +1224,8 @@ function samplePlatformAnimation(platform: MPHPlatformEntity, metadata: MPHPlatf
     return { index: getAnimationIndex(animationIds[2]), timeInAnimation: elapsed };
 }
 
-function samplePlatformPath(dstPosition: vec3, dstRotation: quat, platform: MPHPlatformEntity, timeInMilliseconds: number): void {
+function samplePlatformPath(dstPosition: vec3, dstRotation: quat, platform: MPHPlatformEntity,
+        timeInMilliseconds: number, activeFrameTimeOverride: number | null = null): void {
     if (platform.positions.length === 0) {
         vec3.copy(dstPosition, platform.position);
         quat.identity(dstRotation);
@@ -1208,7 +1244,7 @@ function samplePlatformPath(dstPosition: vec3, dstRotation: quat, platform: MPHP
     // The passive viewer supplies that absent gameplay message after a
     // deterministic per-entity dwell.
     const inactiveActivationDelayFrames = getPlatformActivationDelayMilliseconds(platform) * 30 / 1000;
-    const activeFrameTime = frameTime - inactiveActivationDelayFrames;
+    const activeFrameTime = activeFrameTimeOverride ?? frameTime - inactiveActivationDelayFrames;
     if (activeFrameTime < 0) {
         setPlatformKey(dstPosition, dstRotation, platform, 0);
         return;
@@ -1241,8 +1277,9 @@ function setupPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, modelS
     mat4.fromRotationTranslationScale(dst, platform.rotations[0], position, [modelScale, modelScale, modelScale]);
 }
 
-function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInMilliseconds: number, modelScale: number): void {
-    samplePlatformPath(scratchPosition, scratchRotation, platform, timeInMilliseconds);
+function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInMilliseconds: number,
+        modelScale: number, activeFrameTimeOverride: number | null = null): void {
+    samplePlatformPath(scratchPosition, scratchRotation, platform, timeInMilliseconds, activeFrameTimeOverride);
     vec3.add(scratchPosition, scratchPosition, platform.positionOffset);
     vec3.set(scratchScale, modelScale, modelScale, modelScale);
     mat4.fromRotationTranslationScale(dst, scratchRotation, scratchPosition, scratchScale);
@@ -1456,6 +1493,11 @@ interface MPHObjectStatePlan extends MPHEnemyActivationPlan {
     state: number;
 }
 
+interface MPHPlatformStatePlan extends MPHEnemyActivationPlan {
+    animationActive: boolean;
+    movementActive: boolean;
+}
+
 const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
 const FORCE_FIELD_FADE_DURATION_MS = 31 * 1000 / 30;
 
@@ -1464,6 +1506,7 @@ interface MPHEntityActivationPlans {
     items: Map<number, MPHEnemyActivationPlan[]>;
     forceFields: Map<number, MPHForceFieldTransitionPlan[]>;
     objects: Map<number, MPHObjectStatePlan[]>;
+    platforms: Map<number, MPHPlatformStatePlan[]>;
 }
 
 function addEntityActivationPlan(plansByEntityId: Map<number, MPHEnemyActivationPlan[]>,
@@ -1495,17 +1538,31 @@ function addObjectStatePlan(plansByEntityId: Map<number, MPHObjectStatePlan[]>,
         plans.push({ rootVolume, waveDepth, state });
 }
 
+function addPlatformStatePlan(plansByEntityId: Map<number, MPHPlatformStatePlan[]>,
+        entityId: number, rootVolume: MPHTriggerVolumeEntity | null, waveDepth: number,
+        animationActive: boolean, movementActive: boolean): void {
+    let plans = plansByEntityId.get(entityId);
+    if (plans === undefined)
+        plansByEntityId.set(entityId, plans = []);
+    if (!plans.some((plan) =>
+        plan.rootVolume === rootVolume && plan.waveDepth === waveDepth &&
+        plan.animationActive === animationActive && plan.movementActive === movementActive))
+        plans.push({ rootVolume, waveDepth, animationActive, movementActive });
+}
+
 function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationPlans {
     const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
     const enemyById = new Map(entities.enemySpawns.map((enemy) => [enemy.entityId, enemy]));
     const itemById = new Map(entities.itemSpawns.map((item) => [item.entityId, item]));
     const forceFieldById = new Map(entities.forceFields.map((forceField) => [forceField.entityId, forceField]));
     const objectById = new Map(entities.objects.map((object) => [object.entityId, object]));
+    const platformById = new Map(entities.platforms.map((platform) => [platform.entityId, platform]));
     const result: MPHEntityActivationPlans = {
         enemies: new Map(),
         items: new Map(),
         forceFields: new Map(),
         objects: new Map(),
+        platforms: new Map(),
     };
 
     interface MessageEvent {
@@ -1573,6 +1630,25 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
                 const state = event.message === 0x12 ? 2 : event.messageParam & 0xFF;
                 if (state < 4)
                     addObjectStatePlan(result.objects, object.entityId, rootVolume, event.waveDepth, state);
+                continue;
+            }
+            const platform = platformById.get(event.targetId);
+            if (platform !== undefined) {
+                // HandlePlatformEntityMessage @ 0x0216E854.
+                if (event.message === 0x12)
+                    addPlatformStatePlan(result.platforms, platform.entityId,
+                        rootVolume, event.waveDepth, true, true);
+                else if (event.message === 5)
+                    addPlatformStatePlan(result.platforms, platform.entityId,
+                        rootVolume, event.waveDepth, event.messageParam !== 0, event.messageParam !== 0);
+                else if (event.message === 0x2C)
+                    addPlatformStatePlan(result.platforms, platform.entityId,
+                        rootVolume, event.waveDepth, true, event.messageParam !== 0);
+                else if (event.message === 0x2D)
+                    addPlatformStatePlan(result.platforms, platform.entityId,
+                        rootVolume, event.waveDepth, false, false);
+                else
+                    continue;
                 continue;
             }
 
@@ -1746,23 +1822,107 @@ export class MPHEntityFile {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
                 continue;
-            const platform_ = this.metadata.platforms[platform.modelId];
+            const platform_ = assertExists(this.metadata.platforms[platform.modelId]);
+            const statePlans = entityActivationPlans.platforms.get(platform.entityId) ?? [];
+            let activeFrameTimeOverride: number | null = null;
+            let playbackState: MPHPlatformPlaybackState | null = null;
             const platformRenderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation, additionalAnimations) => {
                 const hasStateAnimations = spec.additionalAnimationIds !== undefined;
+                const rootActivationTimes = new Map<number, number>();
+                const cameraRoomPosition = vec3.create();
+                let sceneStartTime: number | null = null;
+                let platformVisible = true;
+                const animations = [animation, ...additionalAnimations];
+                const animationIds = [spec.animationId, ...(spec.additionalAnimationIds ?? [])];
+                const getAnimationDuration = (animationId: number): number => {
+                    const index = animationIds.indexOf(animationId);
+                    const candidate = index >= 0 ? animations[index] : null;
+                    const frameCount = candidate?.node?.frameCount ??
+                        candidate?.material?.frameCount ??
+                        candidate?.texCoord?.frameCount ?? 1;
+                    return Math.max(0, frameCount - 1) * 1000 / 30;
+                };
+                const updatePlatformState: NonNullable<MPHRendererOptions['isVisibleAtTime']> | undefined =
+                    statePlans.length === 0 ? undefined : (time, viewerInput) => {
+                        if (sceneStartTime === null)
+                            sceneStartTime = time;
+                        const cameraMatrix = viewerInput.camera.worldMatrix;
+                        vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                        if (inverseSceneTransform !== null)
+                            vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+
+                        const occurredPlans: { plan: MPHPlatformStatePlan; time: number }[] = [];
+                        for (const plan of statePlans) {
+                            const transitionTime = getPlannedActivationTime(
+                                [plan], time, sceneStartTime, cameraRoomPosition, rootActivationTimes);
+                            if (transitionTime !== null)
+                                occurredPlans.push({ plan, time: transitionTime });
+                        }
+                        occurredPlans.sort((a, b) => a.time - b.time);
+
+                        let animationActive = platform.active;
+                        let previousAnimationActive = animationActive;
+                        let animationTransitionTime = sceneStartTime;
+                        let movementActive = platform.active;
+                        let movementStartTime = sceneStartTime;
+                        let movementElapsed = 0;
+                        for (const event of occurredPlans) {
+                            if (movementActive)
+                                movementElapsed += event.time - movementStartTime;
+                            movementStartTime = event.time;
+                            movementActive = event.plan.movementActive;
+                            previousAnimationActive = animationActive;
+                            animationActive = event.plan.animationActive;
+                            animationTransitionTime = event.time;
+                        }
+                        if (movementActive)
+                            movementElapsed += time - movementStartTime;
+                        activeFrameTimeOverride = movementActive || movementElapsed > 0 ?
+                            movementElapsed * 30 / 1000 : -1;
+                        playbackState = {
+                            active: animationActive,
+                            previousActive: previousAnimationActive,
+                            transitionElapsed: time - animationTransitionTime,
+                        };
+
+                        platformVisible = true;
+                        if (hasStateAnimations && !animationActive) {
+                            const inactiveAnimationId = platform_.animationIds[0];
+                            if (previousAnimationActive) {
+                                const deactivateAnimationId = platform_.animationIds[3];
+                                platformVisible = deactivateAnimationId >= 0 &&
+                                    playbackState.transitionElapsed < getAnimationDuration(deactivateAnimationId) ||
+                                    inactiveAnimationId >= 0;
+                            } else {
+                                platformVisible = inactiveAnimationId >= 0;
+                            }
+                        }
+                        return platformVisible;
+                    };
                 return {
                     ...baseOptions,
+                    isVisibleAtTime: updatePlatformState,
                     selectNodeAnimation: hasStateAnimations ?
-                        (time) => samplePlatformAnimation(platform, platform_, spec, animation, additionalAnimations, time).index : undefined,
+                        (time) => samplePlatformAnimation(
+                            platform, platform_, spec, animation, additionalAnimations, time, playbackState).index : undefined,
                     additionalMaterialAnimations: hasStateAnimations ?
                         additionalAnimations.map((animation) => animation.material) : undefined,
+                    additionalTexCoordAnimations: hasStateAnimations ?
+                        additionalAnimations.map((animation) => animation.texCoord) : undefined,
                     selectMaterialAnimation: hasStateAnimations ?
-                        (time) => samplePlatformAnimation(platform, platform_, spec, animation, additionalAnimations, time).index : undefined,
+                        (time) => samplePlatformAnimation(
+                            platform, platform_, spec, animation, additionalAnimations, time, playbackState).index : undefined,
+                    selectTexCoordAnimation: hasStateAnimations ?
+                        (time) => samplePlatformAnimation(
+                            platform, platform_, spec, animation, additionalAnimations, time, playbackState).index : undefined,
                     mapAnimationTime: hasStateAnimations ?
-                        (time) => samplePlatformAnimation(platform, platform_, spec, animation, additionalAnimations, time).timeInAnimation : undefined,
+                        (time) => samplePlatformAnimation(
+                            platform, platform_, spec, animation, additionalAnimations, time, playbackState).timeInAnimation : undefined,
                 };
             });
             if (platform.positions.length > 1)
-                this.movers.push((time) => calcPlatformModelMatrix(platformRenderer.modelMatrix, platform, time, platformRenderer.modelScale));
+                this.movers.push((time) => calcPlatformModelMatrix(
+                    platformRenderer.modelMatrix, platform, time, platformRenderer.modelScale, activeFrameTimeOverride));
             else
                 setupPlatformModelMatrix(platformRenderer.modelMatrix, platform, platformRenderer.modelScale);
             renderers.push(platformRenderer);
