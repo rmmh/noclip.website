@@ -1,5 +1,5 @@
 
-import { mat4, mat2d, vec4 } from "gl-matrix";
+import { mat4, mat2d, ReadonlyVec3, vec3, vec4 } from "gl-matrix";
 import { GfxFormat, GfxDevice, GfxProgram, GfxBindingLayoutDescriptor, GfxTexture, GfxBlendMode, GfxBlendFactor, GfxMipFilterMode, GfxTexFilterMode, GfxSampler, GfxMegaStateDescriptor, makeTextureDescriptor2D, GfxWrapMode } from '../gfx/platform/GfxPlatform.js';
 import * as Viewer from '../viewer.js';
 import * as NITRO_GX from '../SuperMario64DS/nitro_gx.js';
@@ -255,8 +255,8 @@ export type MPHSceneMode =
     { kind: 'multiplayer', layout: 0 | 1, captureTheFlag?: boolean };
 
 export interface MPHLighting {
-    colors: readonly [readonly [number, number, number], readonly [number, number, number]];
-    directions: readonly [readonly [number, number, number], readonly [number, number, number]];
+    colors: readonly [ReadonlyVec3, ReadonlyVec3];
+    directions: readonly [ReadonlyVec3, ReadonlyVec3];
 }
 
 export interface MPHRendererOptions {

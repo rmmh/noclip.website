@@ -18,6 +18,8 @@ const ENTITY_TYPE_JUMP_PAD = 9;
 const ENTITY_TYPE_OCTOLITH_FLAG = 12;
 const ENTITY_TYPE_FLAG_BASE = 13;
 const ENTITY_TYPE_TELEPORTER = 14;
+const ENTITY_TYPE_LIGHT_SOURCE = 16;
+const ENTITY_TYPE_ARTIFACT = 17;
 const ENTITY_TYPE_FORCE_FIELD = 19;
 const PLATFORM_DATA_SIZE = 0x24C;
 const OBJECT_DATA_SIZE = 0x98;
@@ -27,6 +29,8 @@ const JUMP_PAD_DATA_SIZE = 0x94;
 const OCTOLITH_FLAG_DATA_SIZE = 0x29;
 const FLAG_BASE_DATA_SIZE = 0x6C;
 const TELEPORTER_DATA_SIZE = 0x5C;
+const LIGHT_SOURCE_DATA_SIZE = 0x88;
+const ARTIFACT_DATA_SIZE = 0x46;
 const FORCE_FIELD_DATA_SIZE = 0x35;
 
 interface MPHEntityEntry {
@@ -104,6 +108,29 @@ interface MPHFlagBaseEntity extends MPHEntityEntry {
     active: boolean;
 }
 
+type MPHLightVolume =
+    { kind: 'box', axes: readonly [vec3, vec3, vec3], origin: vec3, extents: vec3 } |
+    { kind: 'cylinder', axis: vec3, origin: vec3, radius: number, length: number } |
+    { kind: 'sphere', origin: vec3, radius: number };
+
+interface MPHLightSourceEntity extends MPHEntityEntry {
+    volume: MPHLightVolume;
+    light0Enabled: boolean;
+    light0Color: [number, number, number];
+    light0Direction: vec3;
+    light1Enabled: boolean;
+    light1Color: [number, number, number];
+    light1Direction: vec3;
+}
+
+interface MPHArtifactEntity extends MPHEntityEntry {
+    position: vec3;
+    up: vec3;
+    facing: vec3;
+    artifactId: number;
+    active: boolean;
+}
+
 interface MPHTeleporterEntity extends MPHEntityEntry {
     position: vec3;
     up: vec3;
@@ -129,6 +156,8 @@ export interface MPHEntities {
     jumpPads: MPHJumpPadEntity[];
     octolithFlags: MPHOctolithFlagEntity[];
     flagBases: MPHFlagBaseEntity[];
+    lightSources: MPHLightSourceEntity[];
+    artifacts: MPHArtifactEntity[];
     teleporters: MPHTeleporterEntity[];
     forceFields: MPHForceFieldEntity[];
 }
@@ -276,6 +305,87 @@ function parseFlagBase(entry: MPHEntityEntry, view: DataView): MPHFlagBaseEntity
     };
 }
 
+function parseLightSource(entry: MPHEntityEntry, view: DataView): MPHLightSourceEntity {
+    assert(entry.dataLength === LIGHT_SOURCE_DATA_SIZE);
+    const offs = entry.dataOffset;
+    const position = readVec3Fx(view, offs + 0x04);
+    const volumeType = view.getUint32(offs + 0x28, true);
+    let volume: MPHLightVolume;
+    if (volumeType === 0) {
+        volume = {
+            kind: 'box',
+            axes: [
+                readVec3Fx(view, offs + 0x2C),
+                readVec3Fx(view, offs + 0x38),
+                readVec3Fx(view, offs + 0x44),
+            ],
+            origin: readVec3Fx(view, offs + 0x50),
+            extents: readVec3Fx(view, offs + 0x5C),
+        };
+    } else if (volumeType === 1) {
+        volume = {
+            kind: 'cylinder',
+            axis: readVec3Fx(view, offs + 0x2C),
+            origin: readVec3Fx(view, offs + 0x38),
+            radius: readFx32(view, offs + 0x48),
+            length: readFx32(view, offs + 0x4C),
+        };
+    } else {
+        assert(volumeType === 2);
+        volume = {
+            kind: 'sphere',
+            origin: readVec3Fx(view, offs + 0x2C),
+            radius: readFx32(view, offs + 0x38),
+        };
+    }
+    vec3.add(volume.origin, volume.origin, position);
+    return {
+        ...entry,
+        volume,
+        light0Enabled: view.getUint8(offs + 0x68) !== 0,
+        light0Color: [view.getUint8(offs + 0x69) >> 3, view.getUint8(offs + 0x6A) >> 3, view.getUint8(offs + 0x6B) >> 3],
+        light0Direction: readNormalizedVec3Fx(view, offs + 0x6C),
+        light1Enabled: view.getUint8(offs + 0x78) !== 0,
+        light1Color: [view.getUint8(offs + 0x79) >> 3, view.getUint8(offs + 0x7A) >> 3, view.getUint8(offs + 0x7B) >> 3],
+        light1Direction: readNormalizedVec3Fx(view, offs + 0x7C),
+    };
+}
+
+function parseArtifact(entry: MPHEntityEntry, view: DataView): MPHArtifactEntity {
+    assert(entry.dataLength === ARTIFACT_DATA_SIZE);
+    const offs = entry.dataOffset;
+    return {
+        ...entry,
+        position: readVec3Fx(view, offs + 0x04),
+        up: readVec3Fx(view, offs + 0x10),
+        facing: readVec3Fx(view, offs + 0x1C),
+        artifactId: view.getUint8(offs + 0x28),
+        active: view.getUint8(offs + 0x2A) !== 0,
+    };
+}
+
+function pointInsideLightSource(light: MPHLightSourceEntity, point: vec3): boolean {
+    const volume = light.volume;
+    if (volume.kind === 'box') {
+        const delta = vec3.sub(vec3.create(), point, volume.origin);
+        for (let i = 0; i < 3; i++) {
+            const distance = vec3.dot(volume.axes[i], delta);
+            if (distance < 0 || distance > volume.extents[i])
+                return false;
+        }
+        return true;
+    } else if (volume.kind === 'cylinder') {
+        const delta = vec3.sub(vec3.create(), point, volume.origin);
+        const distanceAlongAxis = vec3.dot(volume.axis, delta);
+        if (distanceAlongAxis < 0 || distanceAlongAxis > volume.length)
+            return false;
+        vec3.scaleAndAdd(delta, delta, volume.axis, -distanceAlongAxis);
+        return vec3.squaredLength(delta) <= volume.radius * volume.radius;
+    } else {
+        return vec3.squaredDistance(point, volume.origin) <= volume.radius * volume.radius;
+    }
+}
+
 function parseTeleporter(entry: MPHEntityEntry, view: DataView): MPHTeleporterEntity {
     assert(entry.dataLength === TELEPORTER_DATA_SIZE);
     const offs = entry.dataOffset;
@@ -315,6 +425,8 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     const jumpPads: MPHJumpPadEntity[] = [];
     const octolithFlags: MPHOctolithFlagEntity[] = [];
     const flagBases: MPHFlagBaseEntity[] = [];
+    const lightSources: MPHLightSourceEntity[] = [];
+    const artifacts: MPHArtifactEntity[] = [];
     const teleporters: MPHTeleporterEntity[] = [];
     const forceFields: MPHForceFieldEntity[] = [];
     let entryCount = 0;
@@ -352,6 +464,10 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
             octolithFlags.push(parseOctolithFlag(entry, view));
         else if (entry.type === ENTITY_TYPE_FLAG_BASE)
             flagBases.push(parseFlagBase(entry, view));
+        else if (entry.type === ENTITY_TYPE_LIGHT_SOURCE)
+            lightSources.push(parseLightSource(entry, view));
+        else if (entry.type === ENTITY_TYPE_ARTIFACT)
+            artifacts.push(parseArtifact(entry, view));
         else if (entry.type === ENTITY_TYPE_TELEPORTER)
             teleporters.push(parseTeleporter(entry, view));
         else if (entry.type === ENTITY_TYPE_FORCE_FIELD)
@@ -359,7 +475,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     }
 
     assert(entryCount === view.getUint16(0x04 + layerId * 2, true));
-    return { platforms, objects, doors, itemSpawns, jumpPads, octolithFlags, flagBases, teleporters, forceFields };
+    return { platforms, objects, doors, itemSpawns, jumpPads, octolithFlags, flagBases, lightSources, artifacts, teleporters, forceFields };
 }
 
 export interface MPHObjectMetadata {
@@ -433,6 +549,17 @@ function getItemModelSpec(metadata: MPHEntityMetadata, item: MPHItemSpawnEntity)
         modelFilename: `${item_.modelName}_Model.bin`,
         animationFilename: item_.animated ? `${item_.modelName}_Anim.bin` : undefined,
         animationId: item_.animated ? 0 : undefined,
+    };
+}
+
+function getArtifactModelSpec(artifact: MPHArtifactEntity): MPHEntityModelSpec {
+    assert(artifact.artifactId < 8);
+    const modelNumber = String(artifact.artifactId + 1).padStart(2, '0');
+    return {
+        modelFilename: `Artifact${modelNumber}_mdl_Model.bin`,
+        animationFilename: 'Artifact_Anim.bin',
+        sharedTextureFilename: 'ArtifactTextureShare_img_Model.bin',
+        animationId: 0,
     };
 }
 
@@ -712,6 +839,14 @@ function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInM
 // Stagger spawning to avoid synchronized bobs.
 const ITEM_SPAWN_PREVIEW_PHASE_STEP = 0x2000;
 
+const ARTIFACT_MODEL_OFFSET = (0x1800 - 1843) / 0x1000;
+
+function calcArtifactModelMatrix(dst: mat4, artifact: MPHArtifactEntity, modelScale: number): void {
+    const position = vec3.clone(artifact.position);
+    position[1] += ARTIFACT_MODEL_OFFSET;
+    calcOrientedModelMatrix(dst, position, artifact.facing, artifact.up, modelScale);
+}
+
 function calcJumpPadModelMatrix(dst: mat4, jumpPad: MPHJumpPadEntity, modelScale: number): void {
     calcOrientedModelMatrix(dst, jumpPad.position, jumpPad.facing, jumpPad.up, modelScale);
 }
@@ -792,6 +927,11 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getDoorModelSpec(this.metadata, door));
         for (const item of this.entities.itemSpawns)
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
+        for (const artifact of this.entities.artifacts) {
+            if (!artifact.active)
+                continue;
+            requestEntityModel(this.cache, getArtifactModelSpec(artifact));
+        }
         for (const jumpPad of this.entities.jumpPads) {
             requestEntityModel(this.cache, getJumpPadModelSpec(jumpPad));
             if (jumpPad.active)
@@ -872,6 +1012,34 @@ export class MPHEntityFile {
                 lighting,
             });
             this.movers.push((time) => calcItemSpawnModelMatrix(renderer.modelMatrix, item, phaseAngle, time, renderer.modelScale));
+            renderers.push(renderer);
+        }
+        for (const artifact of this.entities.artifacts) {
+            if (!artifact.active)
+                continue;
+            const colors: [vec3, vec3] = [vec3.clone(lighting.colors[0]), vec3.clone(lighting.colors[1])];
+            const directions: [vec3, vec3] = [vec3.clone(lighting.directions[0]), vec3.clone(lighting.directions[1])];
+            for (const light of this.entities.lightSources) {
+                if (!pointInsideLightSource(light, artifact.position))
+                    continue;
+                if (light.light0Enabled) {
+                    vec3.scale(colors[0], light.light0Color, 1 / 31);
+                    vec3.negate(directions[0], light.light0Direction);
+                }
+                if (light.light1Enabled) {
+                    vec3.scale(colors[1], light.light1Color, 1 / 31);
+                    vec3.negate(directions[1], light.light1Direction);
+                }
+            }
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, getArtifactModelSpec(artifact), (animation) => {
+                const duration = getAnimationLoopDuration(animation);
+                return {
+                    sceneMode: this.sceneMode,
+                    lighting: { colors, directions },
+                    mapAnimationTime: (time) => time % duration,
+                };
+            });
+            calcArtifactModelMatrix(renderer.modelMatrix, artifact, renderer.modelScale);
             renderers.push(renderer);
         }
         for (const jumpPad of this.entities.jumpPads) {
