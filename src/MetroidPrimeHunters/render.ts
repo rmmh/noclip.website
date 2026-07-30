@@ -352,6 +352,7 @@ export interface MPHRendererOptions {
     sceneMode?: MPHSceneMode;
     entityModel?: boolean;
     lighting?: MPHLighting;
+    isVisibleAtTime?: (timeInMilliseconds: number) => boolean;
     mapAnimationTime?: (timeInMilliseconds: number) => number;
     mapMaterialAnimationTime?: (timeInMilliseconds: number) => number;
     additionalNodeAnimations?: (MPHNodeAnimation | null)[];
@@ -413,6 +414,7 @@ export class MPHRenderer {
     private modifyNodeMatrix: MPHRendererOptions['modifyNodeMatrix'];
     private sceneMode: MPHSceneMode;
     private lighting: MPHLighting | undefined;
+    private isVisibleAtTime: MPHRendererOptions['isVisibleAtTime'];
     private mapAnimationTime: MPHRendererOptions['mapAnimationTime'];
     private mapMaterialAnimationTime: MPHRendererOptions['mapMaterialAnimationTime'];
     private sceneTransform: mat4 | null;
@@ -428,6 +430,7 @@ export class MPHRenderer {
     constructor(device: GfxDevice, cache: GfxRenderCache, public mphModel: MPHbin, private tex0: TEX0, mphAnimation: MPHAnimation | null, options: MPHRendererOptions) {
         this.sceneMode = options.sceneMode ?? { kind: 'singlePlayer', geometrySet: 1 };
         this.lighting = options.lighting;
+        this.isVisibleAtTime = options.isVisibleAtTime;
         this.mapAnimationTime = options.mapAnimationTime;
         this.mapMaterialAnimationTime = options.mapMaterialAnimationTime;
         this.selectNodeAnimation = options.selectNodeAnimation;
@@ -519,7 +522,7 @@ export class MPHRenderer {
     }
 
     public prepareToRender(renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput): void {
-        if (!this.visible)
+        if (!this.visible || (this.isVisibleAtTime !== undefined && !this.isVisibleAtTime(viewerInput.time)))
             return;
         this.animationController.setTimeInMilliseconds(this.mapAnimationTime !== undefined ?
             this.mapAnimationTime(viewerInput.time) : viewerInput.time);

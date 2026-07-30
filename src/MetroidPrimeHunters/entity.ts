@@ -92,6 +92,11 @@ interface MPHItemSpawnEntity extends MPHEntityEntry {
     parentEntityId: number;
     itemId: number;
     initialState: number;
+    showBase: boolean;
+    respawns: boolean;
+    maxSpawnCount: number;
+    respawnDelayTicks: number;
+    initialDelayTicks: number;
 }
 
 interface MPHJumpPadEntity extends MPHEntityEntry {
@@ -189,6 +194,7 @@ export interface MPHEntities {
 
 interface MPHEntityModelSpec {
     modelFilename: string;
+    modelDirectory?: string;
     animationFilename?: string;
     sharedTextureFilename?: string;
     paletteFilename?: string;
@@ -295,6 +301,11 @@ function parseItemSpawn(entry: MPHEntityEntry, view: DataView): MPHItemSpawnEnti
         parentEntityId: view.getInt16(offs + 0x28, true),
         itemId: view.getUint32(offs + 0x2C, true),
         initialState: view.getUint8(offs + 0x30),
+        showBase: view.getUint8(offs + 0x31) !== 0,
+        respawns: view.getUint8(offs + 0x32) !== 0,
+        maxSpawnCount: view.getUint16(offs + 0x34, true),
+        respawnDelayTicks: view.getUint16(offs + 0x36, true),
+        initialDelayTicks: view.getUint16(offs + 0x38, true),
     };
 }
 
@@ -620,6 +631,14 @@ function getItemModelSpec(metadata: MPHEntityMetadata, item: MPHItemSpawnEntity)
     };
 }
 
+// InitializeItemSpawnEntityResources @ 0x021074A4 loads this controller model
+// from common.arc. RenderItemSpawnEntity @ 0x02106F04 draws it only when the
+// ItemSpawn record's byte at +0x31 is nonzero.
+const itemSpawnBaseModelSpec: MPHEntityModelSpec = {
+    modelFilename: 'items_base_Model.bin',
+    modelDirectory: '',
+};
+
 function getArtifactModelSpec(artifact: MPHArtifactEntity): MPHEntityModelSpec {
     assert(artifact.artifactId < 8);
     const modelNumber = String(artifact.artifactId + 1).padStart(2, '0');
@@ -784,7 +803,10 @@ function createSamusShipExhaustRenderers(device: GfxDevice, cache: MPHEntityReso
 }
 
 function requestEntityModel(cache: MPHEntityResourceCache, spec: MPHEntityModelSpec): void {
-    cache.fetchMPFile(`models/${spec.modelFilename}`);
+    const modelDirectory = spec.modelDirectory ?? 'models';
+    const modelPath = modelDirectory === '' ? spec.modelFilename : `${modelDirectory}/${spec.modelFilename}`;
+    if (modelDirectory !== '')
+        cache.fetchMPFile(modelPath);
     if (spec.animationFilename !== undefined)
         cache.fetchMPFile(`models/${spec.animationFilename}`);
     if (spec.sharedTextureFilename !== undefined)
@@ -799,22 +821,17 @@ interface MPHSharedTexture {
 }
 
 function createEntityModelRenderer(device: GfxDevice, cache: MPHEntityResourceCache, renderCache: GfxRenderCache, spec: MPHEntityModelSpec, options: MPHRendererOptions | ((animation: MPHAnimation | null, additionalAnimations: readonly MPHAnimation[]) => MPHRendererOptions)): MPHRenderer {
-    const modelFile = assertExists(cache.getFileData(`models/${spec.modelFilename}`));
-    let shared: MPHSharedTexture | null = null;
-    if (spec.sharedTextureFilename !== undefined) {
-        const file = assertExists(cache.getFileData(`models/${spec.sharedTextureFilename}`));
-        shared = { file, bin: parseMPH_Model(file) };
-    }
-
-    const model = parseMPH_Model(modelFile, shared?.bin.mphTex ?? null);
-    let texture: TEX0;
-    if (model.tex0 !== null)
-        texture = model.tex0;
-    else if (model.mphTex.texs.length === 0 && shared !== null)
-        texture = parseTEX0Texture(shared.file, shared.bin.mphTex);
-    else
-        texture = parseTEX0Texture(modelFile, model.mphTex);
-
+    const modelDirectory = spec.modelDirectory ?? 'models';
+    const modelPath = modelDirectory === '' ? spec.modelFilename : `${modelDirectory}/${spec.modelFilename}`;
+    const modelFile = assertExists(cache.getFileData(modelPath));
+    const sharedTextureFile = spec.sharedTextureFilename !== undefined ?
+        assertExists(cache.getFileData(`models/${spec.sharedTextureFilename}`)) : null;
+    const sharedTextureBin = sharedTextureFile !== null ? parseMPH_Model(sharedTextureFile) : null;
+    const model = parseMPH_Model(modelFile, sharedTextureBin?.mphTex ?? null);
+    const texture = model.tex0 !== null ? model.tex0 :
+        model.mphTex.texs.length !== 0 ? parseTEX0Texture(modelFile, model.mphTex) :
+            sharedTextureFile !== null ? parseTEX0Texture(sharedTextureFile, assertExists(sharedTextureBin).mphTex) :
+                parseTEX0Texture(modelFile, model.mphTex);
     if (spec.paletteFilename !== undefined) {
         const paletteFile = assertExists(cache.getFileData(`models/${spec.paletteFilename}`));
         const paletteTexture = parseTEX0Texture(paletteFile, parseMPH_Model(paletteFile).mphTex);
@@ -843,9 +860,14 @@ function createEntityModelRenderer(device: GfxDevice, cache: MPHEntityResourceCa
 }
 
 const scratchPosition = vec3.create();
+const scratchItemPosition = vec3.create();
+const scratchItemParentPosition = vec3.create();
+const scratchItemLocalOffset = vec3.create();
 const scratchDirection = vec3.create();
 const scratchUp = vec3.create();
 const scratchRotation = quat.create();
+const scratchItemParentRotation = quat.create();
+const scratchItemRotationDelta = quat.create();
 const scratchScale = vec3.create();
 
 function calcOrientedModelMatrix(dst: mat4, position: ReadonlyVec3, facing: ReadonlyVec3, up: ReadonlyVec3, modelScale: number): void {
@@ -1167,17 +1189,46 @@ function calcForceFieldModelMatrix(dst: mat4, forceField: MPHForceFieldEntity, m
     mat4.scale(dst, dst, [modelScale * forceField.width, modelScale * forceField.height, modelScale]);
 }
 
-function calcItemSpawnModelMatrix(dst: mat4, item: MPHItemSpawnEntity, phaseAngle: number, timeInMilliseconds: number, modelScale: number): void {
-    const baseY = item.position[1] + 2662 / 0x1000;
+function calcItemSpawnPosition(dst: vec3, item: MPHItemSpawnEntity, parentPlatform: MPHPlatformEntity | null,
+    timeInMilliseconds: number): void {
+    vec3.copy(dst, item.position);
+    if (parentPlatform === null || parentPlatform.positions.length === 0)
+        return;
+
+    // InitializeEntityParentRelativePosition @ 0x02048698 and
+    // UpdateEntityPositionFromParentTransform @ 0x02048700 preserve the
+    // authored world-space offset while carrying a child by its parent's
+    // transform. Unit3_C2 item 9 is the one shipped parented ItemSpawn.
+    samplePlatformPath(scratchItemParentPosition, scratchItemParentRotation, parentPlatform, timeInMilliseconds);
+    vec3.sub(scratchItemLocalOffset, item.position, parentPlatform.positions[0]);
+    quat.invert(scratchItemRotationDelta, parentPlatform.rotations[0]);
+    quat.mul(scratchItemRotationDelta, scratchItemParentRotation, scratchItemRotationDelta);
+    vec3.transformQuat(scratchItemLocalOffset, scratchItemLocalOffset, scratchItemRotationDelta);
+    vec3.add(dst, scratchItemParentPosition, scratchItemLocalOffset);
+}
+
+function calcItemSpawnModelMatrix(dst: mat4, item: MPHItemSpawnEntity, parentPlatform: MPHPlatformEntity | null,
+    phaseAngle: number, timeInMilliseconds: number, modelScale: number): void {
+    calcItemSpawnPosition(scratchItemPosition, item, parentPlatform, timeInMilliseconds);
+    // Item instances spawn 2662 FX32 units above their entity position.
+    const baseY = scratchItemPosition[1] + 2662 / 0x1000;
     // UpdateItemInstance advances rotation by 0x300 angle units per tick and
     // uses the same phase for a 0x200-FX32 vertical bob.
     const ticks = timeInMilliseconds * 30 / 1000;
     const angle = fxAngle(phaseAngle + ticks * 0x300);
     const bob = Math.sin(angle) * (0x200 / 0x1000);
     mat4.fromYRotation(dst, angle);
-    dst[12] = item.position[0];
-    dst[13] = baseY + bob;
-    dst[14] = item.position[2];
+    dst[12] = scratchItemPosition[0];
+    dst[13] = (baseY + bob);
+    dst[14] = scratchItemPosition[2];
+    vec3.set(scratchScale, modelScale, modelScale, modelScale);
+    mat4.scale(dst, dst, scratchScale);
+}
+
+function calcItemSpawnBaseModelMatrix(dst: mat4, item: MPHItemSpawnEntity, parentPlatform: MPHPlatformEntity | null,
+    timeInMilliseconds: number, modelScale: number): void {
+    calcItemSpawnPosition(scratchItemPosition, item, parentPlatform, timeInMilliseconds);
+    mat4.fromTranslation(dst, scratchItemPosition);
     vec3.set(scratchScale, modelScale, modelScale, modelScale);
     mat4.scale(dst, dst, scratchScale);
 }
@@ -1225,6 +1276,8 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getDoorModelSpec(this.metadata, door));
         for (const item of this.entities.itemSpawns)
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
+        if (this.entities.itemSpawns.some((item) => item.showBase))
+            this.cache.fetchMPHARC('archives/common.arc');
         for (const enemy of this.entities.enemySpawns)
             for (const spec of getEnemyModelSpecs(enemy))
                 requestEntityModel(this.cache, spec);
@@ -1336,11 +1389,30 @@ export class MPHEntityFile {
         for (let index = 0; index < this.entities.itemSpawns.length; index++) {
             const item = this.entities.itemSpawns[index];
             const phaseAngle = index * ITEM_SPAWN_PREVIEW_PHASE_STEP;
-            const renderer = createEntityModelRenderer(device, this.cache, renderCache, getItemModelSpec(this.metadata, item), {
+            const parentPlatform = this.entities.platforms.find((platform) => platform.entityId === item.parentEntityId) ?? null;
+            let itemStartTime: number | null = null;
+            const getItemTime = (time: number): number => {
+                if (itemStartTime === null)
+                    itemStartTime = time;
+                return time - itemStartTime;
+            };
+            const itemRenderer = createEntityModelRenderer(device, this.cache, renderCache, getItemModelSpec(this.metadata, item), {
                 ...baseOptions,
+                // CreateItemSpawnEntity @ 0x021071F4 copies initialState from
+                // +0x30. UpdateItemSpawnEntity @ 0x02106F9C waits the +0x38
+                // timer before creating the live ItemInstance.
+                isVisibleAtTime: (time) => item.initialState !== 0 &&
+                    getItemTime(time) * 30 / 1000 >= item.initialDelayTicks,
             });
-            this.movers.push((time) => calcItemSpawnModelMatrix(renderer.modelMatrix, item, phaseAngle, time, renderer.modelScale));
-            renderers.push(renderer);
+            this.movers.push((time) => calcItemSpawnModelMatrix(
+                itemRenderer.modelMatrix, item, parentPlatform, phaseAngle, getItemTime(time), itemRenderer.modelScale));
+            renderers.push(itemRenderer);
+            if (item.showBase) {
+                const baseRenderer = createEntityModelRenderer(device, this.cache, renderCache, itemSpawnBaseModelSpec, baseOptions);
+                this.movers.push((time) => calcItemSpawnBaseModelMatrix(
+                    baseRenderer.modelMatrix, item, parentPlatform, getItemTime(time), baseRenderer.modelScale));
+                renderers.push(baseRenderer);
+            }
         }
         for (const enemy of this.entities.enemySpawns) {
             const simulation: MPHEnemySimulation | null =
