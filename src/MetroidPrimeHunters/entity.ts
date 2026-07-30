@@ -14,10 +14,12 @@ const ENTITY_TYPE_PLATFORM = 0;
 const ENTITY_TYPE_OBJECT = 1;
 const ENTITY_TYPE_DOOR = 3;
 const ENTITY_TYPE_ITEM_SPAWN = 4;
+const ENTITY_TYPE_TELEPORTER = 14;
 const PLATFORM_DATA_SIZE = 0x24C;
 const OBJECT_DATA_SIZE = 0x98;
 const DOOR_DATA_SIZE = 0x68;
 const ITEM_SPAWN_DATA_SIZE = 0x48;
+const TELEPORTER_DATA_SIZE = 0x5C;
 
 interface MPHEntityEntry {
     nodeName: string;
@@ -69,11 +71,19 @@ interface MPHItemSpawnEntity extends MPHEntityEntry {
     initialState: number;
 }
 
+interface MPHTeleporterEntity extends MPHEntityEntry {
+    position: vec3;
+    up: vec3;
+    facing: vec3;
+    invisible: boolean;
+}
+
 export interface MPHEntities {
     platforms: MPHPlatformEntity[];
     objects: MPHObjectEntity[];
     doors: MPHDoorEntity[];
     itemSpawns: MPHItemSpawnEntity[];
+    teleporters: MPHTeleporterEntity[];
 }
 
 interface MPHEntityModelSpec {
@@ -174,6 +184,18 @@ function parseItemSpawn(entry: MPHEntityEntry, view: DataView): MPHItemSpawnEnti
     };
 }
 
+function parseTeleporter(entry: MPHEntityEntry, view: DataView): MPHTeleporterEntity {
+    assert(entry.dataLength === TELEPORTER_DATA_SIZE);
+    const offs = entry.dataOffset;
+    return {
+        ...entry,
+        position: readVec3Fx(view, offs + 0x04),
+        up: readVec3Fx(view, offs + 0x10),
+        facing: readVec3Fx(view, offs + 0x1C),
+        invisible: view.getUint8(offs + 0x2C) !== 0,
+    };
+}
+
 export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPHEntities {
     const view = buffer.createDataView();
     assert(view.getUint32(0x00, true) === 2);
@@ -183,6 +205,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     const objects: MPHObjectEntity[] = [];
     const doors: MPHDoorEntity[] = [];
     const itemSpawns: MPHItemSpawnEntity[] = [];
+    const teleporters: MPHTeleporterEntity[] = [];
     let entryCount = 0;
     for (let offs = ENTITY_HEADER_SIZE; offs + ENTITY_ENTRY_SIZE <= view.byteLength; offs += ENTITY_ENTRY_SIZE) {
         const dataOffset = view.getUint32(offs + 0x14, true);
@@ -212,10 +235,12 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
             doors.push(parseDoor(entry, view));
         else if (entry.type === ENTITY_TYPE_ITEM_SPAWN)
             itemSpawns.push(parseItemSpawn(entry, view));
+        else if (entry.type === ENTITY_TYPE_TELEPORTER)
+            teleporters.push(parseTeleporter(entry, view));
     }
 
     assert(entryCount === view.getUint16(0x04 + layerId * 2, true));
-    return { platforms, objects, doors, itemSpawns };
+    return { platforms, objects, doors, itemSpawns, teleporters };
 }
 
 export interface MPHObjectMetadata {
@@ -289,6 +314,16 @@ function getItemModelSpec(metadata: MPHEntityMetadata, item: MPHItemSpawnEntity)
         modelFilename: `${item_.modelName}_Model.bin`,
         animationFilename: item_.animated ? `${item_.modelName}_Anim.bin` : undefined,
         animationId: item_.animated ? 0 : undefined,
+    };
+}
+
+function getTeleporterModelSpec(sceneMode: MPHSceneMode): MPHEntityModelSpec {
+    const name = sceneMode.kind === 'multiplayer' ? 'TeleporterMP' : 'Teleporter_mdl';
+    return {
+        modelFilename: `${name}_Model.bin`,
+        animationFilename: `${name}_Anim.bin`,
+        sharedTextureFilename: sceneMode.kind === 'multiplayer' ? undefined : 'TeleporterTextureShare_img_Model.bin',
+        animationId: 1,
     };
 }
 
@@ -495,6 +530,10 @@ function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInM
 // Stagger spawning to avoid synchronized bobs.
 const ITEM_SPAWN_PREVIEW_PHASE_STEP = 0x2000;
 
+function calcTeleporterModelMatrix(dst: mat4, teleporter: MPHTeleporterEntity, modelScale: number): void {
+    calcOrientedModelMatrix(dst, teleporter.position, teleporter.facing, teleporter.up, modelScale);
+}
+
 function calcItemSpawnModelMatrix(dst: mat4, item: MPHItemSpawnEntity, phaseAngle: number, timeInMilliseconds: number, modelScale: number): void {
     const baseY = item.position[1] + 2662 / 0x1000;
     // UpdateItemInstance advances rotation by 0x300 angle units per tick and
@@ -514,6 +553,11 @@ function calcItemSpawnModelMatrix(dst: mat4, item: MPHItemSpawnEntity, phaseAngl
 // doors across a connector without enabling visibility through.
 const DOOR_OPEN_HOLD_DURATION = 2000;
 const DOOR_HALF_CYCLE_DURATION = 6050;
+
+function getAnimationLoopDuration(animation: MPHAnimation | null): number {
+    const frameCount = animation?.node?.frameCount ?? animation?.texCoord?.frameCount ?? 1;
+    return Math.max(1, frameCount - 1) * 1000 / 30;
+}
 
 export class MPHEntityFile {
     private movers: ((timeInMilliseconds: number) => void)[] = [];
@@ -536,6 +580,8 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getDoorModelSpec(this.metadata, door));
         for (const item of this.entities.itemSpawns)
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
+        if (this.entities.teleporters.some((teleporter) => !teleporter.invisible))
+            requestEntityModel(this.cache, getTeleporterModelSpec(this.sceneMode));
     }
 
     public createRenderers(device: GfxDevice, renderCache: GfxRenderCache, lighting: MPHLighting): MPHRenderer[] {
@@ -599,6 +645,20 @@ export class MPHEntityFile {
                 lighting,
             });
             this.movers.push((time) => calcItemSpawnModelMatrix(renderer.modelMatrix, item, phaseAngle, time, renderer.modelScale));
+            renderers.push(renderer);
+        }
+        for (const teleporter of this.entities.teleporters) {
+            if (teleporter.invisible)
+                continue;
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, getTeleporterModelSpec(this.sceneMode), (animation) => {
+                const duration = getAnimationLoopDuration(animation);
+                return {
+                    sceneMode: this.sceneMode,
+                    lighting,
+                    mapAnimationTime: (time) => time % duration,
+                };
+            });
+            calcTeleporterModelMatrix(renderer.modelMatrix, teleporter, renderer.modelScale);
             renderers.push(renderer);
         }
         return renderers;
