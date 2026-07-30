@@ -14,12 +14,14 @@ const ENTITY_TYPE_PLATFORM = 0;
 const ENTITY_TYPE_OBJECT = 1;
 const ENTITY_TYPE_DOOR = 3;
 const ENTITY_TYPE_ITEM_SPAWN = 4;
+const ENTITY_TYPE_JUMP_PAD = 9;
 const ENTITY_TYPE_TELEPORTER = 14;
 const ENTITY_TYPE_FORCE_FIELD = 19;
 const PLATFORM_DATA_SIZE = 0x24C;
 const OBJECT_DATA_SIZE = 0x98;
 const DOOR_DATA_SIZE = 0x68;
 const ITEM_SPAWN_DATA_SIZE = 0x48;
+const JUMP_PAD_DATA_SIZE = 0x94;
 const TELEPORTER_DATA_SIZE = 0x5C;
 const FORCE_FIELD_DATA_SIZE = 0x35;
 
@@ -73,6 +75,16 @@ interface MPHItemSpawnEntity extends MPHEntityEntry {
     initialState: number;
 }
 
+interface MPHJumpPadEntity extends MPHEntityEntry {
+    position: vec3;
+    up: vec3;
+    facing: vec3;
+    launchDirection: vec3;
+    active: boolean;
+    modelId: number;
+    beamModelId: number;
+}
+
 interface MPHTeleporterEntity extends MPHEntityEntry {
     position: vec3;
     up: vec3;
@@ -95,6 +107,7 @@ export interface MPHEntities {
     objects: MPHObjectEntity[];
     doors: MPHDoorEntity[];
     itemSpawns: MPHItemSpawnEntity[];
+    jumpPads: MPHJumpPadEntity[];
     teleporters: MPHTeleporterEntity[];
     forceFields: MPHForceFieldEntity[];
 }
@@ -197,6 +210,21 @@ function parseItemSpawn(entry: MPHEntityEntry, view: DataView): MPHItemSpawnEnti
     };
 }
 
+function parseJumpPad(entry: MPHEntityEntry, view: DataView): MPHJumpPadEntity {
+    assert(entry.dataLength === JUMP_PAD_DATA_SIZE);
+    const offs = entry.dataOffset;
+    return {
+        ...entry,
+        position: readVec3Fx(view, offs + 0x04),
+        up: readVec3Fx(view, offs + 0x10),
+        facing: readVec3Fx(view, offs + 0x1C),
+        launchDirection: readVec3Fx(view, offs + 0x70),
+        active: view.getUint8(offs + 0x84) !== 0,
+        modelId: view.getUint32(offs + 0x88, true),
+        beamModelId: view.getUint32(offs + 0x8C, true),
+    };
+}
+
 function parseTeleporter(entry: MPHEntityEntry, view: DataView): MPHTeleporterEntity {
     assert(entry.dataLength === TELEPORTER_DATA_SIZE);
     const offs = entry.dataOffset;
@@ -233,6 +261,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     const objects: MPHObjectEntity[] = [];
     const doors: MPHDoorEntity[] = [];
     const itemSpawns: MPHItemSpawnEntity[] = [];
+    const jumpPads: MPHJumpPadEntity[] = [];
     const teleporters: MPHTeleporterEntity[] = [];
     const forceFields: MPHForceFieldEntity[] = [];
     let entryCount = 0;
@@ -264,6 +293,8 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
             doors.push(parseDoor(entry, view));
         else if (entry.type === ENTITY_TYPE_ITEM_SPAWN)
             itemSpawns.push(parseItemSpawn(entry, view));
+        else if (entry.type === ENTITY_TYPE_JUMP_PAD)
+            jumpPads.push(parseJumpPad(entry, view));
         else if (entry.type === ENTITY_TYPE_TELEPORTER)
             teleporters.push(parseTeleporter(entry, view));
         else if (entry.type === ENTITY_TYPE_FORCE_FIELD)
@@ -271,7 +302,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     }
 
     assert(entryCount === view.getUint16(0x04 + layerId * 2, true));
-    return { platforms, objects, doors, itemSpawns, teleporters, forceFields };
+    return { platforms, objects, doors, itemSpawns, jumpPads, teleporters, forceFields };
 }
 
 export interface MPHObjectMetadata {
@@ -345,6 +376,25 @@ function getItemModelSpec(metadata: MPHEntityMetadata, item: MPHItemSpawnEntity)
         modelFilename: `${item_.modelName}_Model.bin`,
         animationFilename: item_.animated ? `${item_.modelName}_Anim.bin` : undefined,
         animationId: item_.animated ? 0 : undefined,
+    };
+}
+
+const jumpPadModelNames = [
+    'JumpPad', 'JumpPad_Alimbic', 'JumpPad_Ice', 'JumpPad_IceStation',
+    'JumpPad_Lava', 'JumpPad_Station',
+] as const;
+
+function getJumpPadModelSpec(jumpPad: MPHJumpPadEntity): MPHEntityModelSpec {
+    const name = assertExists(jumpPadModelNames[jumpPad.modelId], `jump pad model ${jumpPad.modelId}`);
+    return { modelFilename: `${name}_Model.bin` };
+}
+
+function getJumpPadBeamModelSpec(jumpPad: MPHJumpPadEntity): MPHEntityModelSpec {
+    assert(jumpPad.beamModelId === 0);
+    return {
+        modelFilename: 'JumpPad_Beam_Model.bin',
+        animationFilename: 'JumpPad_Beam_Anim.bin',
+        animationId: 0,
     };
 }
 
@@ -578,6 +628,21 @@ function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInM
 // Stagger spawning to avoid synchronized bobs.
 const ITEM_SPAWN_PREVIEW_PHASE_STEP = 0x2000;
 
+function calcJumpPadModelMatrix(dst: mat4, jumpPad: MPHJumpPadEntity, modelScale: number): void {
+    calcOrientedModelMatrix(dst, jumpPad.position, jumpPad.facing, jumpPad.up, modelScale);
+}
+
+function calcJumpPadBeamModelMatrix(dst: mat4, jumpPad: MPHJumpPadEntity, modelScale: number): void {
+    // CalculateJumpPadBeamTransform @ 0x0210CA1C rotates the launch direction
+    // through the pad basis and starts the beam one game unit above the pad.
+    const basis = mat4.create();
+    calcOrientedModelMatrix(basis, vec3.create(), jumpPad.facing, jumpPad.up, 1);
+    const direction = vec3.transformMat4(vec3.create(), jumpPad.launchDirection, basis);
+    vec3.normalize(direction, direction);
+    const position = vec3.scaleAndAdd(vec3.create(), jumpPad.position, jumpPad.up, 1);
+    calcOrientedModelMatrix(dst, position, direction, jumpPad.facing, modelScale);
+}
+
 function calcTeleporterModelMatrix(dst: mat4, teleporter: MPHTeleporterEntity, modelScale: number): void {
     calcOrientedModelMatrix(dst, teleporter.position, teleporter.facing, teleporter.up, modelScale);
 }
@@ -634,6 +699,11 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getDoorModelSpec(this.metadata, door));
         for (const item of this.entities.itemSpawns)
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
+        for (const jumpPad of this.entities.jumpPads) {
+            requestEntityModel(this.cache, getJumpPadModelSpec(jumpPad));
+            if (jumpPad.active)
+                requestEntityModel(this.cache, getJumpPadBeamModelSpec(jumpPad));
+        }
         if (this.entities.teleporters.some((teleporter) => !teleporter.invisible))
             requestEntityModel(this.cache, getTeleporterModelSpec(this.sceneMode));
         if (this.entities.forceFields.some((forceField) => forceField.active))
@@ -702,6 +772,22 @@ export class MPHEntityFile {
             });
             this.movers.push((time) => calcItemSpawnModelMatrix(renderer.modelMatrix, item, phaseAngle, time, renderer.modelScale));
             renderers.push(renderer);
+        }
+        for (const jumpPad of this.entities.jumpPads) {
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, getJumpPadModelSpec(jumpPad), {
+                sceneMode: this.sceneMode,
+                lighting,
+            });
+            calcJumpPadModelMatrix(renderer.modelMatrix, jumpPad, renderer.modelScale);
+            renderers.push(renderer);
+            if (!jumpPad.active)
+                continue;
+            const beamRenderer = createEntityModelRenderer(device, this.cache, renderCache, getJumpPadBeamModelSpec(jumpPad), {
+                sceneMode: this.sceneMode,
+                lighting,
+            });
+            calcJumpPadBeamModelMatrix(beamRenderer.modelMatrix, jumpPad, beamRenderer.modelScale);
+            renderers.push(beamRenderer);
         }
         for (const teleporter of this.entities.teleporters) {
             if (teleporter.invisible)
