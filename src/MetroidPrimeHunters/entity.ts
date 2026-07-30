@@ -933,9 +933,19 @@ function samplePlatformPath(dstPosition: vec3, dstRotation: quat, platform: MPHP
     }
 
     const frameTime = timeInMilliseconds * 30 / 1000;
+    // CreatePlatformEntity @ 0x0216DB48 leaves authored inactive platforms in
+    // movement state 0 until ActivatePlatformMovement @ 0x0216EF40 is called.
+    // The passive viewer supplies that absent gameplay message after a
+    // deterministic per-entity dwell.
+    const inactiveActivationDelayFrames = platform.active ? 0 :
+        4 * 30 + (platform.entityId * 17 % 31) * 0.2 * 30;
+    const activeFrameTime = frameTime - inactiveActivationDelayFrames;
+    if (activeFrameTime < 0) {
+        setPlatformKey(dstPosition, dstRotation, platform, 0);
+        return;
+    }
     let frame = path.looping ?
-        (frameTime + path.phaseOffsetFrames) % path.cycleFrames :
-        platform.active ? frameTime : 0;
+        (activeFrameTime + path.phaseOffsetFrames) % path.cycleFrames : activeFrameTime;
 
     for (let i = 0; i < path.steps.length; i++) {
         const step = path.steps[i];
