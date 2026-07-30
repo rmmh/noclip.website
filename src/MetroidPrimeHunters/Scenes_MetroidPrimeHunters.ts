@@ -171,6 +171,16 @@ export class MPHSceneRenderer implements Viewer.SceneGfx {
     }
 }
 
+const standaloneEntityFiles = new Map<string, string>([
+    ['mp_fh_data/levels/models/blueRoom_Model', 'regulator_Ent.bin'],
+    ['mp_fh_data/levels/models/e3Level_Model', 'morphBall_Ent.bin'],
+    ['mp_fh_data/levels/models/mp1_Model', 'mp1_Ent.bin'],
+    ['mp_fh_data/levels/models/mp2_Model', 'survivor_Ent.bin'],
+    ['mp_fh_data/levels/models/mp3_Model', 'mp3_Ent.bin'],
+    ['mp_fh_data/levels/models/mp5_Model', 'mp5_Ent.bin'],
+    ['mp_fh_data/levels/models/testLevel_Model', 'testlevel_Ent.bin'],
+]);
+
 class SceneDesc implements Viewer.SceneDesc {
     constructor(public id: string, public name: string, public sceneMode: MPHSceneMode = { kind: 'singlePlayer', geometrySet: 1 }) {
     }
@@ -188,6 +198,7 @@ class SceneDesc implements Viewer.SceneDesc {
         const archiveName = modelArchives[modelFilename] ?? null;
         const textureFilename = archiveName !== null ? archiveTextures[archiveName] ?? null : null;
         const animationFilename = area?.animationFilename ?? `${modelId.replace(/_model$/, '_anim')}.bin`;
+        const entityFilename = area?.entityFilename ?? standaloneEntityFiles.get(this.id) ?? null;
 
         if (archiveName !== null) {
             modelCache.fetchMPHARC(`archives/${archiveName}.arc`);
@@ -196,14 +207,14 @@ class SceneDesc implements Viewer.SceneDesc {
         } else {
             modelCache.fetchMPFile(modelFilename);
         }
-        if (area !== null)
-            modelCache.fetchMPFile(`levels/entities/${area.entityFilename}`);
+        if (entityFilename !== null)
+            modelCache.fetchMPFile(`levels/entities/${entityFilename}`);
         await modelCache.waitForLoad();
 
         const bin_Model = modelCache.getFileData(modelFilename);
         const stageBin = parseMPH_Model(assertExists(bin_Model));
         const entityLayerId = sceneMode.kind === 'multiplayer' && sceneMode.captureTheFlag === true ? 12 : 0;
-        const entityFile = area !== null ? assertExists(modelCache.getFileData(`levels/entities/${area.entityFilename}`)) : null;
+        const entityFile = entityFilename !== null ? assertExists(modelCache.getFileData(`levels/entities/${entityFilename}`)) : null;
         const entities = entityFile !== null ? new MPHEntityFile(parseMPHEntities(entityFile, entityLayerId), entityMetadata, modelCache, sceneMode) : null;
         if (entities !== null) {
             entities.requestResources();
@@ -211,7 +222,7 @@ class SceneDesc implements Viewer.SceneDesc {
         }
 
         const renderer = new MPHSceneRenderer(device);
-        const lighting: MPHLighting | null = area !== null ? {
+        const lighting: MPHLighting = area !== null ? {
             colors: [
                 [area.lightColor0[0] / 31, area.lightColor0[1] / 31, area.lightColor0[2] / 31],
                 [area.lightColor1[0] / 31, area.lightColor1[1] / 31, area.lightColor1[2] / 31],
@@ -220,7 +231,13 @@ class SceneDesc implements Viewer.SceneDesc {
                 [-area.lightVector0[0] / 0x1000, -area.lightVector0[1] / 0x1000, -area.lightVector0[2] / 0x1000],
                 [-area.lightVector1[0] / 0x1000, -area.lightVector1[1] / 0x1000, -area.lightVector1[2] / 0x1000],
             ],
-        } : null;
+        } : {
+            colors: [[1, 1, 1], [1, 1, 1]],
+            directions: [
+                [-0.099853515625, 1, 0],
+                [0, -0.999755859375, 0.099853515625],
+            ],
+        };
         const fog: MPHFogConfig | null = area !== null && area.fog.enabled ? {
             color: colorNewFromRGBA(
                 (area.fog.color & 0x1F) / 31,
@@ -248,7 +265,7 @@ class SceneDesc implements Viewer.SceneDesc {
             collision,
         });
         if (entities !== null) {
-            renderer.objectRenderers.push(...entities.createRenderers(device, renderer.getCache(), assertExists(lighting), fog));
+            renderer.objectRenderers.push(...entities.createRenderers(device, renderer.getCache(), lighting, fog));
             renderer.entities = entities;
         }
 
