@@ -892,6 +892,7 @@ function wrapParticleEmitterAge(age: number, emitter: MPHParticleEmitter): numbe
 
 function createArtifactKeyEffectRenderers(device: GfxDevice, cache: MPHEntityResourceCache, renderCache: GfxRenderCache,
     item: MPHItemSpawnEntity, parentPlatform: MPHPlatformEntity | null, getItemTime: (time: number) => number,
+    isItemVisible: NonNullable<MPHRendererOptions['isVisibleAtTime']>,
     baseOptions: MPHRendererOptions, movers: ((timeInMilliseconds: number) => void)[]): MPHRenderer[] {
     const modelFile = assertExists(cache.getFileData('particles_Model.bin'));
     const textureFile = assertExists(cache.getFileData('models/particles_Tex.bin'));
@@ -935,7 +936,8 @@ function createArtifactKeyEffectRenderers(device: GfxDevice, cache: MPHEntityRes
                 // type-4 quad from the full camera basis.
                 forceBillboard: 'camera',
                 forceTwoSided: true,
-                isVisibleAtTime: (time) => item.initialState !== 0 && sampleParticle(time) !== null,
+                isVisibleAtTime: (time, viewerInput) =>
+                    isItemVisible(time, viewerInput) && sampleParticle(time) !== null,
                 modifyMaterialColor: (dst, _materialName, time) => {
                     const sample = sampleParticle(time);
                     if (sample === null) {
@@ -1444,10 +1446,25 @@ interface MPHEnemyActivationPlan {
 
 const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
 
-function buildEnemyActivationPlans(entities: MPHEntities): Map<number, MPHEnemyActivationPlan[]> {
+interface MPHEntityActivationPlans {
+    enemies: Map<number, MPHEnemyActivationPlan[]>;
+    items: Map<number, MPHEnemyActivationPlan[]>;
+}
+
+function addEntityActivationPlan(plansByEntityId: Map<number, MPHEnemyActivationPlan[]>,
+        entityId: number, rootVolume: MPHTriggerVolumeEntity | null, waveDepth: number): void {
+    let plans = plansByEntityId.get(entityId);
+    if (plans === undefined)
+        plansByEntityId.set(entityId, plans = []);
+    if (!plans.some((plan) => plan.rootVolume === rootVolume && plan.waveDepth === waveDepth))
+        plans.push({ rootVolume, waveDepth });
+}
+
+function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationPlans {
     const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
     const enemyById = new Map(entities.enemySpawns.map((enemy) => [enemy.entityId, enemy]));
-    const result = new Map<number, MPHEnemyActivationPlan[]>();
+    const itemById = new Map(entities.itemSpawns.map((item) => [item.entityId, item]));
+    const result: MPHEntityActivationPlans = { enemies: new Map(), items: new Map() };
 
     interface MessageEvent {
         targetId: number;
@@ -1486,12 +1503,15 @@ function buildEnemyActivationPlans(entities: MPHEntities): Map<number, MPHEnemyA
             const event = events[eventIndex];
             const enemy = enemyById.get(event.targetId);
             if (enemy !== undefined && isEnemySpawnActivationMessage(event.message, event.messageParam)) {
-                let plans = result.get(enemy.entityId);
-                if (plans === undefined)
-                    result.set(enemy.entityId, plans = []);
-                if (!plans.some((plan) => plan.rootVolume === rootVolume && plan.waveDepth === event.waveDepth))
-                    plans.push({ rootVolume, waveDepth: event.waveDepth });
+                addEntityActivationPlan(result.enemies, enemy.entityId, rootVolume, event.waveDepth);
                 enqueueCompletion(enemy, event.waveDepth);
+                continue;
+            }
+            const item = itemById.get(event.targetId);
+            // HandleItemSpawnMessage @ 0x02106C00 uses the same activation
+            // messages as the EnemySpawn controller.
+            if (item !== undefined && isEnemySpawnActivationMessage(event.message, event.messageParam)) {
+                addEntityActivationPlan(result.items, item.entityId, rootVolume, event.waveDepth);
                 continue;
             }
 
@@ -1557,6 +1577,27 @@ function buildEnemyActivationPlans(entities: MPHEntities): Map<number, MPHEnemyA
     return result;
 }
 
+function getPlannedActivationTime(plans: readonly MPHEnemyActivationPlan[], time: number,
+        sceneStartTime: number, cameraRoomPosition: vec3, rootActivationTimes: Map<number, number>): number | null {
+    let earliestActivationTime: number | null = null;
+    for (const plan of plans) {
+        let rootActivationTime = sceneStartTime;
+        if (plan.rootVolume !== null) {
+            rootActivationTime = rootActivationTimes.get(plan.rootVolume.entityId) ?? -1;
+            if (rootActivationTime < 0 && pointInsideVolume(plan.rootVolume.volume, cameraRoomPosition)) {
+                rootActivationTime = time;
+                rootActivationTimes.set(plan.rootVolume.entityId, time);
+            }
+        }
+        if (rootActivationTime < 0)
+            continue;
+        const activationTime = rootActivationTime + plan.waveDepth * ENEMY_PREVIEW_WAVE_DWELL_MS;
+        if (time >= activationTime && (earliestActivationTime === null || activationTime < earliestActivationTime))
+            earliestActivationTime = activationTime;
+    }
+    return earliestActivationTime;
+}
+
 export class MPHEntityFile {
     private movers: ((timeInMilliseconds: number) => void)[] = [];
 
@@ -1592,7 +1633,7 @@ export class MPHEntityFile {
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
         if (this.entities.itemSpawns.some((item) => item.showBase))
             this.cache.fetchMPHARC('archives/common.arc');
-        if (this.entities.itemSpawns.some((item) => item.itemId === 19 && item.initialState !== 0)) {
+        if (this.entities.itemSpawns.some((item) => item.itemId === 19)) {
             this.cache.fetchMPHARC('archives/effectsBase.arc');
             this.cache.fetchMPFile('models/particles_Tex.bin');
             this.cache.fetchMPFile('effects/artifactKeyEffect_PS.bin');
@@ -1639,7 +1680,7 @@ export class MPHEntityFile {
         const normalizedEntityFilename = normalizeEntityFilename(this.entityFilename);
         const inverseSceneTransform = sceneTransform !== undefined ?
             mat4.invert(mat4.create(), sceneTransform) : null;
-        const enemyActivationPlans = buildEnemyActivationPlans(this.entities);
+        const entityActivationPlans = buildEntityActivationPlans(this.entities);
         for (const platform of this.entities.platforms) {
             const spec = getPlatformModelSpec(this.metadata, platform);
             if (spec === null)
@@ -1715,26 +1756,45 @@ export class MPHEntityFile {
             const item = this.entities.itemSpawns[index];
             const phaseAngle = index * ITEM_SPAWN_PREVIEW_PHASE_STEP;
             const parentPlatform = this.entities.platforms.find((platform) => platform.entityId === item.parentEntityId) ?? null;
-            let itemStartTime: number | null = null;
+            const activationPlans = entityActivationPlans.items.get(item.entityId) ?? [];
+            const rootActivationTimes = new Map<number, number>();
+            const cameraRoomPosition = vec3.create();
+            let sceneStartTime: number | null = null;
+            let itemActivationTime: number | null = null;
             const getItemTime = (time: number): number => {
-                if (itemStartTime === null)
-                    itemStartTime = time;
-                return time - itemStartTime;
+                if (sceneStartTime === null)
+                    sceneStartTime = time;
+                return time - (itemActivationTime ?? sceneStartTime);
+            };
+            // CreateItemSpawnEntity @ 0x021071F4 copies initialState from
+            // +0x30. UpdateItemSpawnEntity @ 0x02106F9C waits the +0x38
+            // timer before creating the live ItemInstance.
+            const isItemVisible: NonNullable<MPHRendererOptions['isVisibleAtTime']> = (time, viewerInput) => {
+                if (sceneStartTime === null)
+                    sceneStartTime = time;
+                if (itemActivationTime === null && item.initialState !== 0)
+                    itemActivationTime = sceneStartTime;
+                if (itemActivationTime === null) {
+                    const cameraMatrix = viewerInput.camera.worldMatrix;
+                    vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                    if (inverseSceneTransform !== null)
+                        vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+                    itemActivationTime = getPlannedActivationTime(
+                        activationPlans, time, sceneStartTime, cameraRoomPosition, rootActivationTimes);
+                }
+                return itemActivationTime !== null &&
+                    (time - itemActivationTime) * 30 / 1000 >= item.initialDelayTicks;
             };
             const itemRenderer = createEntityModelRenderer(device, this.cache, renderCache, getItemModelSpec(this.metadata, item), {
                 ...baseOptions,
-                // CreateItemSpawnEntity @ 0x021071F4 copies initialState from
-                // +0x30. UpdateItemSpawnEntity @ 0x02106F9C waits the +0x38
-                // timer before creating the live ItemInstance.
-                isVisibleAtTime: (time) => item.initialState !== 0 &&
-                    getItemTime(time) * 30 / 1000 >= item.initialDelayTicks,
+                isVisibleAtTime: isItemVisible,
             });
             this.movers.push((time) => calcItemSpawnModelMatrix(
                 itemRenderer.modelMatrix, item, parentPlatform, phaseAngle, getItemTime(time), itemRenderer.modelScale));
             renderers.push(itemRenderer);
-            if (item.itemId === 19 && item.initialState !== 0)
+            if (item.itemId === 19)
                 renderers.push(...createArtifactKeyEffectRenderers(device, this.cache, renderCache,
-                    item, parentPlatform, getItemTime, baseOptions, this.movers));
+                    item, parentPlatform, getItemTime, isItemVisible, baseOptions, this.movers));
             if (item.showBase) {
                 const baseRenderer = createEntityModelRenderer(device, this.cache, renderCache, itemSpawnBaseModelSpec, baseOptions);
                 this.movers.push((time) => calcItemSpawnBaseModelMatrix(
@@ -1756,7 +1816,7 @@ export class MPHEntityFile {
             let controllerActive = enemy.initialState !== 0;
             let enemySpawnTime: number | null = null;
             let enemyTriggered = false;
-            const activationPlans = enemyActivationPlans.get(enemy.entityId) ?? [];
+            const activationPlans = entityActivationPlans.enemies.get(enemy.entityId) ?? [];
             const rootActivationTimes = new Map<number, number>();
             const cameraRoomPosition = vec3.create();
             const getControllerTime = (time: number): number => {
@@ -1811,25 +1871,12 @@ export class MPHEntityFile {
                             if (inverseSceneTransform !== null)
                                 vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
                             if (!controllerActive) {
-                                for (const plan of activationPlans) {
-                                    let rootActivationTime: number | null = controllerStartTime;
-                                    if (plan.rootVolume !== null) {
-                                        rootActivationTime = rootActivationTimes.get(plan.rootVolume.entityId) ?? null;
-                                        if (rootActivationTime === null &&
-                                            pointInsideVolume(plan.rootVolume.volume, cameraRoomPosition)) {
-                                            rootActivationTime = time;
-                                            rootActivationTimes.set(plan.rootVolume.entityId, time);
-                                        }
-                                    }
-                                    if (rootActivationTime !== null) {
-                                        const scheduledActivationTime =
-                                            rootActivationTime + plan.waveDepth * ENEMY_PREVIEW_WAVE_DWELL_MS;
-                                        if (time >= scheduledActivationTime) {
-                                            controllerActive = true;
-                                            controllerActivationTime = scheduledActivationTime;
-                                            break;
-                                        }
-                                    }
+                                const scheduledActivationTime = getPlannedActivationTime(
+                                    activationPlans, time, controllerStartTime,
+                                    cameraRoomPosition, rootActivationTimes);
+                                if (scheduledActivationTime !== null) {
+                                    controllerActive = true;
+                                    controllerActivationTime = scheduledActivationTime;
                                 }
                             }
                             if (!controllerActive)
