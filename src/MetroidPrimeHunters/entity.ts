@@ -1451,25 +1451,25 @@ export class MPHEntityFile {
                         selectNodeAnimation: enemy.enemyType === 0x03 ?
                             (time) => sampleMochtroidType03Animation(getEnemyTime(time), enemy).index :
                             enemy.enemyType === 0x00 ?
-                                (time) => sampleWarWaspAnimation(getPreviewTime(time)).index :
+                                (time) => sampleWarWaspAnimation(getPreviewTime(time), enemy.entityId).index :
                             enemy.enemyType === 0x0A ?
-                                (time) => sampleBarbedWarWaspAnimation(getPreviewTime(time)).index :
+                                (time) => sampleBarbedWarWaspAnimation(getPreviewTime(time), enemy.entityId).index :
                             enemy.enemyType === 0x04 ?
                                 (time) => sampleMochtroidType04Animation(getEnemyTime(time)).index :
                             enemy.enemyType === 0x05 ?
                                 (time) => sampleMochtroidType05Animation(getEnemyTime(time)).index :
                             enemy.enemyType === 0x0B ?
-                                (time) => sampleShriekbatAnimation(getPreviewTime(time)).index :
+                                (time) => sampleShriekbatAnimation(getPreviewTime(time), enemy.entityId).index :
                             enemy.enemyType === 0x10 ?
-                                (time) => sampleBlastcapAnimation(getPreviewTime(time)).index :
+                                (time) => sampleBlastcapAnimation(getPreviewTime(time), enemy.entityId).index :
                             enemy.enemyType === 0x0C ?
-                                (time) => sampleGeemerAnimation(getPreviewTime(time)).index :
+                                (time) => sampleGeemerAnimation(getPreviewTime(time), enemy.entityId).index :
                             enemy.enemyType === 0x13 && specIndex === 0 ?
                                 (time) => sampleCylinderBossAnimation(getPreviewTime(time)).index :
                                 enemy.enemyType === 0x17 ?
-                                    (time) => samplePsychoBitAnimation(getPreviewTime(time)).index :
+                                    (time) => samplePsychoBitAnimation(getPreviewTime(time), enemy.entityId).index :
                                     enemy.enemyType === 0x2E || enemy.enemyType === 0x2F ?
-                                        (time) => sampleSphinkTickAnimation(getPreviewTime(time)).index :
+                                        (time) => sampleSphinkTickAnimation(getPreviewTime(time), enemy.entityId).index :
                                     enemy.enemyType === 0x25 ?
                                         (time) => sampleDripStankAnimation(getPreviewTime(time)).index :
                                     enemy.enemyType === 0x24 ?
@@ -1507,13 +1507,13 @@ export class MPHEntityFile {
                                     Math.min(sample.timeInState, 19 * 1000 / 30);
                             }
                             if (enemy.enemyType === 0x00) {
-                                const sample = sampleWarWaspAnimation(getPreviewTime(time));
+                                const sample = sampleWarWaspAnimation(getPreviewTime(time), enemy.entityId);
                                 return sample.state === 3 ?
                                     sample.timeInState + 8 * 1000 / 30 :
                                     sample.timeInState;
                             }
                             if (enemy.enemyType === 0x0A) {
-                                const sample = sampleBarbedWarWaspAnimation(getPreviewTime(time));
+                                const sample = sampleBarbedWarWaspAnimation(getPreviewTime(time), enemy.entityId);
                                 return sample.state === 2 ?
                                     sample.timeInState + 8 * 1000 / 30 :
                                     sample.state === 3 ?
@@ -1533,22 +1533,22 @@ export class MPHEntityFile {
                                     sample.timeInState;
                             }
                             if (enemy.enemyType === 0x10) {
-                                const sample = sampleBlastcapAnimation(getPreviewTime(time));
+                                const sample = sampleBlastcapAnimation(getPreviewTime(time), enemy.entityId);
                                 return sample.state === 0 ? sample.timeInState :
                                     Math.min(sample.timeInState, 19 * 1000 / 30);
                             }
                             if (enemy.enemyType === 0x0C)
-                                return sampleGeemerAnimation(getPreviewTime(time)).timeInState;
+                                return sampleGeemerAnimation(getPreviewTime(time), enemy.entityId).timeInState;
                             if (enemy.enemyType === 0x13 && specIndex === 0)
                                 return sampleCylinderBossAnimation(getPreviewTime(time)).timeInState;
                             if (enemy.enemyType === 0x0B)
-                                return sampleShriekbatAnimation(getPreviewTime(time)).timeInState;
+                                return sampleShriekbatAnimation(getPreviewTime(time), enemy.entityId).timeInState;
                             if (enemy.enemyType === 0x17) {
-                                const sample = samplePsychoBitAnimation(getPreviewTime(time));
+                                const sample = samplePsychoBitAnimation(getPreviewTime(time), enemy.entityId);
                                 return sample.timeInState;
                             }
                             if (enemy.enemyType === 0x2E || enemy.enemyType === 0x2F) {
-                                const sample = sampleSphinkTickAnimation(getPreviewTime(time));
+                                const sample = sampleSphinkTickAnimation(getPreviewTime(time), enemy.entityId);
                                 return sample.timeInState;
                             }
                             if (enemy.enemyType === 0x25) {

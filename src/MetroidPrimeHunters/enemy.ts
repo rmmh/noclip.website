@@ -90,6 +90,40 @@ export function sampleEnemyPreviewStateMachine(timeInMilliseconds: number, tickR
     return { state: states[states.length - 1], timeInStateTicks: 0, cycle };
 }
 
+function hashEnemyPreviewCycle(seed: number, cycle: number): number {
+    let value = (seed ^ Math.imul(cycle + 1, 0x9E3779B1)) >>> 0;
+    value ^= value >>> 16;
+    value = Math.imul(value, 0x7FEB352D) >>> 0;
+    value ^= value >>> 15;
+    value = Math.imul(value, 0x846CA68B) >>> 0;
+    return (value ^ (value >>> 16)) >>> 0;
+}
+
+function sampleOccasionalEnemyStateMachine(timeInMilliseconds: number, tickRate: number, seed: number,
+        idleState: MPHEnemyPreviewState, minIdleTicks: number, maxIdleTicks: number,
+        activeStates: readonly MPHEnemyPreviewState[]): MPHEnemyPreviewStateSample {
+    let remainingTicks = Math.max(0, timeInMilliseconds * tickRate / 1000);
+    const activeDuration = activeStates.reduce((duration, state) => duration + state.durationTicks, 0);
+    const idleRange = Math.max(0, maxIdleTicks - minIdleTicks);
+    let cycle = 0;
+    while (true) {
+        const idleDuration = minIdleTicks + (hashEnemyPreviewCycle(seed, cycle) % (idleRange + 1));
+        const cycleDuration = idleDuration + activeDuration;
+        if (remainingTicks < cycleDuration) {
+            if (remainingTicks < idleDuration)
+                return { state: { ...idleState, durationTicks: idleDuration }, timeInStateTicks: remainingTicks, cycle };
+            remainingTicks -= idleDuration;
+            for (const state of activeStates) {
+                if (remainingTicks < state.durationTicks)
+                    return { state, timeInStateTicks: remainingTicks, cycle };
+                remainingTicks -= state.durationTicks;
+            }
+        }
+        remainingTicks -= cycleDuration;
+        cycle++;
+    }
+}
+
 function readFx32(view: DataView, offs: number): number {
     return view.getInt32(offs, true) * FX32_SCALE;
 }
@@ -518,12 +552,12 @@ export function sampleMochtroidType03Animation(timeInMilliseconds: number, enemy
     };
 }
 
-export function sampleBlastcapAnimation(timeInMilliseconds: number): { index: number, state: number, timeInState: number } {
+export function sampleBlastcapAnimation(timeInMilliseconds: number, seed = 0): { index: number, state: number, timeInState: number } {
     // The original transition into state 1 depends on player proximity. The
     // passive viewer substitutes a deterministic interval, then preserves the
     // original attack and recovery animation lengths.
-    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
-        { id: 0, durationTicks: 150, animationIndex: 0 },
+    const sample = sampleOccasionalEnemyStateMachine(timeInMilliseconds, 30, seed,
+        { id: 0, durationTicks: 0, animationIndex: 0 }, 120, 300, [
         { id: 1, durationTicks: 20, animationIndex: 1 },
         { id: 2, durationTicks: 20, animationIndex: 0 },
     ]);
@@ -534,13 +568,13 @@ export function sampleBlastcapAnimation(timeInMilliseconds: number): { index: nu
     };
 }
 
-export function sampleGeemerAnimation(timeInMilliseconds: number): { index: number, state: number, timeInState: number } {
+export function sampleGeemerAnimation(timeInMilliseconds: number, seed = 0): { index: number, state: number, timeInState: number } {
     // UpdateGeemer @ 0x02153B48 uses state 2/animation 1 when the player
     // enters its proximity radius, state 1/animation 3 while the player
     // remains nearby, and state 3/animation 0 when the player leaves. State
     // 0 then restores the ordinary crawling animation 2.
-    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
-        { id: 0, durationTicks: 240, animationIndex: 0 },
+    const sample = sampleOccasionalEnemyStateMachine(timeInMilliseconds, 30, seed,
+        { id: 0, durationTicks: 0, animationIndex: 0 }, 180, 420, [
         { id: 2, durationTicks: 6, animationIndex: 1 },
         { id: 1, durationTicks: 90, animationIndex: 2 },
         { id: 3, durationTicks: 6, animationIndex: 3 },
@@ -552,14 +586,14 @@ export function sampleGeemerAnimation(timeInMilliseconds: number): { index: numb
     };
 }
 
-export function sampleWarWaspAnimation(timeInMilliseconds: number): { index: number, state: number, timeInState: number } {
+export function sampleWarWaspAnimation(timeInMilliseconds: number, seed = 0): { index: number, state: number, timeInState: number } {
     // BeginWarWaspAttack @ 0x02160B6C binds animation 3 at frame 8 and
     // installs a 40-tick attack timer. FinishWarWaspAttackTimer @ 0x02160818
     // resumes the authored patrol target and looping animation 1. The real
     // transition depends on the player; the passive preview supplies it only
     // after a long patrol interval.
-    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
-        { id: 0, durationTicks: 240, animationIndex: 0 },
+    const sample = sampleOccasionalEnemyStateMachine(timeInMilliseconds, 30, seed,
+        { id: 0, durationTicks: 0, animationIndex: 0 }, 180, 420, [
         { id: 3, durationTicks: 40, animationIndex: 1 },
         { id: 1, durationTicks: 30, animationIndex: 0 },
     ]);
@@ -570,12 +604,12 @@ export function sampleWarWaspAnimation(timeInMilliseconds: number): { index: num
     };
 }
 
-export function sampleBarbedWarWaspAnimation(timeInMilliseconds: number): { index: number, state: number, timeInState: number } {
+export function sampleBarbedWarWaspAnimation(timeInMilliseconds: number, seed = 0): { index: number, state: number, timeInState: number } {
     // BeginBarbedWarWaspAttackWindup @ 0x021530F4 selects animation 0 at
     // frame 8. ProcessBarbedWarWaspProjectileAttack @ 0x021526A0 then
     // selects animation 2 at frame 10 before emitting the projectile.
-    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
-        { id: 0, durationTicks: 240, animationIndex: 0 },
+    const sample = sampleOccasionalEnemyStateMachine(timeInMilliseconds, 30, seed,
+        { id: 0, durationTicks: 0, animationIndex: 0 }, 210, 480, [
         { id: 2, durationTicks: 17, animationIndex: 1 },
         { id: 3, durationTicks: 20, animationIndex: 2 },
         { id: 0, durationTicks: 45, animationIndex: 0 },
@@ -620,13 +654,13 @@ export function sampleGorea1AAnimation(timeInMilliseconds: number): { index: num
     };
 }
 
-export function sampleShriekbatAnimation(timeInMilliseconds: number): { index: number, state: number, timeInState: number } {
+export function sampleShriekbatAnimation(timeInMilliseconds: number, seed = 0): { index: number, state: number, timeInState: number } {
     // State 0 normally waits indefinitely for player proximity. The passive
     // viewer periodically supplies that trigger, then follows the animation
     // order selected by the original state callbacks. The one-shot durations
     // are the authored animation lengths.
-    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
-        { id: 0, durationTicks: 240, animationIndex: 0 },
+    const sample = sampleOccasionalEnemyStateMachine(timeInMilliseconds, 30, seed,
+        { id: 0, durationTicks: 0, animationIndex: 0 }, 210, 480, [
         { id: 1, durationTicks: 41, animationIndex: 1 },
         { id: 2, durationTicks: 11, animationIndex: 2 },
         { id: 3, durationTicks: 20, animationIndex: 3 },
@@ -639,13 +673,13 @@ export function sampleShriekbatAnimation(timeInMilliseconds: number): { index: n
     };
 }
 
-export function samplePsychoBitAnimation(timeInMilliseconds: number): { index: number, state: number, timeInState: number } {
+export function samplePsychoBitAnimation(timeInMilliseconds: number, seed = 0): { index: number, state: number, timeInState: number } {
     // UpdatePsychoBitDormantState @ 0x021503B0 normally waits for a player-
     // dependent transition. The passive viewer periodically substitutes that
     // trigger, preserving the original dormant (9), tracking (2), and firing
     // (3) states and their selected animations.
-    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
-        { id: 9, durationTicks: 240, animationIndex: 0 },
+    const sample = sampleOccasionalEnemyStateMachine(timeInMilliseconds, 30, seed,
+        { id: 9, durationTicks: 0, animationIndex: 0 }, 180, 420, [
         { id: 2, durationTicks: 30, animationIndex: 0 },
         { id: 3, durationTicks: 90, animationIndex: 1 },
     ]);
@@ -656,13 +690,13 @@ export function samplePsychoBitAnimation(timeInMilliseconds: number): { index: n
     };
 }
 
-export function sampleSphinkTickAnimation(timeInMilliseconds: number): { index: number, state: number, timeInState: number } {
+export function sampleSphinkTickAnimation(timeInMilliseconds: number, seed = 0): { index: number, state: number, timeInState: number } {
     // CheckSphinkTickType2EActivationVolume @ 0x02158F60 and
     // ActivateSphinkTickType2E @ 0x021589A0 select animations 6 and 12
     // for the alert and player-directed launch states. Type 2F uses the
     // equivalent callbacks at 0x0215BA30 and 0x0215B470.
-    const sample = sampleEnemyPreviewStateMachine(timeInMilliseconds, 30, [
-        { id: 0, durationTicks: 240, animationIndex: 0 },
+    const sample = sampleOccasionalEnemyStateMachine(timeInMilliseconds, 30, seed,
+        { id: 0, durationTicks: 0, animationIndex: 0 }, 210, 480, [
         { id: 1, durationTicks: 30, animationIndex: 1 },
         { id: 2, durationTicks: 60, animationIndex: 2 },
     ]);
