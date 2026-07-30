@@ -670,13 +670,17 @@ function getObjectModelSpec(metadata: MPHEntityMetadata, object: MPHObjectEntity
     if (object.modelId === -1)
         return null;
     const object_ = assertExists(metadata.objects[object.modelId], `object model ${object.modelId}`);
-    const animationId = object_.animationIds[object.initialState];
-    const hasAnimation = object_.animationName !== null && animationId !== undefined && animationId >= 0;
+    const stateAnimationId = object_.animationIds[object.initialState];
+    const animationIds = [...new Set(object_.animationIds.filter((animationId) => animationId >= 0))];
+    const animationId = stateAnimationId >= 0 ? stateAnimationId : animationIds[0];
+    const hasAnimation = object_.animationName !== null && animationId !== undefined;
     return {
         modelFilename: `${object_.modelName}_Model.bin`,
         animationFilename: hasAnimation ? `${object_.animationName}_Anim.bin` : undefined,
         sharedTextureFilename: getSharedTextureFilename(object_.modelName),
         animationId: hasAnimation ? animationId : undefined,
+        additionalAnimationIds: hasAnimation ?
+            animationIds.filter((candidate) => candidate !== animationId) : undefined,
     };
 }
 
@@ -1448,6 +1452,10 @@ interface MPHForceFieldTransitionPlan extends MPHEnemyActivationPlan {
     active: boolean;
 }
 
+interface MPHObjectStatePlan extends MPHEnemyActivationPlan {
+    state: number;
+}
+
 const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
 const FORCE_FIELD_FADE_DURATION_MS = 31 * 1000 / 30;
 
@@ -1455,6 +1463,7 @@ interface MPHEntityActivationPlans {
     enemies: Map<number, MPHEnemyActivationPlan[]>;
     items: Map<number, MPHEnemyActivationPlan[]>;
     forceFields: Map<number, MPHForceFieldTransitionPlan[]>;
+    objects: Map<number, MPHObjectStatePlan[]>;
 }
 
 function addEntityActivationPlan(plansByEntityId: Map<number, MPHEnemyActivationPlan[]>,
@@ -1476,15 +1485,27 @@ function addForceFieldTransitionPlan(plansByEntityId: Map<number, MPHForceFieldT
         plans.push({ rootVolume, waveDepth, active });
 }
 
+function addObjectStatePlan(plansByEntityId: Map<number, MPHObjectStatePlan[]>,
+        entityId: number, rootVolume: MPHTriggerVolumeEntity | null, waveDepth: number, state: number): void {
+    let plans = plansByEntityId.get(entityId);
+    if (plans === undefined)
+        plansByEntityId.set(entityId, plans = []);
+    if (!plans.some((plan) =>
+        plan.rootVolume === rootVolume && plan.waveDepth === waveDepth && plan.state === state))
+        plans.push({ rootVolume, waveDepth, state });
+}
+
 function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationPlans {
     const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
     const enemyById = new Map(entities.enemySpawns.map((enemy) => [enemy.entityId, enemy]));
     const itemById = new Map(entities.itemSpawns.map((item) => [item.entityId, item]));
     const forceFieldById = new Map(entities.forceFields.map((forceField) => [forceField.entityId, forceField]));
+    const objectById = new Map(entities.objects.map((object) => [object.entityId, object]));
     const result: MPHEntityActivationPlans = {
         enemies: new Map(),
         items: new Map(),
         forceFields: new Map(),
+        objects: new Map(),
     };
 
     interface MessageEvent {
@@ -1544,6 +1565,14 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
                 // HandleForceFieldMessage @ 0x02169100.
                 addForceFieldTransitionPlan(result.forceFields, forceField.entityId,
                     rootVolume, event.waveDepth, event.message === 0x11);
+                continue;
+            }
+            const object = objectById.get(event.targetId);
+            if (object !== undefined && (event.message === 0x12 || event.message === 5)) {
+                // HandleObjectEntityMessage @ 0x0216A994.
+                const state = event.message === 0x12 ? 2 : event.messageParam & 0xFF;
+                if (state < 4)
+                    addObjectStatePlan(result.objects, object.entityId, rootVolume, event.waveDepth, state);
                 continue;
             }
 
@@ -1746,8 +1775,88 @@ export class MPHEntityFile {
             const spec = getObjectModelSpec(this.metadata, object);
             if (spec === null)
                 continue;
-            const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, {
-                ...baseOptions,
+            const statePlans = entityActivationPlans.objects.get(object.entityId) ?? [];
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation, additionalAnimations) => {
+                if (statePlans.length === 0) {
+                    return {
+                        ...baseOptions,
+                    };
+                }
+
+                const object_ = assertExists(this.metadata.objects[object.modelId]);
+                const rootActivationTimes = new Map<number, number>();
+                const cameraRoomPosition = vec3.create();
+                let sceneStartTime: number | null = null;
+                let currentState = object.initialState;
+                let currentStateStartTime = 0;
+                const animations = [animation, ...additionalAnimations];
+                const animationIds = [spec.animationId, ...(spec.additionalAnimationIds ?? [])];
+                const getStateAnimationIndex = (state: number): number => {
+                    const index = animationIds.indexOf(object_.animationIds[state]);
+                    return index >= 0 ? index : 0;
+                };
+                const getStateAnimationDuration = (state: number): number => {
+                    const stateAnimation = animations[getStateAnimationIndex(state)];
+                    const frameCount = stateAnimation?.node?.frameCount ??
+                        stateAnimation?.material?.frameCount ??
+                        stateAnimation?.texCoord?.frameCount ?? 1;
+                    return Math.max(0, frameCount - 1) * 1000 / 30;
+                };
+                const updateObjectState: NonNullable<MPHRendererOptions['isVisibleAtTime']> = (time, viewerInput) => {
+                    if (sceneStartTime === null) {
+                        sceneStartTime = time;
+                        currentStateStartTime = time;
+                    }
+                    const cameraMatrix = viewerInput.camera.worldMatrix;
+                    vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                    if (inverseSceneTransform !== null)
+                        vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+
+                    let state = object.initialState;
+                    let latestTransitionTime = sceneStartTime;
+                    for (const plan of statePlans) {
+                        const transitionTime = getPlannedActivationTime(
+                            [plan], time, sceneStartTime, cameraRoomPosition, rootActivationTimes);
+                        if (transitionTime !== null && transitionTime >= latestTransitionTime) {
+                            state = plan.state;
+                            latestTransitionTime = transitionTime;
+                        }
+                    }
+                    const elapsed = time - latestTransitionTime;
+                    if (object.modelId === 0x35 && state === 1) {
+                        // UpdateObjectEntity @ 0x0216ACE4 advances WallSwitch
+                        // from its activation animation to its active state.
+                        const duration = getStateAnimationDuration(state);
+                        if (elapsed >= duration) {
+                            state = 2;
+                            latestTransitionTime += duration;
+                        }
+                    } else if (object.modelId >= 0x2F && object.modelId <= 0x34 && state === 1) {
+                        // The six SecretSwitch palettes return from their
+                        // activation animation to state zero.
+                        const duration = getStateAnimationDuration(state);
+                        if (elapsed >= duration) {
+                            state = 0;
+                            latestTransitionTime += duration;
+                        }
+                    }
+                    currentState = state;
+                    currentStateStartTime = latestTransitionTime;
+                    return object_.animationIds[currentState] >= 0;
+                };
+                const selectAnimation = (): number => getStateAnimationIndex(currentState);
+                const mapAnimationTime = (time: number): number => time - currentStateStartTime;
+                return {
+                    ...baseOptions,
+                    isVisibleAtTime: updateObjectState,
+                    additionalMaterialAnimations: animations.slice(1).map((candidate) => candidate?.material ?? null),
+                    additionalTexCoordAnimations: animations.slice(1).map((candidate) => candidate?.texCoord ?? null),
+                    selectNodeAnimation: selectAnimation,
+                    selectMaterialAnimation: selectAnimation,
+                    selectTexCoordAnimation: selectAnimation,
+                    mapAnimationTime,
+                    mapMaterialAnimationTime: mapAnimationTime,
+                };
             });
             calcOrientedModelMatrix(renderer.modelMatrix, object.position, object.facing, object.up, renderer.modelScale);
             renderers.push(renderer);
