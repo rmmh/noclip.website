@@ -15,6 +15,8 @@ const ENTITY_TYPE_OBJECT = 1;
 const ENTITY_TYPE_DOOR = 3;
 const ENTITY_TYPE_ITEM_SPAWN = 4;
 const ENTITY_TYPE_JUMP_PAD = 9;
+const ENTITY_TYPE_OCTOLITH_FLAG = 12;
+const ENTITY_TYPE_FLAG_BASE = 13;
 const ENTITY_TYPE_TELEPORTER = 14;
 const ENTITY_TYPE_FORCE_FIELD = 19;
 const PLATFORM_DATA_SIZE = 0x24C;
@@ -22,6 +24,8 @@ const OBJECT_DATA_SIZE = 0x98;
 const DOOR_DATA_SIZE = 0x68;
 const ITEM_SPAWN_DATA_SIZE = 0x48;
 const JUMP_PAD_DATA_SIZE = 0x94;
+const OCTOLITH_FLAG_DATA_SIZE = 0x29;
+const FLAG_BASE_DATA_SIZE = 0x6C;
 const TELEPORTER_DATA_SIZE = 0x5C;
 const FORCE_FIELD_DATA_SIZE = 0x35;
 
@@ -85,6 +89,21 @@ interface MPHJumpPadEntity extends MPHEntityEntry {
     beamModelId: number;
 }
 
+interface MPHOctolithFlagEntity extends MPHEntityEntry {
+    position: vec3;
+    up: vec3;
+    facing: vec3;
+    teamId: number;
+}
+
+interface MPHFlagBaseEntity extends MPHEntityEntry {
+    position: vec3;
+    up: vec3;
+    facing: vec3;
+    teamId: number;
+    active: boolean;
+}
+
 interface MPHTeleporterEntity extends MPHEntityEntry {
     position: vec3;
     up: vec3;
@@ -108,6 +127,8 @@ export interface MPHEntities {
     doors: MPHDoorEntity[];
     itemSpawns: MPHItemSpawnEntity[];
     jumpPads: MPHJumpPadEntity[];
+    octolithFlags: MPHOctolithFlagEntity[];
+    flagBases: MPHFlagBaseEntity[];
     teleporters: MPHTeleporterEntity[];
     forceFields: MPHForceFieldEntity[];
 }
@@ -132,6 +153,11 @@ function readFx32(view: DataView, offs: number): number {
 
 function readVec3Fx(view: DataView, offs: number): vec3 {
     return vec3.fromValues(readFx32(view, offs + 0x00), readFx32(view, offs + 0x04), readFx32(view, offs + 0x08));
+}
+
+function readNormalizedVec3Fx(view: DataView, offs: number): vec3 {
+    const dst = readVec3Fx(view, offs);
+    return vec3.normalize(dst, dst);
 }
 
 function readQuatFx(view: DataView, offs: number): quat {
@@ -225,6 +251,31 @@ function parseJumpPad(entry: MPHEntityEntry, view: DataView): MPHJumpPadEntity {
     };
 }
 
+function parseOctolithFlag(entry: MPHEntityEntry, view: DataView): MPHOctolithFlagEntity {
+    assert(entry.dataLength === OCTOLITH_FLAG_DATA_SIZE);
+    const offs = entry.dataOffset;
+    return {
+        ...entry,
+        position: readVec3Fx(view, offs + 0x04),
+        up: readNormalizedVec3Fx(view, offs + 0x10),
+        facing: readNormalizedVec3Fx(view, offs + 0x1C),
+        teamId: view.getUint8(offs + 0x28),
+    };
+}
+
+function parseFlagBase(entry: MPHEntityEntry, view: DataView): MPHFlagBaseEntity {
+    assert(entry.dataLength === FLAG_BASE_DATA_SIZE);
+    const offs = entry.dataOffset;
+    return {
+        ...entry,
+        position: readVec3Fx(view, offs + 0x04),
+        up: readVec3Fx(view, offs + 0x10),
+        facing: readVec3Fx(view, offs + 0x1C),
+        teamId: view.getUint32(offs + 0x28, true),
+        active: view.getUint32(offs + 0x2C, true) !== 0,
+    };
+}
+
 function parseTeleporter(entry: MPHEntityEntry, view: DataView): MPHTeleporterEntity {
     assert(entry.dataLength === TELEPORTER_DATA_SIZE);
     const offs = entry.dataOffset;
@@ -262,6 +313,8 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     const doors: MPHDoorEntity[] = [];
     const itemSpawns: MPHItemSpawnEntity[] = [];
     const jumpPads: MPHJumpPadEntity[] = [];
+    const octolithFlags: MPHOctolithFlagEntity[] = [];
+    const flagBases: MPHFlagBaseEntity[] = [];
     const teleporters: MPHTeleporterEntity[] = [];
     const forceFields: MPHForceFieldEntity[] = [];
     let entryCount = 0;
@@ -295,6 +348,10 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
             itemSpawns.push(parseItemSpawn(entry, view));
         else if (entry.type === ENTITY_TYPE_JUMP_PAD)
             jumpPads.push(parseJumpPad(entry, view));
+        else if (entry.type === ENTITY_TYPE_OCTOLITH_FLAG)
+            octolithFlags.push(parseOctolithFlag(entry, view));
+        else if (entry.type === ENTITY_TYPE_FLAG_BASE)
+            flagBases.push(parseFlagBase(entry, view));
         else if (entry.type === ENTITY_TYPE_TELEPORTER)
             teleporters.push(parseTeleporter(entry, view));
         else if (entry.type === ENTITY_TYPE_FORCE_FIELD)
@@ -302,7 +359,7 @@ export function parseMPHEntities(buffer: ArrayBufferSlice, layerId: number): MPH
     }
 
     assert(entryCount === view.getUint16(0x04 + layerId * 2, true));
-    return { platforms, objects, doors, itemSpawns, jumpPads, teleporters, forceFields };
+    return { platforms, objects, doors, itemSpawns, jumpPads, octolithFlags, flagBases, teleporters, forceFields };
 }
 
 export interface MPHObjectMetadata {
@@ -394,6 +451,33 @@ function getJumpPadBeamModelSpec(jumpPad: MPHJumpPadEntity): MPHEntityModelSpec 
     return {
         modelFilename: 'JumpPad_Beam_Model.bin',
         animationFilename: 'JumpPad_Beam_Anim.bin',
+        animationId: 0,
+    };
+}
+
+function getFlagBaseModelSpec(flagBase: MPHFlagBaseEntity, captureTheFlag: boolean): MPHEntityModelSpec {
+    assert(flagBase.teamId === 0 || flagBase.teamId === 1);
+    if (captureTheFlag) {
+        return {
+            modelFilename: 'flagbase_ctf_mdl_Model.bin',
+            animationFilename: 'flagbase_ctf_Anim.bin',
+            sharedTextureFilename: flagBase.teamId === 0 ? 'flagbase_ctf_orange_img_Model.bin' : 'flagbase_ctf_green_img_Model.bin',
+            animationId: 0,
+        };
+    }
+    return {
+        modelFilename: 'flagbase_bounty_Model.bin',
+        animationFilename: 'flagbase_bounty_Anim.bin',
+        animationId: 0,
+    };
+}
+
+function getOctolithFlagModelSpec(flag: MPHOctolithFlagEntity): MPHEntityModelSpec {
+    assert(flag.teamId === 0 || flag.teamId === 1);
+    return {
+        modelFilename: 'octolith_ctf_mdl_Model.bin',
+        animationFilename: 'octolith_ctf_Anim.bin',
+        sharedTextureFilename: flag.teamId === 0 ? 'octolith_ctf_orange_img_Model.bin' : 'octolith_ctf_green_img_Model.bin',
         animationId: 0,
     };
 }
@@ -643,6 +727,15 @@ function calcJumpPadBeamModelMatrix(dst: mat4, jumpPad: MPHJumpPadEntity, modelS
     calcOrientedModelMatrix(dst, position, direction, jumpPad.facing, modelScale);
 }
 
+function calcFlagBaseModelMatrix(dst: mat4, flagBase: MPHFlagBaseEntity, modelScale: number): void {
+    calcOrientedModelMatrix(dst, flagBase.position, flagBase.facing, flagBase.up, modelScale);
+}
+
+function calcOctolithFlagModelMatrix(dst: mat4, flag: MPHOctolithFlagEntity, modelScale: number): void {
+    const position = vec3.scaleAndAdd(vec3.create(), flag.position, flag.up, 2);
+    calcOrientedModelMatrix(dst, position, flag.facing, flag.up, modelScale);
+}
+
 function calcTeleporterModelMatrix(dst: mat4, teleporter: MPHTeleporterEntity, modelScale: number): void {
     calcOrientedModelMatrix(dst, teleporter.position, teleporter.facing, teleporter.up, modelScale);
 }
@@ -704,6 +797,14 @@ export class MPHEntityFile {
             if (jumpPad.active)
                 requestEntityModel(this.cache, getJumpPadBeamModelSpec(jumpPad));
         }
+        const captureTheFlag = this.sceneMode.kind === 'multiplayer' && this.sceneMode.captureTheFlag === true;
+        for (const flagBase of this.entities.flagBases) {
+            if (!flagBase.active)
+                continue;
+            requestEntityModel(this.cache, getFlagBaseModelSpec(flagBase, captureTheFlag));
+        }
+        for (const flag of this.entities.octolithFlags)
+            requestEntityModel(this.cache, getOctolithFlagModelSpec(flag));
         if (this.entities.teleporters.some((teleporter) => !teleporter.invisible))
             requestEntityModel(this.cache, getTeleporterModelSpec(this.sceneMode));
         if (this.entities.forceFields.some((forceField) => forceField.active))
@@ -788,6 +889,33 @@ export class MPHEntityFile {
             });
             calcJumpPadBeamModelMatrix(beamRenderer.modelMatrix, jumpPad, beamRenderer.modelScale);
             renderers.push(beamRenderer);
+        }
+        const captureTheFlag = this.sceneMode.kind === 'multiplayer' && this.sceneMode.captureTheFlag === true;
+        for (const flagBase of this.entities.flagBases) {
+            if (!flagBase.active)
+                continue;
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, getFlagBaseModelSpec(flagBase, captureTheFlag), (animation) => {
+                const duration = getAnimationLoopDuration(animation);
+                return {
+                    sceneMode: this.sceneMode,
+                    lighting,
+                    mapAnimationTime: (time) => time % duration,
+                };
+            });
+            calcFlagBaseModelMatrix(renderer.modelMatrix, flagBase, renderer.modelScale);
+            renderers.push(renderer);
+        }
+        for (const flag of this.entities.octolithFlags) {
+            const renderer = createEntityModelRenderer(device, this.cache, renderCache, getOctolithFlagModelSpec(flag), (animation) => {
+                const duration = getAnimationLoopDuration(animation);
+                return {
+                    sceneMode: this.sceneMode,
+                    lighting,
+                    mapAnimationTime: (time) => time % duration,
+                };
+            });
+            calcOctolithFlagModelMatrix(renderer.modelMatrix, flag, renderer.modelScale);
+            renderers.push(renderer);
         }
         for (const teleporter of this.entities.teleporters) {
             if (teleporter.invisible)
