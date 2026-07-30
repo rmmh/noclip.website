@@ -18,6 +18,7 @@ import { MPHbin, MPHMaterial, MPHNode, MPHShape } from "./mph_binModel.js";
 import { CalcBillboardFlags, Vec3Zero, calcBillboardMatrix, computeModelMatrixSRT } from "../MathHelpers.js";
 import { GfxRenderCache } from "../gfx/render/GfxRenderCache.js";
 import { White, colorNewCopy } from "../Color.js";
+import { MPHCollisionData, MPHCollisionPortal } from "./mph_collision.js";
 
 function translateWrapMode(repeat: boolean, flip: boolean): GfxWrapMode {
     if (flip)
@@ -41,6 +42,11 @@ function parseMPHTexImageParamWrapModeT(w0: number): GfxWrapMode {
 }
 
 const scratchTexMatrix = mat2d.create();
+class MPHProgram extends NITRO_Program {
+    public override vert = new NITRO_Program().vert
+        .replace('    v_Color = a_Color;', '    v_Color = a_Color;\n    v_Color.a *= u_Misc[2].w;');
+}
+
 export type MPHFogConfig = NITROFogConfig;
 
 class MaterialInstance {
@@ -145,15 +151,15 @@ class MaterialInstance {
         this.viewerTextures.push({ gfxTexture, extraInfo });
     }
 
-    public setOnRenderInst(template: GfxRenderInst, viewerInput: Viewer.ViewerRenderInput): void {
+    public setOnRenderInst(template: GfxRenderInst, viewerInput: Viewer.ViewerRenderInput, alphaMultiplier: number = 1, forceTranslucent: boolean = false): void {
         if (this.texCoordAnimator !== null) {
             this.texCoordAnimator.calcTexMtx(scratchTexMatrix, this.material.texScaleS, this.material.texScaleT);
         } else {
             mat2d.copy(scratchTexMatrix, this.material.texMatrix);
         }
 
-        template.sortKey = this.sortKey;
-        template.setMegaStateFlags(this.megaStateFlags);
+        template.sortKey = forceTranslucent ? makeSortKeyOpaque(GfxRendererLayer.TRANSLUCENT, 0) : this.sortKey;
+        template.setMegaStateFlags(forceTranslucent ? { ...this.megaStateFlags, depthWrite: false } : this.megaStateFlags);
 
         if (this.pat0Animator !== null) {
             const fullTextureName = this.pat0Animator.calcFullTextureName();
@@ -169,7 +175,7 @@ class MaterialInstance {
         offs += fillMatrix3x2(materialParamsMapped, offs, scratchTexMatrix);
         offs += fillColor(materialParamsMapped, offs, this.diffuseColor, 0);
         offs += fillColor(materialParamsMapped, offs, this.ambientColor, this.lightMask);
-        offs += fillColor(materialParamsMapped, offs, this.specularColor);
+        offs += fillColor(materialParamsMapped, offs, this.specularColor, alphaMultiplier);
         offs += fillColor(materialParamsMapped, offs, this.emissionColor);
         offs += fillNITROFogParams(materialParamsMapped, offs, this.fog, this.fogEnabled);
     }
@@ -254,11 +260,25 @@ class ShapeInstance {
     private vertexData: VertexData;
     private matrixNodes: Node[] = [];
 
-    constructor(cache: GfxRenderCache, private materialInstance: MaterialInstance, public node: Node, public shape: MPHShape, matrixNodes: Map<number, Node>, numMatrices: number) {
+    constructor(cache: GfxRenderCache, private materialInstance: MaterialInstance, public node: Node, public shape: MPHShape, matrixNodes: Map<number, Node>, numMatrices: number, private portal: MPHCollisionPortal | null = null) {
         const baseCtx = this.materialInstance.baseCtx;
         for (let i = 0; i < numMatrices; i++)
             this.matrixNodes.push(matrixNodes.get(i) ?? node);
         this.vertexData = new VertexData(cache, NITRO_GX.readCmds(shape.dlBuffer, baseCtx, 1));
+    }
+
+    private calcPortalAlphaMultiplier(viewerInput: Viewer.ViewerRenderInput): number {
+        if (this.portal === null || this.portal.centroid === null)
+            return 1;
+
+        const cameraMatrix = viewerInput.camera.worldMatrix;
+        const distance = Math.hypot(
+            cameraMatrix[12] - this.portal.centroid[0],
+            cameraMatrix[13] - this.portal.centroid[1],
+            cameraMatrix[14] - this.portal.centroid[2],
+        );
+
+        return Math.min(distance * 4, 31) / 31;
     }
 
     public prepareToRender(renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput): void {
@@ -271,7 +291,9 @@ class ShapeInstance {
         for (let i = 0; i < this.matrixNodes.length; i++)
             offs += fillMatrix4x3(drawParamsMapped, offs, this.matrixNodes[i].drawMatrix);
 
-        this.materialInstance.setOnRenderInst(renderInst, viewerInput);
+        const alphaMultiplier = this.calcPortalAlphaMultiplier(viewerInput);
+        const forceTranslucent = this.portal !== null && alphaMultiplier < 1;
+        this.materialInstance.setOnRenderInst(renderInst, viewerInput, alphaMultiplier, forceTranslucent);
 
         const drawCall = this.vertexData.nitroVertexData.drawCall;
         renderInst.setDrawCount(drawCall.numIndices, drawCall.startIndex);
@@ -307,6 +329,7 @@ export interface MPHRendererOptions {
     forceBillboard?: boolean;
     forceTwoSided?: boolean;
     fog?: MPHFogConfig | null;
+    collision?: MPHCollisionData | null;
 }
 
 function nodeIsVisibleInMode(name: string, mode: MPHSceneMode): boolean {
@@ -364,7 +387,8 @@ export class MPHRenderer {
         this.lighting = options.lighting;
         this.mapAnimationTime = options.mapAnimationTime;
         const entityModel = options.entityModel ?? false;
-        const program = new NITRO_Program();
+        const collision = options.collision ?? null;
+        const program = new MPHProgram();
         program.defines.set('USE_VERTEX_COLOR', '1');
         program.defines.set('USE_TEXTURE', '1');
         program.defines.set('USE_FOG', '1');
@@ -413,6 +437,11 @@ export class MPHRenderer {
             if (this.materialInstances[i].viewerTextures.length > 0)
                 this.viewerTextures.push(this.materialInstances[i].viewerTextures[0]);
 
+        const portalsByNode = new Map<string, MPHCollisionPortal>();
+        for (const portal of collision?.portals ?? [])
+            if (portal.geometryNodeName !== null)
+                portalsByNode.set(portal.geometryNodeName, portal);
+
         for (const node of this.nodeDrawOrder) {
             if (options.nodeFilter !== undefined && !options.nodeFilter(node.node.name))
                 continue;
@@ -422,7 +451,8 @@ export class MPHRenderer {
             for (let j = 0; j < node.node.meshCount; j++) {
                 const mesh = mphModel.meshs[node.node.meshStart + j];
                 const shape = mphModel.shapes[mesh.shapeID];
-                this.shapeInstances.push(new ShapeInstance(cache, this.materialInstances[mesh.matID], node, shape, matrixNodes, numMatrices));
+                const portal = node.parent !== null ? portalsByNode.get(node.parent.node.name) ?? null : null;
+                this.shapeInstances.push(new ShapeInstance(cache, this.materialInstances[mesh.matID], node, shape, matrixNodes, numMatrices, portal));
             }
         }
     }

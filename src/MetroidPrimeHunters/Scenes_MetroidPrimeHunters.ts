@@ -9,6 +9,7 @@ import { parseMPH_Model, parseTEX0Texture } from './mph_binModel.js';
 import { parseMPHAnimation } from './mph_anim.js';
 import { findAreaMetadata, MPHMetadata, sceneIdToModelStem } from './area_metadata.js';
 import { MPHEntityFile, parseMPHEntities } from './entity.js';
+import { parseMPHCollision } from './mph_collision.js';
 
 import { DataFetcher } from '../DataFetcher.js';
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
@@ -239,9 +240,12 @@ class SceneDesc implements Viewer.SceneDesc {
         const stageTex = textureFile !== null ? parseTEX0Texture(textureFile, stageBin.mphTex) : parseTEX0Texture(assertExists(bin_Model), stageBin.mphTex);
         const animationFile = modelCache.getFileData(animationFilename);
         const animation = animationFile !== null ? parseMPHAnimation(animationFile) : null;
+        const collisionFile = area !== null ? modelCache.getFileData(area.collisionFilename) : null;
+        const collision = collisionFile !== null ? parseMPHCollision(collisionFile) : null;
         renderer.stageRenderer = new MPHRenderer(device, renderer.getCache(), stageBin, stageBin.tex0 !== null ? stageBin.tex0 : assertExists(stageTex), animation, {
             sceneMode,
             fog,
+            collision,
         });
         if (entities !== null) {
             renderer.objectRenderers.push(...entities.createRenderers(device, renderer.getCache(), assertExists(lighting), fog));
