@@ -82,6 +82,7 @@ export interface MPHDoorEntity extends MPHEntityEntry {
     subtype: number;
     doorType: number;
     connectorLevelId: number;
+    locked: boolean;
     connectionId: number;
     destinationEntityFilename: string;
 }
@@ -184,6 +185,7 @@ type MPHTriggerVolume = MPHLightVolume;
 interface MPHTriggerVolumeEntity extends MPHEntityEntry {
     mode: number;
     initialState: number;
+    cooldown: number;
     counter: number;
     volume: MPHTriggerVolume;
     targetEntityIds: readonly [number, number];
@@ -304,6 +306,7 @@ function parseDoor(entry: MPHEntityEntry, view: DataView, buffer: ArrayBufferSli
         subtype: view.getUint32(offs + 0x38, true),
         doorType: view.getUint32(offs + 0x3C, true),
         connectorLevelId: view.getUint32(offs + 0x40, true),
+        locked: view.getUint8(offs + 0x45) !== 0,
         connectionId: view.getUint8(offs + 0x46),
         destinationEntityFilename: normalizeEntityFilename(readString(buffer, offs + 0x48, 0x10, true)),
     };
@@ -532,6 +535,7 @@ function parseTriggerVolume(entry: MPHEntityEntry, view: DataView): MPHTriggerVo
         ...entry,
         mode: view.getUint32(offs + 0x28, true),
         initialState: view.getUint8(offs + 0x6E),
+        cooldown: view.getUint16(offs + 0x72, true),
         counter: view.getUint32(offs + 0x7C, true),
         volume,
         targetEntityIds: [
@@ -684,6 +688,15 @@ function getObjectModelSpec(metadata: MPHEntityMetadata, object: MPHObjectEntity
     };
 }
 
+// InitializeDoorModelInstances @ 0x021062A8 indexes the lock model and
+// animation resource tables alongside the primary door resources.
+const doorLockModels = [
+    { modelName: 'AlimbicDoorLock_mdl', animationName: 'AlimbicDoorLock_mdl' },
+    { modelName: 'AlimbicMorphBallDoorLock_mdl', animationName: 'AlimbicMorphBallDoorLock_mdl' },
+    { modelName: 'AlimbicBossDoorLock_mdl', animationName: 'AlimbicBossDoorLock_mdl' },
+    { modelName: 'ThinDoorLock_mdl', animationName: 'ThinDoorLock_mdl' },
+] as const;
+
 function isPlatformModelSupported(metadata: MPHEntityMetadata, platform: MPHPlatformEntity): boolean {
     return metadata.platforms[platform.modelId] !== undefined;
 }
@@ -827,6 +840,20 @@ function getDoorModelSpec(metadata: MPHEntityMetadata, door: MPHDoorEntity): MPH
         paletteFilename: paletteOverrides !== undefined ? 'AlimbicPalettes_pal_Model.bin' : undefined,
         paletteOverrides,
         animationId: 0,
+    };
+}
+
+function getDoorLockModelSpec(metadata: MPHEntityMetadata, door: MPHDoorEntity): MPHEntityModelSpec {
+    const lock = assertExists(doorLockModels[door.doorType], `door lock type ${door.doorType}`);
+    const paletteId = assertExists(metadata.doorLockPaletteIds[door.subtype], `door lock subtype ${door.subtype}`);
+    return {
+        modelFilename: `${lock.modelName}_Model.bin`,
+        animationFilename: `${lock.animationName}_Anim.bin`,
+        sharedTextureFilename: 'AlimbicTextureShare_img_Model.bin',
+        paletteFilename: 'AlimbicPalettes_pal_Model.bin',
+        paletteOverrides: [{ target: 1, source: paletteId }],
+        animationId: 0,
+        additionalAnimationIds: [1],
     };
 }
 
@@ -1285,6 +1312,20 @@ function calcPlatformModelMatrix(dst: mat4, platform: MPHPlatformEntity, timeInM
     mat4.fromRotationTranslationScale(dst, scratchRotation, scratchPosition, scratchScale);
 }
 
+function calcDoorModelMatrix(dst: mat4, door: MPHDoorEntity, modelScale: number): void {
+    calcOrientedModelMatrix(dst, door.position, door.facing, door.up, modelScale);
+}
+
+const doorLockOffsets = [0x1666, 0x0B33, 0x3800, 0x1666] as const;
+
+function calcDoorLockModelMatrix(dst: mat4, door: MPHDoorEntity, modelScale: number): void {
+    // CalculateDoorPortalPosition @ 0x02106204 offsets the lock/interaction
+    // position along facing using the table at 0x0211FEDC.
+    const position = vec3.scaleAndAdd(vec3.create(), door.position, door.facing,
+        fx32(assertExists(doorLockOffsets[door.doorType])));
+    calcOrientedModelMatrix(dst, position, door.facing, door.up, modelScale);
+}
+
 // Stagger spawning to avoid synchronized bobs.
 const ITEM_SPAWN_PREVIEW_PHASE_STEP = 0x2000;
 
@@ -1498,6 +1539,10 @@ interface MPHPlatformStatePlan extends MPHEnemyActivationPlan {
     movementActive: boolean;
 }
 
+interface MPHDoorStatePlan extends MPHEnemyActivationPlan {
+    locked: boolean;
+}
+
 const ENEMY_PREVIEW_WAVE_DWELL_MS = 6000;
 const EVENT_FLAG_PREVIEW_DWELL_MS = 4000;
 const FORCE_FIELD_FADE_DURATION_MS = 31 * 1000 / 30;
@@ -1508,6 +1553,7 @@ interface MPHEntityActivationPlans {
     forceFields: Map<number, MPHForceFieldTransitionPlan[]>;
     objects: Map<number, MPHObjectStatePlan[]>;
     platforms: Map<number, MPHPlatformStatePlan[]>;
+    doors: Map<number, MPHDoorStatePlan[]>;
 }
 
 function addEntityActivationPlan(plansByEntityId: Map<number, MPHEnemyActivationPlan[]>,
@@ -1551,6 +1597,16 @@ function addPlatformStatePlan(plansByEntityId: Map<number, MPHPlatformStatePlan[
         plans.push({ rootVolume, waveDepth, animationActive, movementActive });
 }
 
+function addDoorStatePlan(plansByEntityId: Map<number, MPHDoorStatePlan[]>,
+        entityId: number, rootVolume: MPHTriggerVolumeEntity | null, waveDepth: number, locked: boolean): void {
+    let plans = plansByEntityId.get(entityId);
+    if (plans === undefined)
+        plansByEntityId.set(entityId, plans = []);
+    if (!plans.some((plan) =>
+        plan.rootVolume === rootVolume && plan.waveDepth === waveDepth && plan.locked === locked))
+        plans.push({ rootVolume, waveDepth, locked });
+}
+
 function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationPlans {
     const triggerById = new Map(entities.triggerVolumes.map((trigger) => [trigger.entityId, trigger]));
     const enemyById = new Map(entities.enemySpawns.map((enemy) => [enemy.entityId, enemy]));
@@ -1558,12 +1614,14 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
     const forceFieldById = new Map(entities.forceFields.map((forceField) => [forceField.entityId, forceField]));
     const objectById = new Map(entities.objects.map((object) => [object.entityId, object]));
     const platformById = new Map(entities.platforms.map((platform) => [platform.entityId, platform]));
+    const doorById = new Map(entities.doors.map((door) => [door.entityId, door]));
     const result: MPHEntityActivationPlans = {
         enemies: new Map(),
         items: new Map(),
         forceFields: new Map(),
         objects: new Map(),
         platforms: new Map(),
+        doors: new Map(),
     };
 
     interface MessageEvent {
@@ -1650,6 +1708,18 @@ function buildEntityActivationPlans(entities: MPHEntities): MPHEntityActivationP
                         rootVolume, event.waveDepth, false, false);
                 else
                     continue;
+                continue;
+            }
+            const door = doorById.get(event.targetId);
+            if (door !== undefined && (event.message === 0x10 || event.message === 0x11 ||
+                event.message === 0x21 || event.message === 0x22)) {
+                // HandleDoorEntityMessage @ 0x02106394: 0x10/0x21 unlock,
+                // while 0x11/0x22 lock. The latter pair broadcasts to the
+                // door entity ID selected by the dispatcher; entity IDs are
+                // unique within this parsed room, so the resulting target is
+                // the same door represented by this graph edge.
+                addDoorStatePlan(result.doors, door.entityId, rootVolume, event.waveDepth,
+                    event.message === 0x11 || event.message === 0x22);
                 continue;
             }
 
@@ -1779,8 +1849,10 @@ export class MPHEntityFile {
             if (spec !== null)
                 requestEntityModel(this.cache, spec);
         }
-        for (const door of this.entities.doors)
+        for (const door of this.entities.doors) {
             requestEntityModel(this.cache, getDoorModelSpec(this.metadata, door));
+            requestEntityModel(this.cache, getDoorLockModelSpec(this.metadata, door));
+        }
         for (const item of this.entities.itemSpawns)
             requestEntityModel(this.cache, getItemModelSpec(this.metadata, item));
         if (this.entities.itemSpawns.some((item) => item.showBase))
@@ -2039,6 +2111,40 @@ export class MPHEntityFile {
         for (let index = 0; index < this.entities.doors.length; index++) {
             const door = this.entities.doors[index];
             const spec = getDoorModelSpec(this.metadata, door);
+            const statePlans = entityActivationPlans.doors.get(door.entityId) ?? [];
+            const rootActivationTimes = new Map<number, number>();
+            const cameraRoomPosition = vec3.create();
+            let sceneStartTime: number | null = null;
+            let locked = door.locked;
+            let unlocking = false;
+            let latestTransitionTime = 0;
+            const updateDoorState: NonNullable<MPHRendererOptions['isVisibleAtTime']> = (time, viewerInput) => {
+                if (sceneStartTime === null)
+                    sceneStartTime = time;
+                const cameraMatrix = viewerInput.camera.worldMatrix;
+                vec3.set(cameraRoomPosition, cameraMatrix[12], cameraMatrix[13], cameraMatrix[14]);
+                if (inverseSceneTransform !== null)
+                    vec3.transformMat4(cameraRoomPosition, cameraRoomPosition, inverseSceneTransform);
+
+                const occurredPlans: { plan: MPHDoorStatePlan; time: number }[] = [];
+                for (const plan of statePlans) {
+                    const transitionTime = getPlannedActivationTime(
+                        [plan], time, sceneStartTime, cameraRoomPosition, rootActivationTimes);
+                    if (transitionTime !== null)
+                        occurredPlans.push({ plan, time: transitionTime });
+                }
+                occurredPlans.sort((a, b) => a.time - b.time);
+
+                locked = door.locked;
+                unlocking = false;
+                latestTransitionTime = sceneStartTime;
+                for (const event of occurredPlans) {
+                    unlocking = locked && !event.plan.locked;
+                    locked = event.plan.locked;
+                    latestTransitionTime = event.time;
+                }
+                return true;
+            };
             const doorRenderer = createEntityModelRenderer(device, this.cache, renderCache, spec, (animation) => {
                 const animationDuration = Math.max(0, (animation?.node?.frameCount ?? 1) - 1) * 1000 / 30;
                 const cycleOffset = staggerDoorCycles && door.connectionId !== 0xFF && door.destinationEntityFilename !== '' ?
@@ -2048,7 +2154,11 @@ export class MPHEntityFile {
                     sceneMode: this.sceneMode,
                     fog,
                     sceneTransform,
+                    isVisibleAtTime: updateDoorState,
                     mapAnimationTime: (time) => {
+                        if (locked)
+                            return 0;
+                        time -= latestTransitionTime;
                         let phase = (time + cycleOffset) % (DOOR_HALF_CYCLE_DURATION * 2);
                         if (phase < DOOR_OPEN_HOLD_DURATION)
                             return animationDuration;
@@ -2067,6 +2177,30 @@ export class MPHEntityFile {
             calcOrientedModelMatrix(doorRenderer.modelMatrix, door.position, door.facing, door.up, doorRenderer.modelScale);
             renderers.push(doorRenderer);
             doorRenderers.set(door.entityId, doorRenderer);
+
+            const lockSpec = getDoorLockModelSpec(this.metadata, door);
+            const lockRenderer = createEntityModelRenderer(device, this.cache, renderCache, lockSpec,
+                (animation, additionalAnimations) => {
+                    const unlockAnimation = additionalAnimations[0] ?? null;
+                    const unlockDuration = getAnimationLoopDuration(unlockAnimation);
+                    return {
+                        ...baseOptions,
+                        isVisibleAtTime: (time, viewerInput) => {
+                            updateDoorState(time, viewerInput);
+                            return locked || unlocking && time - latestTransitionTime < unlockDuration;
+                        },
+                        additionalMaterialAnimations: additionalAnimations.map((candidate) => candidate.material),
+                        additionalTexCoordAnimations: additionalAnimations.map((candidate) => candidate.texCoord),
+                        selectNodeAnimation: () => locked ? 0 : 1,
+                        selectMaterialAnimation: () => locked ? 0 : 1,
+                        selectTexCoordAnimation: () => locked ? 0 : 1,
+                        mapAnimationTime: (time) => locked ? 0 : time - latestTransitionTime,
+                        mapMaterialAnimationTime: (time) => locked ? 0 : time - latestTransitionTime,
+                    };
+                });
+            renderers.push(lockRenderer);
+            calcDoorLockModelMatrix(lockRenderer.modelMatrix, door, lockRenderer.modelScale);
+            renderers.push(lockRenderer);
         }
         for (let index = 0; index < this.entities.itemSpawns.length; index++) {
             const item = this.entities.itemSpawns[index];
