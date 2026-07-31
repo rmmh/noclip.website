@@ -154,15 +154,6 @@ export interface TerrainMesh {
     stagePlacement?: 'direct';
 }
 
-function findBytes(bytes: Uint8Array, needle: Uint8Array, start: number): number {
-    outer: for (let i = start; i + needle.length <= bytes.length; i++) {
-        for (let j = 0; j < needle.length; j++)
-            if (bytes[i + j] !== needle[j]) continue outer;
-        return i;
-    }
-    return -1;
-}
-
 function transformMesh(mesh: TerrainMesh, matrix: mat4): TerrainMesh {
     const vertices = mesh.vertices.slice();
     const p = vec3.create(), n = vec3.create();
@@ -363,6 +354,70 @@ export function parseStageBundle(
 ): TerrainMesh[] {
     const bytes = buffer.createTypedArray(Uint8Array);
     const data = buffer.createDataView();
+    const entryCount = data.getUint32(0, true);
+    const directoryEnd = 4 + entryCount * 0x10;
+    if (entryCount > 0x10000 || directoryEnd > data.byteLength)
+        throw new Error('Invalid stage-bundle directory');
+    const entries: { path: string; payloadStart: number; payloadSize: number }[] = [];
+    const directoryEntries = Array.from({ length: entryCount }, (_, index) => {
+        const directory = 4 + index * 0x10;
+        return {
+            primarySize: data.getUint32(directory + 0x08, true),
+            secondarySize: data.getUint32(directory + 0x0C, true),
+        };
+    });
+    let entryStart = directoryEnd;
+    for (let index = 0; index < entryCount; index++) {
+        const entrySize = directoryEntries[index].primarySize;
+        if (entrySize < 8 || entryStart + entrySize > data.byteLength)
+            throw new Error(`Invalid stage-bundle entry ${index} size`);
+        const pathSize = data.getUint32(entryStart, true);
+        const payloadSize = data.getUint32(entryStart + 4, true);
+        const payloadStart = entryStart + 8 + pathSize;
+        if (pathSize === 0 || bytes[payloadStart - 1] !== 0 ||
+            8 + pathSize + payloadSize > entrySize)
+            throw new Error(`Invalid stage-bundle entry ${index} payload`);
+        entries.push({
+            path: ascii(bytes, entryStart + 8, pathSize - 1),
+            payloadStart,
+            payloadSize,
+        });
+        entryStart += entrySize;
+    }
+    for (let index = 0; index < entryCount; index++) {
+        const blockSize = directoryEntries[index].secondarySize;
+        if (blockSize === 0)
+            continue;
+        const blockEnd = entryStart + blockSize;
+        if (entryStart + 8 > data.byteLength || blockEnd > data.byteLength)
+            throw new Error(`Invalid stage-bundle resource block ${index}`);
+        const resourceCount = data.getUint32(entryStart, true);
+        const groupNameSize = data.getUint32(entryStart + 4, true);
+        entryStart += 8;
+        if (groupNameSize === 0 || entryStart + groupNameSize > blockEnd ||
+            bytes[entryStart + groupNameSize - 1] !== 0)
+            throw new Error(`Invalid stage-bundle resource group ${index}`);
+        entryStart += groupNameSize;
+        for (let resource = 0; resource < resourceCount; resource++) {
+            if (entryStart + 0x10 > blockEnd)
+                throw new Error(`Invalid stage-bundle resource ${index}:${resource}`);
+            const pathSize = data.getUint32(entryStart + 8, true);
+            const payloadSize = data.getUint32(entryStart + 0x0C, true);
+            entryStart += 0x10;
+            const payloadStart = entryStart + pathSize;
+            if (pathSize === 0 || payloadStart + payloadSize > blockEnd ||
+                bytes[payloadStart - 1] !== 0)
+                throw new Error(`Invalid stage-bundle resource payload ${index}:${resource}`);
+            entries.push({
+                path: ascii(bytes, entryStart, pathSize - 1),
+                payloadStart,
+                payloadSize,
+            });
+            entryStart = payloadStart + payloadSize;
+        }
+        if (entryStart !== blockEnd)
+            throw new Error(`Stage-bundle resource block ${index} size mismatch`);
+    }
     interface XffSymbol {
         name: string;
         body: number;
@@ -392,17 +447,17 @@ export function parseStageBundle(
             type: data.getUint32(anchor + 8, true),
         };
     };
-    const xff2 = new TextEncoder().encode('xff2');
-    for (let moduleStart = findBytes(bytes, xff2, 0); moduleStart >= 0;
-        moduleStart = findBytes(bytes, xff2, moduleStart + 4)) {
-        if (moduleStart + 0x70 > bytes.length) break;
+    for (const entry of entries) {
+        const moduleStart = entry.payloadStart;
+        if (entry.payloadSize < 0x70 || ascii(bytes, moduleStart, 4) !== 'xff2')
+            continue;
         const moduleSize = data.getUint32(moduleStart + 0x14, true);
         const symbolCount = data.getUint32(moduleStart + 0x24, true);
         const symbolTable = data.getUint32(moduleStart + 0x54, true);
         const strings = data.getUint32(moduleStart + 0x58, true);
         const sectionCount = data.getUint32(moduleStart + 0x40, true);
         const sectionTable = data.getUint32(moduleStart + 0x5C, true);
-        if (moduleSize < 0x70 || moduleStart + moduleSize > bytes.length ||
+        if (moduleSize !== entry.payloadSize ||
             symbolCount > 0x10000 || symbolTable + symbolCount * 0x10 > moduleSize ||
             sectionCount > 0x1000 || sectionTable + sectionCount * 0x20 > moduleSize)
             continue;
@@ -486,22 +541,17 @@ export function parseStageBundle(
         triangles: number;
         bounds: { min: number[]; max: number[] } | null;
     }[] = [];
-    const legacyXff = new Uint8Array([0x78, 0x66, 0x66, 0x00]);
-    for (let start = findBytes(bytes, legacyXff, 0); start >= 0;
-        start = findBytes(bytes, legacyXff, start + 4)) {
-        if (start + 0x70 > bytes.length) break;
+    for (const entry of entries) {
+        const start = entry.payloadStart;
+        if (entry.payloadSize < 0x70 || ascii(bytes, start, 4) !== 'xff\0')
+            continue;
         const size = data.getUint32(start + 0x14, true);
-        if (size < 0x70 || start + size > bytes.length) continue;
+        if (size !== entry.payloadSize) continue;
         const sheet = buffer.slice(start, start + size);
-        const prefix = ascii(bytes, Math.max(0, start - 512), Math.min(512, start));
-        const paths = [...prefix.matchAll(/(?:nmo\/)?[A-Za-z0-9_./-]+\.nmo\x00/g)];
-        const sourceName = paths.length === 0 ? '' : paths[paths.length - 1][0].slice(0, -1);
-        const animationPaths = [...prefix.matchAll(/anim\/[A-Za-z0-9_./-]+\.anb\x00/g)];
-        const animationMatch = animationPaths[animationPaths.length - 1];
-        const animationDistance = animationMatch === undefined ? Infinity :
-            prefix.length - (animationMatch.index + animationMatch[0].length);
-        const animationPath = animationDistance > 0x40 ? '' :
-            animationMatch[0].slice(0, -1).toLowerCase();
+        const sourceName = /(?:^|\/)nmo\/[A-Za-z0-9_./-]+\.nmo$/i.test(entry.path) ||
+            /^[A-Za-z0-9_./-]+\.nmo$/i.test(entry.path) ? entry.path : '';
+        const animationPath = /^anim\/[A-Za-z0-9_./-]+\.anb$/i.test(entry.path)
+            ? entry.path.toLowerCase() : '';
         if (animationPath !== '') {
             try {
                 const relocated = relocateLegacyXff(sheet);
