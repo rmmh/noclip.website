@@ -32,6 +32,7 @@ import * as Scenes_KingdomHeartsIIFinalMix from './KingdomHearts2FinalMix/scenes
 import * as Scenes_Psychonauts from './psychonauts/scenes.js';
 import * as Scenes_DarkSouls from './DarkSouls/scenes.js';
 import * as Scenes_KatamariDamacy from './KatamariDamacy/scenes.js';
+import * as Scenes_ShadowOfTheColossus from './ShadowOfTheColossus/scenes.js';
 import * as Scenes_PaperMario64 from './PaperMario64/scenes.js';
 import * as Scenes_Elebits from './rres/Scenes_Elebits.js';
 import * as Scenes_KirbysReturnToDreamLand from './rres/Scenes_KirbysReturnToDreamLand.js';
@@ -220,6 +221,7 @@ const sceneGroups: (string | SceneGroup)[] = [
     Scenes_WorldOfWarcraft.bcSceneGroup,
     Scenes_WorldOfWarcraft.wotlkSceneGroup,
     "Experimental",
+    Scenes_ShadowOfTheColossus.sceneGroup,
     Scenes_CrashWarped.sceneGroup,
     Scenes_CrazyTaxi.sceneGroup,
     Scenes_Spyro.sceneGroup,
