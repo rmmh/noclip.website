@@ -11,7 +11,7 @@ import { GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
 import { SceneContext } from '../SceneBase.js';
 import * as Viewer from '../viewer.js';
 import * as UI from '../ui.js';
-import { DecodedTexture, parseHiPack, parseNto2Textures, parseStageBundle, parseTerrainCell, parseTexturePack, placeStageBundle, StageBundleDiagnostics, TerrainMesh } from './bin.js';
+import { DecodedTexture, parseHiPack, parseNto2Textures, parseStageBundle, parseTerrainCell, parseTexturePack, placeStageBundle, TerrainMesh } from './bin.js';
 import { fillSceneParams, makeTerrainPipeline, TerrainGeometry, TerrainTextures } from './render.js';
 
 interface Manifest {
@@ -54,8 +54,6 @@ class SotCRenderer implements Viewer.SceneGfx {
         triangles: number;
         focusedMeshes?: {
             mesh: number;
-            texture: string | null;
-            secondaryTexture: string | null;
             triangles: number;
             bounds: { min: number[]; max: number[] };
             layer1: boolean;
@@ -70,19 +68,23 @@ class SotCRenderer implements Viewer.SceneGfx {
             source: string;
             meshes: number;
             triangles: number;
-            textures: string[];
             bounds: { min: number[]; max: number[] } | null;
         }[];
     }>();
     // Parsed without a cell origin so a stage ID shared by multiple grid cells
     // only needs to be decompressed and parsed once.
     private stageBundles = new Map<number, Promise<{ meshes: TerrainMesh[]; textures: DecodedTexture[] }>>();
-    private stageBundleDiagnostics = new Map<number, StageBundleDiagnostics>();
+    // A missing or malformed stage is terminal for this scene lifetime. Keep
+    // it separate from pendingStages so streaming does not fetch it every frame.
+    private failedStageBundles = new Set<number>();
     private available: Set<string>;
     private destroyed = false;
-    private enableProps = true;
+    private enableStages = true;
     private aliveBosses = true;
-    private renderDistance = 16;
+    // Literal terrain-cell footprint width. The game defaults to a 6x6
+    // resident square (2x2 hi center plus a two-cell lo ring); this viewer uses
+    // the hi payload at all coordinates in that footprint.
+    private renderDistance = 6;
     private warnedMissingStageGrid = false;
     private lastStageCell = '';
     private streamingDebug: Record<string, unknown> | null = null;
@@ -108,8 +110,7 @@ class SotCRenderer implements Viewer.SceneGfx {
             loaded,
             pending: [...this.pendingStages],
             parsedStageBundles: [...this.stageBundles.keys()].sort((a, b) => a - b),
-            stage373AssociationTrace: this.stageBundleDiagnostics.get(373) ?? null,
-            stage378AssociationTrace: this.stageBundleDiagnostics.get(378) ?? null,
+            failedStageBundles: [...this.failedStageBundles].sort((a, b) => a - b),
         }, (key, value) => {
             if (key === 'bounds' && value !== null &&
                 Array.isArray(value.min) && Array.isArray(value.max))
@@ -140,17 +141,47 @@ class SotCRenderer implements Viewer.SceneGfx {
         // (+2950,+2950), and Z was flipped during vertex decoding.
         const cellX = Math.max(0, Math.min(59, Math.floor((3000 - input.camera.worldMatrix[12]) / 100)));
         const cellY = Math.max(0, Math.min(59, Math.floor((3000 + input.camera.worldMatrix[14]) / 100)));
+        const stageGrid = this.manifest.stageGrid;
+        const fineWidth = stageGrid === undefined ? 0 : stageGrid.coarseWidth * stageGrid.fineSide;
+        const fineHeight = stageGrid === undefined ? 0 : stageGrid.coarseHeight * stageGrid.fineSide;
+        const fineCellSize = fineWidth === 0 ? 0 : 6000 / fineWidth;
+        const stageFX = fineWidth === 0 ? 0 : (3000 - input.camera.worldMatrix[12]) / fineCellSize;
+        const stageFY = fineHeight === 0 ? 0 : (3000 - input.camera.worldMatrix[14]) / fineCellSize;
+        const stageX = Math.max(0, Math.min(fineWidth - 1, Math.floor(stageFX)));
+        const stageY = Math.max(0, Math.min(fineHeight - 1, Math.floor(stageFY)));
+        // The stage manager begins transitions before the cell boundary,
+        // retaining edge/corner neighbors through its 0.42/0.58 hysteresis.
+        const edgeLow = 0.42;
+        const edgeHigh = 0.58;
+        const fracX = stageFX - Math.floor(stageFX), fracY = stageFY - Math.floor(stageFY);
+        const xNeighbor = fracX < edgeLow ? -1 : fracX > edgeHigh ? 1 : 0;
+        const yNeighbor = fracY < edgeLow ? -1 : fracY > edgeHigh ? 1 : 0;
+        const selectedStageCells: [number, number][] = [[stageX, stageY]];
+        if (xNeighbor !== 0) selectedStageCells.push([stageX + xNeighbor, stageY]);
+        if (yNeighbor !== 0) selectedStageCells.push([stageX, stageY + yNeighbor]);
+        if (xNeighbor !== 0 && yNeighbor !== 0)
+            selectedStageCells.push([stageX + xNeighbor, stageY + yNeighbor]);
         const wantedCells = new Set<string>();
         const wantedPacks = new Set<string>();
-        const lowRadius = Math.floor(this.renderDistance / 2);
-        const highRadius = this.renderDistance - lowRadius;
+        // The game defaults to highRadius=1 and middleRadius=2: an inner 2x2
+        // hi square plus a lo ring making a 6x6 resident footprint. We retain
+        // those exact coordinates but deliberately use each coordinate's hi
+        // payload throughout. The slider overrides the combined footprint size
+        // without affecting the independent stage-cell set.
+        const terrainDistance = this.renderDistance;
+        const lowRadius = Math.floor(terrainDistance / 2);
+        const highRadius = terrainDistance - lowRadius;
         for (let y = cellY - lowRadius; y < cellY + highRadius; y++)
             for (let x = cellX - lowRadius; x < cellX + highRadius; x++) {
                 if (x < 0 || y < 0 || x >= this.manifest.grid.width || y >= this.manifest.grid.height) continue;
                 wantedCells.add(`${x},${y}`);
+            }
+        for (const key of wantedCells) {
+                const [x, y] = key.split(',').map(Number);
+                if (x < 0 || y < 0 || x >= this.manifest.grid.width || y >= this.manifest.grid.height) continue;
                 const p = `hi/${Math.floor(y / 4).toString().padStart(2, '0')}-${Math.floor(x / 4).toString().padStart(2, '0')}.bin`;
                 if (this.available.has(p)) wantedPacks.add(p);
-            }
+        }
         for (const path of wantedPacks) {
             if (this.packs.has(path) || this.pending.has(path)) continue;
             this.pending.add(path);
@@ -185,7 +216,6 @@ class SotCRenderer implements Viewer.SceneGfx {
         // Stage activation uses a 4x4 fine subdivision of each 10x10 coarse
         // world cell. initlayout derives the placement origin from the coarse
         // index; the fine record only selects which stages are active.
-        const stageGrid = this.manifest.stageGrid;
         if (stageGrid === undefined) {
             if (!this.warnedMissingStageGrid) {
                 this.warnedMissingStageGrid = true;
@@ -193,32 +223,11 @@ class SotCRenderer implements Viewer.SceneGfx {
             }
             return;
         }
-        const fineWidth = stageGrid.coarseWidth * stageGrid.fineSide;
-        const fineHeight = stageGrid.coarseHeight * stageGrid.fineSide;
-        const fineCellSize = 6000 / fineWidth;
-        const stageFX = (3000 - input.camera.worldMatrix[12]) / fineCellSize;
         // Terrain vertices are reflected on Z while decoding, so its packed
         // cell rows increase with viewer Z. The stage context table remains
         // indexed in the game's original Z direction and therefore uses the
         // opposite sign.
-        const stageFY = (3000 - input.camera.worldMatrix[14]) / fineCellSize;
-        const stageX = Math.max(0, Math.min(fineWidth - 1, Math.floor(stageFX)));
-        const stageY = Math.max(0, Math.min(fineHeight - 1, Math.floor(stageFY)));
-        // The high+middle radius belongs to streamed map/detail data. Stage
-        // layouts use the separate current/edge/corner list maintained by the
-        // stage manager, with transitions at 0.42 and 0.58 of a fine cell.
-        const fracX = stageFX - Math.floor(stageFX), fracY = stageFY - Math.floor(stageFY);
-        const xNeighbor = fracX < 0.42 ? -1 : fracX > 0.58 ? 1 : 0;
-        const yNeighbor = fracY < 0.42 ? -1 : fracY > 0.58 ? 1 : 0;
-        // The viewer's minimum distance is an explicit debugging override:
-        // retain only the current fine stage cell. Any higher distance uses
-        // the game's ordinary edge/corner activation set.
-        const includeStageNeighbors = this.renderDistance > 2;
-        const selectedStageCells: [number, number][] = [[stageX, stageY]];
-        if (includeStageNeighbors && xNeighbor !== 0) selectedStageCells.push([stageX + xNeighbor, stageY]);
-        if (includeStageNeighbors && yNeighbor !== 0) selectedStageCells.push([stageX, stageY + yNeighbor]);
-        if (includeStageNeighbors && xNeighbor !== 0 && yNeighbor !== 0)
-            selectedStageCells.push([stageX + xNeighbor, stageY + yNeighbor]);
+        const includeStageNeighbors = true;
         const wantedStageInstances = new Set<string>();
         const wantedStageIds = new Set<number>();
         const selectedCoarseCells = new Set<string>();
@@ -260,21 +269,17 @@ class SotCRenderer implements Viewer.SceneGfx {
                 // enclosing coarse coordinate frame in initlayout.
                 const key = `${coarseKey}:${id}`;
                 wantedStageInstances.add(key);
-                if (this.stageCells.has(key) || this.pendingStages.has(key))
+                if (this.stageCells.has(key) || this.pendingStages.has(key) || this.failedStageBundles.has(id))
                     continue;
                 this.pendingStages.add(key);
                 let bundle = this.stageBundles.get(id);
                 if (bundle === undefined) {
-                    const diagnostics: StageBundleDiagnostics = {};
-                    if (id === 373 || id === 378)
-                        this.stageBundleDiagnostics.set(id, diagnostics);
                     bundle = this.context.dataFetcher.fetchData(`${pathBase}/stage/${id}.bin`)
                         .then((file) => decompress(file.createTypedArray(Uint8Array)))
                         .then((bytes) => ({
                             meshes: parseStageBundle(
                                 ArrayBufferSlice.fromView(bytes),
                                 id === 382 ? 'stage 382' : '',
-                                id === 373 || id === 378 ? diagnostics : undefined,
                             ),
                             textures: parseNto2Textures(bytes),
                         }));
@@ -296,7 +301,6 @@ class SotCRenderer implements Viewer.SceneGfx {
                         source: string;
                         meshes: number;
                         triangles: number;
-                        textures: Set<string>;
                         bounds: number[];
                     }>();
                     const focusedMeshes: NonNullable<NonNullable<ReturnType<typeof this.stageDebug.get>>['focusedMeshes']> = [];
@@ -311,13 +315,10 @@ class SotCRenderer implements Viewer.SceneGfx {
                             source: mesh.sourceName,
                             meshes: 0,
                             triangles: 0,
-                            textures: new Set<string>(),
                             bounds: [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity],
                         };
                         resource.meshes++;
                         resource.triangles += triangles;
-                        if (mesh.textureName !== null) resource.textures.add(mesh.textureName);
-                        if (mesh.secondaryTextureName !== null) resource.textures.add(mesh.secondaryTextureName);
                         resources.set(mesh.sourceName, resource);
                         const meshBounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
                         for (let i = 0; i < mesh.vertices.length; i += 14) {
@@ -334,8 +335,6 @@ class SotCRenderer implements Viewer.SceneGfx {
                         if (id === 378 && mesh.sourceName === 'nmo/home_spiral_stair.nmo') {
                             focusedMeshes.push({
                                 mesh: meshIndex,
-                                texture: mesh.textureName,
-                                secondaryTexture: mesh.secondaryTextureName,
                                 triangles,
                                 bounds: { min: meshBounds.slice(0, 3), max: meshBounds.slice(3, 6) },
                                 layer1: mesh.isLayer1,
@@ -363,7 +362,6 @@ class SotCRenderer implements Viewer.SceneGfx {
                             source: resource.source,
                             meshes: resource.meshes,
                             triangles: resource.triangles,
-                            textures: [...resource.textures].sort(),
                             bounds: resource.meshes === 0 ? null : {
                                 min: resource.bounds.slice(0, 3),
                                 max: resource.bounds.slice(3, 6),
@@ -373,7 +371,10 @@ class SotCRenderer implements Viewer.SceneGfx {
                 }).catch((error) => {
                     this.pendingStages.delete(key);
                     this.stageBundles.delete(id);
-                    console.error(`[SotC] failed to load stage bundle ${id}`, error);
+                    const firstFailure = !this.failedStageBundles.has(id);
+                    this.failedStageBundles.add(id);
+                    if (firstFailure)
+                        console.error(`[SotC] failed to load stage bundle ${id}`, error);
                 });
             }
         }
@@ -453,17 +454,17 @@ class SotCRenderer implements Viewer.SceneGfx {
             for (const geometry of geometries)
                 if (geometry.isLayer1)
                     geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
-        for (const geometries of this.stageCells.values()) {
-            for (const geometry of geometries)
-                if (geometry.isLayer1)
-                    geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
-        }
+        if (this.enableStages)
+            for (const geometries of this.stageCells.values())
+                for (const geometry of geometries)
+                    if (geometry.isLayer1)
+                        geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
         manager.setCurrentList(this.terrainList);
         for (const geometries of this.cells.values())
             for (const geometry of geometries)
                 if (!geometry.isLayer1 && !geometry.isSpecialLayer)
                     geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
-        if (this.enableProps)
+        if (this.enableStages)
             for (const geometries of this.stageCells.values())
                 for (const geometry of geometries)
                     if (!geometry.isLayer1 && !geometry.isSpecialLayer)
@@ -516,16 +517,16 @@ class SotCRenderer implements Viewer.SceneGfx {
         panel.customHeaderBackgroundColor = UI.COOL_BLUE_COLOR;
         panel.setTitle(UI.RENDER_HACKS_ICON, 'Render Hacks');
 
-        const props = new UI.Checkbox('Enable Props', this.enableProps);
-        props.onchanged = () => this.enableProps = props.checked;
-        panel.contents.appendChild(props.elem);
+        const stages = new UI.Checkbox('Enable Stages', this.enableStages);
+        stages.onchanged = () => this.enableStages = stages.checked;
+        panel.contents.appendChild(stages.elem);
 
         const bosses = new UI.Checkbox('Alive Bosses', this.aliveBosses);
         bosses.onchanged = () => this.aliveBosses = bosses.checked;
         panel.contents.appendChild(bosses.elem);
 
-        const distance = new UI.Slider('Render Distance', this.renderDistance, 2, 32);
-        distance.setRange(2, 32, 2);
+        const distance = new UI.Slider('Render Distance', this.renderDistance, 1, 32);
+        distance.setRange(1, 32, 1);
         distance.onvalue = () => {
             this.renderDistance = distance.getValue();
         };

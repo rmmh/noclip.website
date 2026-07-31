@@ -170,7 +170,7 @@ export class TerrainTextures {
                 wrapS: clampS ? GfxWrapMode.Clamp : GfxWrapMode.Repeat,
                 wrapT: clampT ? GfxWrapMode.Clamp : GfxWrapMode.Repeat,
                 minFilter: GfxTexFilterMode.Bilinear, magFilter: GfxTexFilterMode.Bilinear,
-                mipFilter: GfxMipFilterMode.Nearest, minLOD: 0, maxLOD: 0,
+                mipFilter: GfxMipFilterMode.Linear, minLOD: 0, maxLOD: 100,
             }));
         }
         this.fallback = device.createTexture(makeTextureDescriptor2D(GfxFormat.U8_RGBA_NORM, 1, 1, 1));
@@ -182,9 +182,11 @@ export class TerrainTextures {
     private addTexture(device: GfxDevice, texture: DecodedTexture): void {
         if (this.textures.has(texture.name))
             return;
-        const gfxTexture = device.createTexture(makeTextureDescriptor2D(GfxFormat.U8_RGBA_NORM, texture.width, texture.height, 1));
+        const gfxTexture = device.createTexture(makeTextureDescriptor2D(
+            GfxFormat.U8_RGBA_NORM, texture.width, texture.height, texture.levels.length,
+        ));
         device.setResourceName(gfxTexture, texture.name);
-        device.uploadTextureData(gfxTexture, 0, [texture.pixels]);
+        device.uploadTextureData(gfxTexture, 0, texture.levels);
         this.textures.set(texture.name, gfxTexture);
         this.decoded.set(texture.name, texture);
     }

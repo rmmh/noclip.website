@@ -2,6 +2,7 @@ import ArrayBufferSlice from '../ArrayBufferSlice.js';
 import { GSPixelStorageFormat, gsMemoryMapNew, gsMemoryMapReadImagePSMT4_PSMCT32, gsMemoryMapReadImagePSMT8_PSMCT32, gsMemoryMapUploadImage } from '../Common/PS2/GS.js';
 import { getVifUnpackFormatByteSize, VifCmd } from '../Common/PS2/VIF.js';
 import { mat3, mat4, quat, vec3 } from 'gl-matrix';
+import { relocateLegacyXff, type RelocatedXff } from './xff.js';
 
 export interface PackEntry {
     x: number;
@@ -147,6 +148,10 @@ export interface TerrainMesh {
     // the same triangle-list order as vertices and retained for animation.
     skinningControl?: Uint8Array;
     deformationData?: Uint32Array;
+    // Slow-object models are instantiated directly by initSlowObject. Unlike
+    // ordinary StageLayout instances, they do not receive either the
+    // StageLayout transform or the enclosing coarse-cell origin.
+    stagePlacement?: 'direct';
 }
 
 function findBytes(bytes: Uint8Array, needle: Uint8Array, start: number): number {
@@ -220,6 +225,115 @@ export interface StageBundleDiagnostics {
     models?: unknown[];
     layouts?: unknown[];
     unassociatedModels?: string[];
+}
+
+interface AnbFrameZeroTrack {
+    type: number;
+    name: string;
+    matrix: mat4;
+}
+
+function readOffsetCString(bytes: Uint8Array, offset: number): string {
+    if (offset < 0 || offset >= bytes.length)
+        throw new Error('ANB string pointer exceeds relocated XFF image');
+    let end = offset;
+    while (end < bytes.length && bytes[end] !== 0) end++;
+    if (end === bytes.length)
+        throw new Error('ANB string is not terminated');
+    return ascii(bytes, offset, end - offset);
+}
+
+function decodeAnbVector(view: DataView, pointer: number, mode: number, scale: boolean): vec3 {
+    if (pointer === 0)
+        return scale ? vec3.fromValues(1, 1, 1) : vec3.create();
+    if (pointer < 0 || pointer + 12 > view.byteLength)
+        throw new Error('ANB vector pointer exceeds relocated XFF image');
+    if (mode === 0 || mode === 1 || mode > 3)
+        return vec3.fromValues(
+            view.getFloat32(pointer, true),
+            view.getFloat32(pointer + 4, true),
+            view.getFloat32(pointer + 8, true),
+        );
+    if (pointer + 0x1C > view.byteLength)
+        throw new Error('ANB quantized vector header exceeds relocated XFF image');
+    const samples = view.getUint32(pointer + 0x18, true);
+    let x: number, y: number, z: number;
+    if (mode === 2) {
+        if (samples + (scale ? 4 : 6) > view.byteLength)
+            throw new Error('ANB quantized vector sample exceeds relocated XFF image');
+        if (scale) {
+            const packed = view.getUint32(samples, true);
+            x = packed >>> 21;
+            y = packed >>> 10 & 0x7FF;
+            z = packed & 0x3FF;
+            return vec3.fromValues(
+                view.getFloat32(pointer, true) + x * view.getFloat32(pointer + 4, true) / 2047,
+                view.getFloat32(pointer + 8, true) + y * view.getFloat32(pointer + 0x0C, true) / 2047,
+                view.getFloat32(pointer + 0x10, true) + z * view.getFloat32(pointer + 0x14, true) / 1023,
+            );
+        }
+        x = view.getInt16(samples, true);
+        y = view.getInt16(samples + 2, true);
+        z = view.getInt16(samples + 4, true);
+        return vec3.fromValues(
+            view.getFloat32(pointer, true) + x * view.getFloat32(pointer + 4, true) / 32767,
+            view.getFloat32(pointer + 8, true) + y * view.getFloat32(pointer + 0x0C, true) / 32767,
+            view.getFloat32(pointer + 0x10, true) + z * view.getFloat32(pointer + 0x14, true) / 32767,
+        );
+    }
+    if (!scale)
+        return vec3.fromValues(
+            view.getFloat32(pointer, true),
+            view.getFloat32(pointer + 4, true),
+            view.getFloat32(pointer + 8, true),
+        );
+    if (samples + 2 > view.byteLength)
+        throw new Error('ANB quantized scale sample exceeds relocated XFF image');
+    const packed = view.getUint16(samples, true);
+    return vec3.fromValues(
+        view.getFloat32(pointer, true) + (packed >>> 11) * view.getFloat32(pointer + 4, true) / 31,
+        view.getFloat32(pointer + 8, true) + (packed >>> 5 & 0x3F) * view.getFloat32(pointer + 0x0C, true) / 31,
+        view.getFloat32(pointer + 0x10, true) + (packed & 0x1F) * view.getFloat32(pointer + 0x14, true) / 31,
+    );
+}
+
+function decodeAnbFrameZero(module: RelocatedXff): AnbFrameZeroTrack[] {
+    const bytes = module.image.createTypedArray(Uint8Array);
+    const view = module.image.createDataView();
+    const root = module.entryOffset;
+    if (root <= 0 || root + 0x18 > view.byteLength)
+        throw new Error('Invalid relocated ANB root');
+    const descriptors = view.getUint32(root + 0x10, true);
+    const count = view.getUint32(root + 0x14, true);
+    if (count > 0x10000 || descriptors + count * 0x0C > view.byteLength)
+        throw new Error('Invalid relocated ANB track table');
+    const tracks: AnbFrameZeroTrack[] = [];
+    const reflectZ = mat4.fromScaling(mat4.create(), [1, 1, -1]);
+    for (let i = 0; i < count; i++) {
+        const descriptor = descriptors + i * 0x0C;
+        const type = view.getUint32(descriptor, true);
+        const name = readOffsetCString(bytes, view.getUint32(descriptor + 4, true));
+        const track = view.getUint32(descriptor + 8, true);
+        if (track + 0x10 > view.byteLength)
+            throw new Error('ANB transform track exceeds relocated XFF image');
+        const position = decodeAnbVector(view, view.getUint32(track + 4, true), view.getUint8(track + 2), false);
+        const rotationPointer = view.getUint32(track + 8, true);
+        const rotation = quat.create();
+        if (rotationPointer !== 0) {
+            if (view.getUint8(track + 1) !== 0 || rotationPointer + 0x10 > view.byteLength)
+                throw new Error(`Unsupported frame-zero ANB quaternion mode ${view.getUint8(track + 1)}`);
+            quat.set(rotation,
+                view.getFloat32(rotationPointer, true), view.getFloat32(rotationPointer + 4, true),
+                view.getFloat32(rotationPointer + 8, true), view.getFloat32(rotationPointer + 0x0C, true));
+            quat.normalize(rotation, rotation);
+        }
+        const scale = decodeAnbVector(view, view.getUint32(track + 0x0C, true), view.getUint8(track), true);
+        const gameMatrix = mat4.fromRotationTranslationScale(mat4.create(), rotation, position, scale);
+        const viewerMatrix = mat4.multiply(mat4.create(), reflectZ, gameMatrix);
+        mat4.multiply(viewerMatrix, viewerMatrix, reflectZ);
+        tracks.push({ type, name, matrix: viewerMatrix });
+    }
+    return tracks;
 }
 
 export function parseStageBundle(
@@ -330,6 +444,7 @@ export function parseStageBundle(
     }
 
     const models = new Map<string, TerrainMesh[]>();
+    const animations = new Map<string, AnbFrameZeroTrack[]>();
     const modelInventory: {
         source: string;
         moduleOffset: string;
@@ -347,6 +462,23 @@ export function parseStageBundle(
         const prefix = ascii(bytes, Math.max(0, start - 512), Math.min(512, start));
         const paths = [...prefix.matchAll(/(?:nmo\/)?[A-Za-z0-9_./-]+\.nmo\x00/g)];
         const sourceName = paths.length === 0 ? '' : paths[paths.length - 1][0].slice(0, -1);
+        const animationPaths = [...prefix.matchAll(/anim\/[A-Za-z0-9_./-]+\.anb\x00/g)];
+        const animationMatch = animationPaths[animationPaths.length - 1];
+        const animationDistance = animationMatch === undefined ? Infinity :
+            prefix.length - (animationMatch.index + animationMatch[0].length);
+        const animationPath = animationDistance > 0x40 ? '' :
+            animationMatch[0].slice(0, -1).toLowerCase();
+        if (animationPath !== '') {
+            try {
+                const relocated = relocateLegacyXff(sheet);
+                animations.set(animationPath, decodeAnbFrameZero(relocated));
+            } catch (error) {
+                // Not every .anb resource is an object-transform animation.
+                // Only retain modules with the AnimationResource root shape.
+                if (debugLabel !== '')
+                    console.warn(`[SotC] skipped non-object ANB ${animationPath} at 0x${start.toString(16)}`, error);
+            }
+        }
         const meshes = parseTerrainCell(sheet, sourceName);
         if (sourceName !== '' || meshes.some((mesh) => mesh.vertices.length !== 0)) {
             const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
@@ -377,6 +509,7 @@ export function parseStageBundle(
         console.warn(`[SotC] ${debugLabel} stage bundle resources`, {
             layoutInstances: stageLayouts.length,
             renderableModels: models.size,
+            animations: [...animations].map(([path, tracks]) => ({ path, tracks: tracks.length })),
             resources: modelInventory,
             rawBounds: modelInventory.map(({ source, bounds }) =>
                 `${source}: ${bounds === null ? 'empty' : `${bounds.min.join(',')} .. ${bounds.max.join(',')}`}`),
@@ -407,10 +540,17 @@ export function parseStageBundle(
         return symbols.find((symbol) =>
             symbol.moduleStart === sheet.moduleStart && symbol.name === wanted);
     };
-    const ownedModelPaths = (rootHash: number): { paths: Set<string>; trace: unknown[] } => {
+    const ownedModelPaths = (rootHash: number): {
+        paths: Set<string>;
+        animatedChildren: { path: string; matrix: mat4 }[];
+        trace: unknown[];
+        directPlacement: boolean;
+    } => {
         const paths = new Set<string>();
+        const animatedChildren: { path: string; matrix: mat4 }[] = [];
         const visited = new Set<number>();
         const trace: unknown[] = [];
+        let directPlacement = false;
         const visit = (hash: number): void => {
             if (visited.has(hash)) {
                 trace.push({ hash: `0x${hash.toString(16)}`, result: 'already visited' });
@@ -427,6 +567,13 @@ export function parseStageBundle(
                 trace.push({ hash: `0x${hash.toString(16)}`, sheet: sheet.name, result: 'element symbol not found' });
                 return;
             }
+            // GAMECORE's initSlowObject consumes definitions of this exported
+            // type through its dedicated slow-object list. It resolves the
+            // contained GameObject -> LayoutObjDef -> DispObjDef reference and
+            // passes the model directly to CreateLayoutObjVU0Secure; no
+            // StageLayout matrix is read. Preserve that distinct init path.
+            if (element.name.startsWith('_LayoutObjDefSLOWOBJ_'))
+                directPlacement = true;
             if (element.name.includes('DispObjDef') ||
                 element.name.startsWith('_ScriptCharObjDef') ||
                 element.name.startsWith('_AnimObjDef'))
@@ -457,6 +604,29 @@ export function parseStageBundle(
                 // layout from +0x28. The animation-definition references at
                 // +0x04/+0x08 subsequently drive that layout's child state.
                 fields = [element.body + 0x28];
+                const seenAnimations = new Set<string>();
+                for (const field of [element.body + 4, element.body + 8]) {
+                    const target = packedTarget(field);
+                    const animationSheet = target === null ? undefined : sheets.get(target.hash);
+                    const animationElement = animationSheet === undefined ? undefined : symbolForSheet(animationSheet);
+                    if (animationElement === undefined)
+                        continue;
+                    const searchEnd = Math.min(bytes.length,
+                        animationElement.body + animationElement.byteSize + 0x100);
+                    const text = ascii(bytes, animationElement.body, searchEnd - animationElement.body);
+                    for (const match of text.matchAll(/anim\/[A-Za-z0-9_./-]+\.anb\x00/g)) {
+                        const animationPath = match[0].slice(0, -1).toLowerCase();
+                        if (seenAnimations.has(animationPath))
+                            continue;
+                        seenAnimations.add(animationPath);
+                        for (const track of animations.get(animationPath) ?? []) {
+                            if (track.type !== 1 && track.type !== 5)
+                                continue;
+                            const path = `${track.name.replace(/^nmo\//, '')}.nmo`.toLowerCase();
+                            animatedChildren.push({ path, matrix: track.matrix });
+                        }
+                    }
+                }
             } else {
                 fields = [];
             }
@@ -505,25 +675,39 @@ export function parseStageBundle(
             }
         };
         visit(rootHash);
-        return { paths, trace };
+        return { paths, animatedChildren, trace, directPlacement };
     };
     const output: TerrainMesh[] = [];
     const associations = [];
     const associatedModels = new Set<string>();
     for (const layout of stageLayouts) {
-        const { paths, trace } = ownedModelPaths(layout.targetHash);
+        const { paths, animatedChildren, trace, directPlacement } = ownedModelPaths(layout.targetHash);
         associations.push({
             targetHash: `0x${layout.targetHash.toString(16)}`,
             target: sheets.get(layout.targetHash)?.name ?? `0x${layout.targetHash.toString(16)}`,
             models: [...paths],
+            animatedChildren: animatedChildren.map((child) => child.path),
+            placement: directPlacement ? 'direct' : 'stage-layout',
             trace,
         });
         for (const path of paths) {
             const model = models.get(path);
             if (model === undefined) continue;
             associatedModels.add(path);
+            for (const mesh of model) {
+                if (directPlacement)
+                    output.push({ ...mesh, isProp: true, stagePlacement: 'direct' });
+                else
+                    output.push(transformMesh(mesh, layout.matrix));
+            }
+        }
+        for (const child of animatedChildren) {
+            const model = models.get(child.path);
+            if (model === undefined) continue;
+            associatedModels.add(child.path);
+            const childMatrix = mat4.multiply(mat4.create(), layout.matrix, child.matrix);
             for (const mesh of model)
-                output.push(transformMesh(mesh, layout.matrix));
+                output.push(transformMesh(mesh, childMatrix));
         }
     }
     if (diagnostics !== undefined) {
@@ -540,7 +724,7 @@ export function placeStageBundle(meshes: TerrainMesh[], cellOriginX: number, cel
     // initlayout's game-space coarse origin has already been converted to the
     // viewer's reflected-Z grid by the caller.
     const translation = mat4.fromTranslation(mat4.create(), [cellOriginX, 0, cellOriginZ]);
-    return meshes.map((mesh) => transformMesh(mesh, translation));
+    return meshes.map((mesh) => mesh.stagePlacement === 'direct' ? mesh : transformMesh(mesh, translation));
 }
 
 function readNames(bytes: Uint8Array, start: number, end: number): string[] {
@@ -730,7 +914,7 @@ export function parseTerrainCell(buffer: ArrayBufferSlice, sourceNameHint = ''):
         const output = outputs.get(key) ?? {
             textureName,
             secondaryTextureName,
-            // Terrain-cell NMO geometry is never controlled by Enable Props.
+            // Terrain-cell NMO geometry is never controlled by Enable Stages.
             // Stage-layout ownership is assigned by parseStageBundle.
             isProp: false,
             isLayer1,
@@ -1005,6 +1189,7 @@ export interface DecodedTexture {
     width: number;
     height: number;
     pixels: Uint8Array;
+    levels: Uint8Array[];
     alphaTest: number;
     alphaReference: number;
     alphaFail: number;
@@ -1041,7 +1226,8 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
         const alphaTest = data.getUint32(offset + 0x80, true);
         const alphaReference = data.getUint32(offset + 0x84, true);
         const alphaFail = data.getUint32(offset + 0x88, true);
-        const baseMipUsesPsmct32Transfer = (payload[offset + 0x1F] & 0x01) !== 0;
+        const mipTransferModes = payload[offset + 0x1F];
+        const mipCount = Math.max(1, (packed >>> 12) & 0x07);
         const width = 1 << (data.getUint16(offset + 0x1E, true) & 0x0F);
         const height = 1 << ((packed >>> 20) & 0x0F);
         const paletteBytes = psm === 0x14 ? 0x40 : psm === 0x13 ? 0x400 : 0;
@@ -1050,25 +1236,10 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
         while (nameEnd < payload.length && payload[nameEnd] !== 0 && nameEnd - nameStart < 256) nameEnd++;
         if (pixelOffset < 0x20 || paletteOffset < pixelOffset || nameEnd >= payload.length) { offset += 4; continue; }
         const name = ascii(payload, nameStart, nameEnd - nameStart).replace(/\.nto$/i, '');
-        const pixels = new Uint8Array(width * height * 4);
+        const levels: Uint8Array[] = [];
         const palette = offset + paletteOffset;
+        let mipPixelOffset = offset + pixelOffset;
         if (psm === GSPixelStorageFormat.PSMT4 || psm === GSPixelStorageFormat.PSMT8) {
-            const tbw = Math.max(1, Math.ceil(width / 64));
-            const texels = ArrayBufferSlice.fromView(payload.subarray(offset + pixelOffset, offset + paletteOffset));
-            // texTransResolve tests one bit per mip at NTO2 +0x1f. A set bit
-            // uploads indexed texels as PSMCT32 using the reduced transfer
-            // dimensions below, then samples that memory with the declared
-            // indexed PSM. A clear bit uploads directly in the declared PSM.
-            if (baseMipUsesPsmct32Transfer)
-                gsMemoryMapUploadImage(
-                    gsMap, GSPixelStorageFormat.PSMCT32, textureBasePointer, Math.max(1, tbw >>> 1),
-                    0, 0, width >>> 1, height >>> (psm === GSPixelStorageFormat.PSMT4 ? 2 : 1), texels,
-                );
-            else
-                gsMemoryMapUploadImage(
-                    gsMap, psm, textureBasePointer, tbw,
-                    0, 0, width, height, texels,
-                );
             const paletteWidth = psm === GSPixelStorageFormat.PSMT4 ? 8 : 16;
             const paletteHeight = psm === GSPixelStorageFormat.PSMT4 ? 2 : 16;
             gsMemoryMapUploadImage(
@@ -1076,25 +1247,56 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
                 0, 0, paletteWidth, paletteHeight,
                 ArrayBufferSlice.fromView(payload.subarray(palette, palette + paletteBytes)),
             );
-            if (psm === GSPixelStorageFormat.PSMT4)
-                gsMemoryMapReadImagePSMT4_PSMCT32(
-                    pixels, gsMap, textureBasePointer, tbw, width, height,
-                    paletteBasePointer, 0, -1,
-                );
-            else
-                gsMemoryMapReadImagePSMT8_PSMCT32(
-                    pixels, gsMap, textureBasePointer, tbw, width, height,
-                    paletteBasePointer, -1,
-                );
+            for (let level = 0; level < mipCount; level++) {
+                const mipWidth = Math.max(1, width >>> level);
+                const mipHeight = Math.max(1, height >>> level);
+                const mipBytes = psm === GSPixelStorageFormat.PSMT4 ? Math.ceil(mipWidth * mipHeight / 2) : mipWidth * mipHeight;
+                if (mipPixelOffset + mipBytes > offset + paletteOffset) break;
+                const pixels = new Uint8Array(mipWidth * mipHeight * 4);
+                const tbw = Math.max(1, Math.ceil(mipWidth / 64));
+                const texels = ArrayBufferSlice.fromView(payload.subarray(mipPixelOffset, mipPixelOffset + mipBytes));
+                // texTransResolve tests one bit per mip at NTO2 +0x1f. A set
+                // bit uploads indexed bytes as PSMCT32 at reduced dimensions,
+                // then samples the same GS memory using the declared PSM.
+                if ((mipTransferModes & (1 << level)) !== 0)
+                    gsMemoryMapUploadImage(
+                        gsMap, GSPixelStorageFormat.PSMCT32, textureBasePointer, Math.max(1, tbw >>> 1),
+                        0, 0, Math.max(1, mipWidth >>> 1),
+                        Math.max(1, mipHeight >>> (psm === GSPixelStorageFormat.PSMT4 ? 2 : 1)), texels,
+                    );
+                else
+                    gsMemoryMapUploadImage(gsMap, psm, textureBasePointer, tbw, 0, 0, mipWidth, mipHeight, texels);
+                if (psm === GSPixelStorageFormat.PSMT4)
+                    gsMemoryMapReadImagePSMT4_PSMCT32(
+                        pixels, gsMap, textureBasePointer, tbw, mipWidth, mipHeight,
+                        paletteBasePointer, 0, -1,
+                    );
+                else
+                    gsMemoryMapReadImagePSMT8_PSMCT32(
+                        pixels, gsMap, textureBasePointer, tbw, mipWidth, mipHeight,
+                        paletteBasePointer, -1,
+                    );
+                levels.push(pixels);
+                mipPixelOffset += mipBytes;
+            }
         } else if (psm === GSPixelStorageFormat.PSMCT32) {
-            for (let i = 0; i < width * height; i++) {
-                const src = offset + pixelOffset + i * 4;
-                pixels.set(payload.subarray(src, src + 4), i * 4);
-                pixels[i * 4 + 3] = Math.min(0xFF, pixels[i * 4 + 3] * 2);
+            for (let level = 0; level < mipCount; level++) {
+                const mipWidth = Math.max(1, width >>> level);
+                const mipHeight = Math.max(1, height >>> level);
+                const mipBytes = mipWidth * mipHeight * 4;
+                if (mipPixelOffset + mipBytes > offset + paletteOffset) break;
+                const pixels = new Uint8Array(mipBytes);
+                for (let i = 0; i < mipWidth * mipHeight; i++) {
+                    const src = mipPixelOffset + i * 4;
+                    pixels.set(payload.subarray(src, src + 4), i * 4);
+                    pixels[i * 4 + 3] = Math.min(0xFF, pixels[i * 4 + 3] * 2);
+                }
+                levels.push(pixels);
+                mipPixelOffset += mipBytes;
             }
         } else { offset = nameEnd + 1; continue; }
-        if (name.length !== 0 && !textures.has(name))
-            textures.set(name, { name, width, height, pixels, alphaTest, alphaReference, alphaFail });
+        if (name.length !== 0 && levels.length !== 0 && !textures.has(name))
+            textures.set(name, { name, width, height, pixels: levels[0], levels, alphaTest, alphaReference, alphaFail });
         offset = nameEnd + 1;
     }
     return [...textures.values()];
