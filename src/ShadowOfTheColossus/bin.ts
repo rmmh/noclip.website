@@ -787,6 +787,13 @@ export function parseStageBundle(
                 hash: `0x${hash.toString(16)}`,
                 sheet: sheet.name,
                 element: element.name,
+                elementBody: `0x${element.body.toString(16)}`,
+                ...((element.name.includes('Slow') || element.name.includes('SLOW')) ? {
+                    elementWords: Array.from(
+                        { length: Math.min(0x20, Math.floor(element.byteSize / 4)) },
+                        (_, i) => `0x${data.getUint32(element.body + i * 4, true).toString(16)}`,
+                    ),
+                } : {}),
                 modulePaths: element.modulePaths,
                 followedFields: targets,
                 result: fields.length === 0 ? 'unsupported/static leaf' : 'traversed',

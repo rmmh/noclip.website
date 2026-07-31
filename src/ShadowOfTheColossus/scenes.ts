@@ -94,6 +94,7 @@ class SotCRenderer implements Viewer.SceneGfx {
     private renderDistance = 6;
     private warnedMissingStageGrid = false;
     private lastStageCell = '';
+    private slowGridCell: [number, number] | null = null;
     private streamingDebug: Record<string, unknown> | null = null;
 
     private onKeyDown = (event: KeyboardEvent): void => {
@@ -163,11 +164,41 @@ class SotCRenderer implements Viewer.SceneGfx {
         const fracX = stageFX - Math.floor(stageFX), fracY = stageFY - Math.floor(stageFY);
         const xNeighbor = fracX < edgeLow ? -1 : fracX > edgeHigh ? 1 : 0;
         const yNeighbor = fracY < edgeLow ? -1 : fracY > edgeHigh ? 1 : 0;
+        // SlowCellSelectionUpdate uses a separate grid whose cells span two
+        // 150-unit stage-context cells. It retains the previous coarse cell
+        // only within 20 world units of a boundary.
+        const slowFineSpan = 2;
+        const slowCellSize = fineCellSize * slowFineSpan;
+        const slowWorldX = stageFX * fineCellSize;
+        const slowWorldY = stageFY * fineCellSize;
+        let slowX = Math.floor(slowWorldX / slowCellSize);
+        let slowY = Math.floor(slowWorldY / slowCellSize);
+        if (this.slowGridCell !== null) {
+            const remX = slowWorldX - slowX * slowCellSize;
+            const remY = slowWorldY - slowY * slowCellSize;
+            if (slowX < this.slowGridCell[0] && remX > slowCellSize - 20) slowX++;
+            else if (this.slowGridCell[0] < slowX && remX < 20) slowX--;
+            if (slowY < this.slowGridCell[1] && remY > slowCellSize - 20) slowY++;
+            else if (this.slowGridCell[1] < slowY && remY < 20) slowY--;
+        }
+        const slowGridWidth = Math.ceil(fineWidth / slowFineSpan);
+        const slowGridHeight = Math.ceil(fineHeight / slowFineSpan);
+        this.slowGridCell = [
+            Math.max(0, Math.min(slowGridWidth - 1, slowX)),
+            Math.max(0, Math.min(slowGridHeight - 1, slowY)),
+        ];
+        const slowStageCell: [number, number] = [
+            this.slowGridCell[0] * slowFineSpan,
+            this.slowGridCell[1] * slowFineSpan,
+        ];
         const selectedStageCells: [number, number][] = [[stageX, stageY]];
         if (xNeighbor !== 0) selectedStageCells.push([stageX + xNeighbor, stageY]);
         if (yNeighbor !== 0) selectedStageCells.push([stageX, stageY + yNeighbor]);
         if (xNeighbor !== 0 && yNeighbor !== 0)
             selectedStageCells.push([stageX + xNeighbor, stageY + yNeighbor]);
+        const ordinaryStageCells = new Set(selectedStageCells.map(([x, y]) => `${x},${y}`));
+        if (!ordinaryStageCells.has(`${slowStageCell[0]},${slowStageCell[1]}`))
+            selectedStageCells.push(slowStageCell);
         const wantedCells = new Set<string>();
         const wantedPacks = new Set<string>();
         // The game defaults to highRadius=1 and middleRadius=2: an inner 2x2
@@ -254,13 +285,17 @@ class SotCRenderer implements Viewer.SceneGfx {
             const coarseY = Math.floor(y / stageGrid.fineSide);
             const coarseKey = `${coarseX},${coarseY}`;
             const fineCell = stageGrid.fineCells[y * fineWidth + x];
-            const coarseStages = stageGrid.coarseCells[coarseY * stageGrid.coarseWidth + coarseX] ?? [];
-            const stages = fineCell?.stages ?? [];
-            const bossStages = this.aliveBosses ? fineCell?.aliveBosses ?? [] : fineCell?.deadBosses ?? [];
+            const ordinarySelected = ordinaryStageCells.has(`${x},${y}`);
+            const coarseStages = ordinarySelected
+                ? stageGrid.coarseCells[coarseY * stageGrid.coarseWidth + coarseX] ?? [] : [];
+            const stages = ordinarySelected ? fineCell?.stages ?? [] : [];
+            const bossStages = ordinarySelected
+                ? (this.aliveBosses ? fineCell?.aliveBosses ?? [] : fineCell?.deadBosses ?? []) : [];
             // SlowCellSelectionUpdate maintains one independent fine-cell
             // selection. Its +0x34 stage is a fixed world-space backdrop, not
             // an ordinary StageLayout contribution from every neighbor.
-            const slowStages = x === stageX && y === stageY ? fineCell?.slowStages ?? [] : [];
+            const slowStages = x === slowStageCell[0] && y === slowStageCell[1]
+                ? fineCell?.slowStages ?? [] : [];
             const ids = [
                 ...coarseStages,
                 ...stages,
@@ -429,6 +464,7 @@ class SotCRenderer implements Viewer.SceneGfx {
                 includeNeighbors: includeStageNeighbors,
                 floatingCell: [stageFX, stageFY],
                 cell: [stageX, stageY],
+                slowCell: slowStageCell,
                 enclosingCoarseCell: [
                     Math.floor(stageX / stageGrid.fineSide),
                     Math.floor(stageY / stageGrid.fineSide),
@@ -513,13 +549,18 @@ class SotCRenderer implements Viewer.SceneGfx {
         const clear = makeAttachmentClearDescriptor(colorNewFromRGBA(0.48, 0.58, 0.62, 1));
         const builder = this.helper.renderGraph.newGraphBuilder();
         const color = builder.createRenderTargetID(makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, input, clear), 'Main Color');
+        // The game draws display layer 1 (sky and SLOWMODEL geometry) with
+        // normal depth testing, then bgEnd clears depth before layers 2/5.
+        // Separate transient depth targets reproduce that boundary while
+        // preserving the layer-1 color buffer.
+        const backgroundDepth = builder.createRenderTargetID(makeBackbufferDescSimple(GfxrAttachmentSlot.DepthStencil, input, clear), 'Background Depth');
         const depth = builder.createRenderTargetID(makeBackbufferDescSimple(GfxrAttachmentSlot.DepthStencil, input, clear), 'Main Depth');
         builder.pushPass((pass) => {
-            // modelGetDlLayer maps the 0x4106/0x4186 SRFs to layer 1,
+            // modelGetDlLayer maps the 0x4086/0x4186 SRFs to layer 1,
             // before ordinary world geometry.
             pass.setDebugName('Display Layer 1');
             pass.attachRenderTargetID(GfxrAttachmentSlot.Color0, color);
-            pass.attachRenderTargetID(GfxrAttachmentSlot.DepthStencil, depth);
+            pass.attachRenderTargetID(GfxrAttachmentSlot.DepthStencil, backgroundDepth);
             pass.exec((renderer) => this.skyList.drawOnPassRenderer(this.helper.renderCache, renderer));
         });
         builder.pushPass((pass) => {
