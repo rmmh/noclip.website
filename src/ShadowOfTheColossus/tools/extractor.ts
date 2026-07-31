@@ -189,6 +189,7 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
     const coarse = Array.from({ length: 100 }, () => new Set<number>());
     const fine = Array.from({ length: 1600 }, () => ({
         stages: new Set<number>(), aliveBosses: new Set<number>(), deadBosses: new Set<number>(),
+        slowStages: new Set<number>(),
     }));
     for (let at = data.indexOf('xff2'); at >= 0; at = data.indexOf('xff2', at + 4)) {
         const xff = data.subarray(at);
@@ -230,6 +231,7 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
                     for (const [o, set] of [
                         [0, cell.stages], [8, cell.stages], [12, cell.stages], [16, cell.stages],
                         [20, cell.aliveBosses], [28, cell.deadBosses],
+                        [52, cell.slowStages],
                     ] as const) {
                         const token = body.readUInt32LE(n * 0x3c + o);
                         if (token) set.add((token >>> 18) & 0xfff);
@@ -243,6 +245,7 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
         stages: [...cell.stages].sort((a, b) => a - b),
         aliveBosses: [...cell.aliveBosses].sort((a, b) => a - b),
         deadBosses: [...cell.deadBosses].sort((a, b) => a - b),
+        slowStages: [...cell.slowStages].sort((a, b) => a - b),
     }));
     return {
         coarseWidth: 10,
@@ -251,7 +254,7 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
         coarseCells,
         fineCells,
         ids: [...new Set([...coarseCells.flat(), ...fineCells.flatMap((cell) =>
-            [...cell.stages, ...cell.aliveBosses, ...cell.deadBosses])])].sort((a, b) => a - b),
+            [...cell.stages, ...cell.aliveBosses, ...cell.deadBosses, ...cell.slowStages])])].sort((a, b) => a - b),
     };
 }
 

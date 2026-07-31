@@ -27,6 +27,7 @@ interface Manifest {
             stages: number[];
             aliveBosses: number[];
             deadBosses: number[];
+            slowStages?: number[];
         }[];
     };
 }
@@ -85,6 +86,7 @@ class SotCRenderer implements Viewer.SceneGfx {
     private available: Set<string>;
     private destroyed = false;
     private enableStages = true;
+    private enableSlowStages = true;
     private aliveBosses = true;
     // Literal terrain-cell footprint width. The game defaults to a 6x6
     // resident square (2x2 hi center plus a two-cell lo ring); this viewer uses
@@ -242,6 +244,7 @@ class SotCRenderer implements Viewer.SceneGfx {
             coarseStages: number[];
             stages: number[];
             bossStages: number[];
+            slowStages: number[];
             combined: number[];
         }[] = [];
         for (const [x, y] of selectedStageCells) {
@@ -254,6 +257,10 @@ class SotCRenderer implements Viewer.SceneGfx {
             const coarseStages = stageGrid.coarseCells[coarseY * stageGrid.coarseWidth + coarseX] ?? [];
             const stages = fineCell?.stages ?? [];
             const bossStages = this.aliveBosses ? fineCell?.aliveBosses ?? [] : fineCell?.deadBosses ?? [];
+            // SlowCellSelectionUpdate maintains one independent fine-cell
+            // selection. Its +0x34 stage is a fixed world-space backdrop, not
+            // an ordinary StageLayout contribution from every neighbor.
+            const slowStages = x === stageX && y === stageY ? fineCell?.slowStages ?? [] : [];
             const ids = [
                 ...coarseStages,
                 ...stages,
@@ -265,14 +272,18 @@ class SotCRenderer implements Viewer.SceneGfx {
                 coarseStages,
                 stages,
                 bossStages,
-                combined: [...new Set(ids)].sort((a, b) => a - b),
+                slowStages,
+                combined: [...new Set([...ids, ...slowStages])].sort((a, b) => a - b),
             });
             selectedCoarseCells.add(coarseKey);
-            for (const id of ids) {
+            const instances = [
+                ...ids.map((id) => ({ id, key: `${coarseKey}:${id}`, slowOnly: false })),
+                ...slowStages.map((id) => ({ id, key: `slow:${id}`, slowOnly: true })),
+            ];
+            for (const { id, key, slowOnly } of instances) {
                 wantedStageIds.add(id);
                 // References from all four-by-four fine records share the
                 // enclosing coarse coordinate frame in initlayout.
-                const key = `${coarseKey}:${id}`;
                 wantedStageInstances.add(key);
                 if (this.stageCells.has(key) || this.pendingStages.has(key) || this.failedStageBundles.has(id))
                     continue;
@@ -303,7 +314,10 @@ class SotCRenderer implements Viewer.SceneGfx {
                     const coarseCellSize = 6000 / stageGrid.coarseWidth;
                     const originX = 3000 - (coarseX + 0.5) * coarseCellSize;
                     const originZ = 3000 - (coarseY + 0.5) * coarseCellSize;
-                    const placedMeshes = placeStageBundle(meshes, originX, originZ);
+                    const selectedMeshes = slowOnly
+                        ? meshes.filter((mesh) => mesh.stagePlacement === 'direct')
+                        : meshes;
+                    const placedMeshes = placeStageBundle(selectedMeshes, originX, originZ);
                     this.stageCells.set(key, placedMeshes.filter((mesh) => mesh.vertices.length !== 0)
                         .map((mesh) => new TerrainGeometry(device, mesh, this.textures)));
                     const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
@@ -475,8 +489,8 @@ class SotCRenderer implements Viewer.SceneGfx {
             for (const geometry of geometries)
                 if (geometry.isLayer1)
                     geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
-        if (this.enableStages)
-            for (const geometries of this.stageCells.values())
+        for (const [key, geometries] of this.stageCells)
+            if (key.startsWith('slow:') ? this.enableSlowStages : this.enableStages)
                 for (const geometry of geometries)
                     if (geometry.isLayer1)
                         geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
@@ -485,8 +499,8 @@ class SotCRenderer implements Viewer.SceneGfx {
             for (const geometry of geometries)
                 if (!geometry.isLayer1 && !geometry.isSpecialLayer)
                     geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
-        if (this.enableStages)
-            for (const geometries of this.stageCells.values())
+        for (const [key, geometries] of this.stageCells)
+            if (key.startsWith('slow:') ? this.enableSlowStages : this.enableStages)
                 for (const geometry of geometries)
                     if (!geometry.isLayer1 && !geometry.isSpecialLayer)
                         geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
@@ -538,9 +552,13 @@ class SotCRenderer implements Viewer.SceneGfx {
         panel.customHeaderBackgroundColor = UI.COOL_BLUE_COLOR;
         panel.setTitle(UI.RENDER_HACKS_ICON, 'Render Hacks');
 
-        const stages = new UI.Checkbox('Enable Stages', this.enableStages);
+        const stages = new UI.Checkbox('Show Stages', this.enableStages);
         stages.onchanged = () => this.enableStages = stages.checked;
         panel.contents.appendChild(stages.elem);
+
+        const slowStages = new UI.Checkbox('Show Slow Stages', this.enableSlowStages);
+        slowStages.onchanged = () => this.enableSlowStages = slowStages.checked;
+        panel.contents.appendChild(slowStages.elem);
 
         const bosses = new UI.Checkbox('Alive Bosses', this.aliveBosses);
         bosses.onchanged = () => this.aliveBosses = bosses.checked;

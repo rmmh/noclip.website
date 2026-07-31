@@ -612,6 +612,10 @@ export function parseStageBundle(
             // StageLayout matrix is read. Preserve that distinct init path.
             if (element.name.startsWith('_LayoutObjDefSLOWOBJ_'))
                 directPlacement = true;
+            if (element.name.startsWith('_SlowGroupNameDef') ||
+                element.name.startsWith('_SlowGroupDef') ||
+                element.name.startsWith('_SlowObjDef'))
+                directPlacement = true;
             if (element.name.includes('DispObjDef') ||
                 element.name.startsWith('_ScriptCharObjDef') ||
                 element.name.startsWith('_AnimObjDef'))
@@ -622,6 +626,20 @@ export function parseStageBundle(
                 // StageLayoutInstanceCreate resolves GameObject +0x10. The
                 // exported element symbol begins at that field.
                 fields = [element.body];
+            } else if (element.name.startsWith('_SlowGroupNameDef') ||
+                       element.name.startsWith('_SlowGroupDef')) {
+                // The +0x34 seamless-cell reference resolves to this group.
+                // Its serialized body owns a count/list of SlowObjDef sheet
+                // references; follow all valid packed references because the
+                // exported symbol may cover more than one group variant.
+                fields = Array.from(
+                    { length: Math.floor(element.byteSize / 4) },
+                    (_, index) => element.body + index * 4,
+                ).filter((field) => packedTarget(field) !== null);
+            } else if (element.name.startsWith('_SlowObjDef')) {
+                // initSlowObject walks 0x0c-byte entries and resolves the
+                // LayoutObjDef reference stored at entry +0x04.
+                fields = [element.body + 4];
             } else if (element.name.startsWith('_LayoutObjDef')) {
                 // Each 0x18-byte layout definition selects its display object
                 // at +0x04. Multiple definitions share one typed sheet.
