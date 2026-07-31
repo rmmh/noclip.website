@@ -216,7 +216,17 @@ function readSrfGsRegister(data: DataView, surface: number, wantedAddress: numbe
 // all models and all layout instances in one streamed bundle have the same
 // lifetime, so retaining both lists is also a safe static-viewer fallback for
 // bundles which import a prototype through an unsupported object class.
-export function parseStageBundle(buffer: ArrayBufferSlice, debugLabel = ''): TerrainMesh[] {
+export interface StageBundleDiagnostics {
+    models?: unknown[];
+    layouts?: unknown[];
+    unassociatedModels?: string[];
+}
+
+export function parseStageBundle(
+    buffer: ArrayBufferSlice,
+    debugLabel = '',
+    diagnostics?: StageBundleDiagnostics,
+): TerrainMesh[] {
     const bytes = buffer.createTypedArray(Uint8Array);
     const data = buffer.createDataView();
     interface XffSymbol {
@@ -279,11 +289,11 @@ export function parseStageBundle(buffer: ArrayBufferSlice, debugLabel = ''): Ter
             for (let record = body; record + 0x4C <= body + bodySize; record += 0x4C) {
                 if (data.getUint32(record, true) === 0)
                     continue;
-                const tx = -data.getFloat32(record + 0x18, true);
+                const tx = data.getFloat32(record + 0x18, true);
                 const ty = data.getFloat32(record + 0x1C, true);
                 const tz = data.getFloat32(record + 0x20, true);
                 const rx = data.getFloat32(record + 0x24, true);
-                const ry = -data.getFloat32(record + 0x28, true);
+                const ry = data.getFloat32(record + 0x28, true);
                 const rz = data.getFloat32(record + 0x2C, true);
                 const scale = vec3.fromValues(
                     data.getFloat32(record + 0x30, true),
@@ -306,7 +316,7 @@ export function parseStageBundle(buffer: ArrayBufferSlice, debugLabel = ''): Ter
                 // transform with S * Mgame * S rather than adjusting Euler
                 // components independently.
                 const gameMatrix = mat4.fromRotationTranslationScale(
-                    mat4.create(), rotation, [tx, ty, -tz], scale,
+                    mat4.create(), rotation, [tx, ty, tz], scale,
                 );
                 const reflectZ = mat4.fromScaling(mat4.create(), [1, 1, -1]);
                 const viewerMatrix = mat4.multiply(mat4.create(), reflectZ, gameMatrix);
@@ -371,9 +381,24 @@ export function parseStageBundle(buffer: ArrayBufferSlice, debugLabel = ''): Ter
             rawBounds: modelInventory.map(({ source, bounds }) =>
                 `${source}: ${bounds === null ? 'empty' : `${bounds.min.join(',')} .. ${bounds.max.join(',')}`}`),
         });
-    if (models.size === 0)
+    if (diagnostics !== undefined)
+        diagnostics.models = modelInventory;
+    if (models.size === 0) {
+        if (diagnostics !== undefined) {
+            diagnostics.layouts = stageLayouts.map((layout) => ({
+                targetHash: `0x${layout.targetHash.toString(16)}`,
+                target: sheets.get(layout.targetHash)?.name ?? null,
+                result: 'no decoded models in bundle',
+            }));
+            diagnostics.unassociatedModels = modelInventory.map((model) => model.source);
+        }
         return [];
+    }
     if (stageLayouts.length === 0) {
+        if (diagnostics !== undefined) {
+            diagnostics.layouts = [];
+            diagnostics.unassociatedModels = [];
+        }
         return [...models.values()].flat();
     }
 
@@ -382,17 +407,26 @@ export function parseStageBundle(buffer: ArrayBufferSlice, debugLabel = ''): Ter
         return symbols.find((symbol) =>
             symbol.moduleStart === sheet.moduleStart && symbol.name === wanted);
     };
-    const ownedModelPaths = (rootHash: number): Set<string> => {
+    const ownedModelPaths = (rootHash: number): { paths: Set<string>; trace: unknown[] } => {
         const paths = new Set<string>();
         const visited = new Set<number>();
-        const visit = (hash: number, allowAnimationLayout = false): void => {
-            const visitKey = hash * 2 + Number(allowAnimationLayout);
-            if (visited.has(visitKey)) return;
-            visited.add(visitKey);
+        const trace: unknown[] = [];
+        const visit = (hash: number): void => {
+            if (visited.has(hash)) {
+                trace.push({ hash: `0x${hash.toString(16)}`, result: 'already visited' });
+                return;
+            }
+            visited.add(hash);
             const sheet = sheets.get(hash);
-            if (sheet === undefined) return;
+            if (sheet === undefined) {
+                trace.push({ hash: `0x${hash.toString(16)}`, result: 'sheet hash not found' });
+                return;
+            }
             const element = symbolForSheet(sheet);
-            if (element === undefined) return;
+            if (element === undefined) {
+                trace.push({ hash: `0x${hash.toString(16)}`, sheet: sheet.name, result: 'element symbol not found' });
+                return;
+            }
             if (element.name.includes('DispObjDef') ||
                 element.name.startsWith('_ScriptCharObjDef') ||
                 element.name.startsWith('_AnimObjDef'))
@@ -419,34 +453,83 @@ export function parseStageBundle(buffer: ArrayBufferSlice, debugLabel = ''): Ter
             } else if (element.name.startsWith('_LwsorientRes')) {
                 fields = [element.body + 4];
             } else if (element.name.startsWith('_ScriptAnimationObjDef')) {
-                fields = allowAnimationLayout ? [element.body + 0x28] : [];
+                // CreateScriptAnimationObj initializes the controller's base
+                // layout from +0x28. The animation-definition references at
+                // +0x04/+0x08 subsequently drive that layout's child state.
+                fields = [element.body + 0x28];
             } else {
                 fields = [];
             }
+            const targets = fields.map((field) => {
+                const target = packedTarget(field);
+                return {
+                    field: `0x${(field - element.body).toString(16)}`,
+                    targetHash: target === null ? null : `0x${target.hash.toString(16)}`,
+                    targetType: target === null ? null : `0x${target.type.toString(16)}`,
+                    targetSheet: target === null ? null : sheets.get(target.hash)?.name ?? null,
+                };
+            });
+            trace.push({
+                hash: `0x${hash.toString(16)}`,
+                sheet: sheet.name,
+                element: element.name,
+                modulePaths: element.modulePaths,
+                followedFields: targets,
+                result: fields.length === 0 ? 'unsupported/static leaf' : 'traversed',
+                ...(element.name.startsWith('_ScriptAnimationObjDef') ? {
+                    // CreateScriptAnimationObj does not treat this as a plain
+                    // display-object pointer. It initializes an AnimationDef
+                    // and creates typed child layout objects from its tracks.
+                    // Report every packed sheet reference in the serialized
+                    // definition so we can identify that AnimationDef and
+                    // decode its frame-zero child state without guessing.
+                    packedReferences: Array.from(
+                        { length: Math.floor(element.byteSize / 4) },
+                        (_, i) => element.body + i * 4,
+                    ).map((field) => ({ field, target: packedTarget(field) }))
+                        .filter(({ target }) => target !== null)
+                        .map(({ field, target }) => ({
+                            field: `0x${(field - element.body).toString(16)}`,
+                            raw: `0x${data.getUint32(field, true).toString(16)}`,
+                            targetHash: `0x${target!.hash.toString(16)}`,
+                            targetType: `0x${target!.type.toString(16)}`,
+                            targetSheet: sheets.get(target!.hash)?.name ?? null,
+                        })),
+                } : {}),
+            });
             for (const field of fields) {
                 const target = packedTarget(field);
                 if (target !== null && sheets.has(target.hash)) {
-                    visit(target.hash, element.name.startsWith('_LwsorientRes'));
+                    visit(target.hash);
                 }
             }
         };
         visit(rootHash);
-        return paths;
+        return { paths, trace };
     };
     const output: TerrainMesh[] = [];
     const associations = [];
+    const associatedModels = new Set<string>();
     for (const layout of stageLayouts) {
-        const paths = ownedModelPaths(layout.targetHash);
+        const { paths, trace } = ownedModelPaths(layout.targetHash);
         associations.push({
+            targetHash: `0x${layout.targetHash.toString(16)}`,
             target: sheets.get(layout.targetHash)?.name ?? `0x${layout.targetHash.toString(16)}`,
             models: [...paths],
+            trace,
         });
         for (const path of paths) {
             const model = models.get(path);
             if (model === undefined) continue;
+            associatedModels.add(path);
             for (const mesh of model)
                 output.push(transformMesh(mesh, layout.matrix));
         }
+    }
+    if (diagnostics !== undefined) {
+        diagnostics.layouts = associations;
+        diagnostics.unassociatedModels = [...models.keys()]
+            .filter((path) => !associatedModels.has(path)).sort();
     }
     if (debugLabel !== '')
         console.warn(`[SotC] ${debugLabel} resolved stage associations`, associations);
@@ -937,6 +1020,10 @@ export function parseTexturePack(file: ArrayBufferSlice, physicalSheetCount: num
     } else {
         payload = decompress(bytes.subarray(physicalSheetCount * 4));
     }
+    return parseNto2Textures(payload);
+}
+
+export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
     const textures = new Map<string, DecodedTexture>();
     const gsMap = gsMemoryMapNew();
     const textureBasePointer = 0;

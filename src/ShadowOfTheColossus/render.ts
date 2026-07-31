@@ -176,12 +176,21 @@ export class TerrainTextures {
         this.fallback = device.createTexture(makeTextureDescriptor2D(GfxFormat.U8_RGBA_NORM, 1, 1, 1));
         device.uploadTextureData(this.fallback, 0, [new Uint8Array([0xFF, 0xFF, 0xFF, 0xFF])]);
         for (const texture of decoded) {
-            const gfxTexture = device.createTexture(makeTextureDescriptor2D(GfxFormat.U8_RGBA_NORM, texture.width, texture.height, 1));
-            device.setResourceName(gfxTexture, texture.name);
-            device.uploadTextureData(gfxTexture, 0, [texture.pixels]);
-            this.textures.set(texture.name, gfxTexture);
-            this.decoded.set(texture.name, texture);
+            this.addTexture(device, texture);
         }
+    }
+    private addTexture(device: GfxDevice, texture: DecodedTexture): void {
+        if (this.textures.has(texture.name))
+            return;
+        const gfxTexture = device.createTexture(makeTextureDescriptor2D(GfxFormat.U8_RGBA_NORM, texture.width, texture.height, 1));
+        device.setResourceName(gfxTexture, texture.name);
+        device.uploadTextureData(gfxTexture, 0, [texture.pixels]);
+        this.textures.set(texture.name, gfxTexture);
+        this.decoded.set(texture.name, texture);
+    }
+    public addTextures(device: GfxDevice, textures: DecodedTexture[]): void {
+        for (const texture of textures)
+            this.addTexture(device, texture);
     }
     public getTexture(name: string | null): DecodedTexture | null {
         return name === null ? null : this.decoded.get(name) ?? null;

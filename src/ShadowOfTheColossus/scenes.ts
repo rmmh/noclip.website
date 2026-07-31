@@ -11,7 +11,7 @@ import { GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
 import { SceneContext } from '../SceneBase.js';
 import * as Viewer from '../viewer.js';
 import * as UI from '../ui.js';
-import { DecodedTexture, parseHiPack, parseStageBundle, parseTerrainCell, parseTexturePack, placeStageBundle, TerrainMesh } from './bin.js';
+import { DecodedTexture, parseHiPack, parseNto2Textures, parseStageBundle, parseTerrainCell, parseTexturePack, placeStageBundle, StageBundleDiagnostics, TerrainMesh } from './bin.js';
 import { fillSceneParams, makeTerrainPipeline, TerrainGeometry, TerrainTextures } from './render.js';
 
 interface Manifest {
@@ -45,9 +45,39 @@ class SotCRenderer implements Viewer.SceneGfx {
     private pending = new Set<string>();
     private stageCells = new Map<string, TerrainGeometry[]>();
     private pendingStages = new Set<string>();
+    private stageDebug = new Map<string, {
+        stage: number;
+        coarseCell: number[];
+        cellOrigin: number[];
+        bounds: { min: number[]; max: number[] } | null;
+        meshes: number;
+        triangles: number;
+        focusedMeshes?: {
+            mesh: number;
+            texture: string | null;
+            secondaryTexture: string | null;
+            triangles: number;
+            bounds: { min: number[]; max: number[] };
+            layer1: boolean;
+            specialLayer: boolean;
+            translucent: boolean;
+            water: boolean;
+            disableCull: boolean;
+            gsAlpha: string;
+            gsAlphaFix: number;
+        }[];
+        resources: {
+            source: string;
+            meshes: number;
+            triangles: number;
+            textures: string[];
+            bounds: { min: number[]; max: number[] } | null;
+        }[];
+    }>();
     // Parsed without a cell origin so a stage ID shared by multiple grid cells
     // only needs to be decompressed and parsed once.
-    private stageBundles = new Map<number, Promise<TerrainMesh[]>>();
+    private stageBundles = new Map<number, Promise<{ meshes: TerrainMesh[]; textures: DecodedTexture[] }>>();
+    private stageBundleDiagnostics = new Map<number, StageBundleDiagnostics>();
     private available: Set<string>;
     private destroyed = false;
     private enableProps = true;
@@ -55,10 +85,38 @@ class SotCRenderer implements Viewer.SceneGfx {
     private renderDistance = 16;
     private warnedMissingStageGrid = false;
     private lastStageCell = '';
-    private probeCellX = -1;
-    private probeCellY = -1;
-    private probeWorldX = 0;
-    private probeWorldZ = 0;
+    private streamingDebug: Record<string, unknown> | null = null;
+
+    private onKeyDown = (event: KeyboardEvent): void => {
+        if (event.code !== 'KeyY' || event.repeat)
+            return;
+        const target = event.target;
+        if (target instanceof HTMLElement &&
+            (target.isContentEditable || target instanceof HTMLInputElement ||
+             target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement))
+            return;
+        const loaded = [...this.stageCells].map(([key, geometries]) => ({
+            key,
+            ...(this.stageDebug.get(key) ?? {
+                coarseCell: key.substring(0, key.lastIndexOf(':')),
+                stage: Number(key.substring(key.lastIndexOf(':') + 1)),
+                meshes: geometries.length,
+            }),
+        }));
+        console.warn('[SotC] position/stage debug dump (Y)\n' + JSON.stringify({
+            ...this.streamingDebug,
+            loaded,
+            pending: [...this.pendingStages],
+            parsedStageBundles: [...this.stageBundles.keys()].sort((a, b) => a - b),
+            stage373AssociationTrace: this.stageBundleDiagnostics.get(373) ?? null,
+            stage378AssociationTrace: this.stageBundleDiagnostics.get(378) ?? null,
+        }, (key, value) => {
+            if (key === 'bounds' && value !== null &&
+                Array.isArray(value.min) && Array.isArray(value.max))
+                return `${value.min.map(Math.round).join(',')} ${value.max.map(Math.round).join(',')}`;
+            return value;
+        }));
+    };
 
     private textures: TerrainTextures;
     constructor(device: GfxDevice, private context: SceneContext, private manifest: Manifest, decodedTextures: DecodedTexture[]) {
@@ -66,6 +124,7 @@ class SotCRenderer implements Viewer.SceneGfx {
         this.pipeline = makeTerrainPipeline(this.helper.renderCache);
         this.textures = new TerrainTextures(device, this.helper.renderCache, decodedTextures);
         this.available = new Set(manifest.worlds[0].packs);
+        document.addEventListener('keydown', this.onKeyDown);
     }
 
     public adjustCameraController(c: CameraController): void { c.setSceneMoveSpeedMult(1 / 10); }
@@ -76,172 +135,11 @@ class SotCRenderer implements Viewer.SceneGfx {
         mat4.targetTo(dst, [0, 100, 180], [0, 0, 0], [0, 1, 0]);
     }
 
-    private meshGroundHits(meshes: TerrainMesh[], worldX: number, worldZ: number) {
-        const hits: {
-            mesh: number;
-            source: string;
-            texture: string | null;
-            groundY: number;
-            translucent: boolean;
-            specialLayer: boolean;
-            water: boolean;
-        }[] = [];
-        const nearest: {
-            mesh: number;
-            source: string;
-            texture: string | null;
-            triangles: number;
-            xzBounds: number[];
-            xzDistance: number;
-            yRange: number[];
-        }[] = [];
-        const overallBounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
-        for (let meshIndex = 0; meshIndex < meshes.length; meshIndex++) {
-            const mesh = meshes[meshIndex], vertices = mesh.vertices;
-            const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
-            for (let i = 0; i < vertices.length; i += 14) {
-                const x = vertices[i], y = vertices[i + 1], z = vertices[i + 2];
-                bounds[0] = Math.min(bounds[0], x); bounds[1] = Math.min(bounds[1], y); bounds[2] = Math.min(bounds[2], z);
-                bounds[3] = Math.max(bounds[3], x); bounds[4] = Math.max(bounds[4], y); bounds[5] = Math.max(bounds[5], z);
-            }
-            if (vertices.length !== 0) {
-                for (let i = 0; i < 6; i++)
-                    overallBounds[i] = i < 3 ? Math.min(overallBounds[i], bounds[i]) : Math.max(overallBounds[i], bounds[i]);
-                const dx = worldX < bounds[0] ? bounds[0] - worldX : worldX > bounds[3] ? worldX - bounds[3] : 0;
-                const dz = worldZ < bounds[2] ? bounds[2] - worldZ : worldZ > bounds[5] ? worldZ - bounds[5] : 0;
-                nearest.push({
-                    mesh: meshIndex,
-                    source: mesh.sourceName,
-                    texture: mesh.textureName,
-                    triangles: vertices.length / 14 / 3,
-                    xzBounds: [bounds[0], bounds[2], bounds[3], bounds[5]],
-                    xzDistance: Math.hypot(dx, dz),
-                    yRange: [bounds[1], bounds[4]],
-                });
-            }
-            for (let i = 0; i + 41 < vertices.length; i += 42) {
-                const x0 = vertices[i], y0 = vertices[i + 1], z0 = vertices[i + 2];
-                const x1 = vertices[i + 14], y1 = vertices[i + 15], z1 = vertices[i + 16];
-                const x2 = vertices[i + 28], y2 = vertices[i + 29], z2 = vertices[i + 30];
-                const denominator = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2);
-                if (Math.abs(denominator) < 1e-8) continue;
-                const a = ((z1 - z2) * (worldX - x2) + (x2 - x1) * (worldZ - z2)) / denominator;
-                const b = ((z2 - z0) * (worldX - x2) + (x0 - x2) * (worldZ - z2)) / denominator;
-                const c = 1 - a - b;
-                if (a < -1e-5 || b < -1e-5 || c < -1e-5) continue;
-                hits.push({
-                    mesh: meshIndex,
-                    source: mesh.sourceName,
-                    texture: mesh.textureName,
-                    groundY: a * y0 + b * y1 + c * y2,
-                    translucent: mesh.isTranslucent,
-                    specialLayer: mesh.isSpecialLayer,
-                    water: mesh.isWater,
-                });
-            }
-        }
-        return {
-            overallBounds: nearest.length === 0 ? null : {
-                min: overallBounds.slice(0, 3),
-                max: overallBounds.slice(3, 6),
-            },
-            hits: hits.sort((a, b) => b.groundY - a.groundY),
-            nearest: nearest.sort((a, b) => a.xzDistance - b.xzDistance).slice(0, 12),
-        };
-    }
-
-    private debugGroundProbe(cellX: number, cellY: number, worldX: number, worldZ: number): void {
-        const packPath = `hi/${Math.floor(cellY / 4).toString().padStart(2, '0')}-${Math.floor(cellX / 4).toString().padStart(2, '0')}.bin`;
-        const entries = this.packs.get(packPath);
-        const entry = entries?.find((v) => v.x === cellX && v.y === cellY);
-        if (entries === undefined || entry === undefined) {
-            console.warn('[SotC] terrain ground probe unavailable', {
-                terrainCell: [cellX, cellY],
-                worldXZ: [worldX, worldZ],
-                packPath,
-                packAvailable: this.available.has(packPath),
-                packPending: this.pending.has(packPath),
-                packResident: entries !== undefined,
-                cellPresentInPack: entry !== undefined,
-            });
-            return;
-        }
-
-        const meshes = parseTerrainCell(entry.data);
-        const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
-        let triangleCount = 0;
-        const hits: {
-            mesh: number;
-            texture: string | null;
-            groundY: number;
-            translucent: boolean;
-            specialLayer: boolean;
-            water: boolean;
-            triangle: number[][];
-        }[] = [];
-        const materials = meshes.map((mesh, meshIndex) => {
-            const vertices = mesh.vertices;
-            const meshTriangles = vertices.length / 14 / 3;
-            triangleCount += meshTriangles;
-            for (let i = 0; i < vertices.length; i += 14) {
-                bounds[0] = Math.min(bounds[0], vertices[i]);
-                bounds[1] = Math.min(bounds[1], vertices[i + 1]);
-                bounds[2] = Math.min(bounds[2], vertices[i + 2]);
-                bounds[3] = Math.max(bounds[3], vertices[i]);
-                bounds[4] = Math.max(bounds[4], vertices[i + 1]);
-                bounds[5] = Math.max(bounds[5], vertices[i + 2]);
-            }
-            for (let i = 0; i + 41 < vertices.length; i += 42) {
-                const x0 = vertices[i], y0 = vertices[i + 1], z0 = vertices[i + 2];
-                const x1 = vertices[i + 14], y1 = vertices[i + 15], z1 = vertices[i + 16];
-                const x2 = vertices[i + 28], y2 = vertices[i + 29], z2 = vertices[i + 30];
-                const denominator = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2);
-                if (Math.abs(denominator) < 1e-8) continue;
-                const a = ((z1 - z2) * (worldX - x2) + (x2 - x1) * (worldZ - z2)) / denominator;
-                const b = ((z2 - z0) * (worldX - x2) + (x0 - x2) * (worldZ - z2)) / denominator;
-                const c = 1 - a - b;
-                if (a < -1e-5 || b < -1e-5 || c < -1e-5) continue;
-                hits.push({
-                    mesh: meshIndex,
-                    texture: mesh.textureName,
-                    groundY: a * y0 + b * y1 + c * y2,
-                    translucent: mesh.isTranslucent,
-                    specialLayer: mesh.isSpecialLayer,
-                    water: mesh.isWater,
-                    triangle: [[x0, y0, z0], [x1, y1, z1], [x2, y2, z2]],
-                });
-            }
-            return {
-                mesh: meshIndex,
-                texture: mesh.textureName,
-                triangles: meshTriangles,
-                translucent: mesh.isTranslucent,
-                specialLayer: mesh.isSpecialLayer,
-                layer1: mesh.isLayer1,
-                water: mesh.isWater,
-            };
-        });
-        console.warn('[SotC] terrain ground probe', {
-            terrainCell: [cellX, cellY],
-            worldXZ: [worldX, worldZ],
-            packPath,
-            meshCount: meshes.length,
-            triangleCount,
-            bounds: triangleCount === 0 ? null : { min: bounds.slice(0, 3), max: bounds.slice(3, 6) },
-            hits: hits.sort((a, b) => b.groundY - a.groundY),
-            materials,
-        });
-    }
-
     private updateStreaming(device: GfxDevice, input: Viewer.ViewerRenderInput): void {
         // Terrain positions are absolute. The stage grid runs in reverse from
         // (+2950,+2950), and Z was flipped during vertex decoding.
         const cellX = Math.max(0, Math.min(59, Math.floor((3000 - input.camera.worldMatrix[12]) / 100)));
         const cellY = Math.max(0, Math.min(59, Math.floor((3000 + input.camera.worldMatrix[14]) / 100)));
-        this.probeCellX = cellX;
-        this.probeCellY = cellY;
-        this.probeWorldX = input.camera.worldMatrix[12];
-        this.probeWorldZ = input.camera.worldMatrix[14];
         const wantedCells = new Set<string>();
         const wantedPacks = new Set<string>();
         const lowRadius = Math.floor(this.renderDistance / 2);
@@ -261,9 +159,6 @@ class SotCRenderer implements Viewer.SceneGfx {
                 if (this.destroyed) return;
                 const entries = parseHiPack(file, path, decompress);
                 this.packs.set(path, entries);
-                const probePack = `hi/${Math.floor(this.probeCellY / 4).toString().padStart(2, '0')}-${Math.floor(this.probeCellX / 4).toString().padStart(2, '0')}.bin`;
-                if (path === probePack)
-                    this.debugGroundProbe(this.probeCellX, this.probeCellY, this.probeWorldX, this.probeWorldZ);
             }).catch((error) => {
                 this.pending.delete(path);
                 console.error(`[SotC] failed to load terrain pack ${path}`, error);
@@ -309,22 +204,32 @@ class SotCRenderer implements Viewer.SceneGfx {
         const stageFY = (3000 - input.camera.worldMatrix[14]) / fineCellSize;
         const stageX = Math.max(0, Math.min(fineWidth - 1, Math.floor(stageFX)));
         const stageY = Math.max(0, Math.min(fineHeight - 1, Math.floor(stageFY)));
-        // The seamless-stage manager's defaults are one high-detail cell plus
-        // two middle-detail cells. SeamlessStageLoadWindowRebuild builds the
-        // half-open interval [cell - (high + middle),
-        // cell + (high + middle)) on each axis.
-        // Its 0.42/0.58 tests only decide when to rebuild this window; they do
-        // not restrict residency to the adjacent cells.
-        const highModelDistance = 1;
-        const middleModelDistance = 2;
-        const stageRadius = highModelDistance + middleModelDistance;
-        const selectedStageCells: [number, number][] = [];
-        for (let y = Math.max(0, stageY - stageRadius); y < Math.min(fineHeight, stageY + stageRadius); y++)
-            for (let x = Math.max(0, stageX - stageRadius); x < Math.min(fineWidth, stageX + stageRadius); x++)
-                selectedStageCells.push([x, y]);
+        // The high+middle radius belongs to streamed map/detail data. Stage
+        // layouts use the separate current/edge/corner list maintained by the
+        // stage manager, with transitions at 0.42 and 0.58 of a fine cell.
+        const fracX = stageFX - Math.floor(stageFX), fracY = stageFY - Math.floor(stageFY);
+        const xNeighbor = fracX < 0.42 ? -1 : fracX > 0.58 ? 1 : 0;
+        const yNeighbor = fracY < 0.42 ? -1 : fracY > 0.58 ? 1 : 0;
+        // The viewer's minimum distance is an explicit debugging override:
+        // retain only the current fine stage cell. Any higher distance uses
+        // the game's ordinary edge/corner activation set.
+        const includeStageNeighbors = this.renderDistance > 2;
+        const selectedStageCells: [number, number][] = [[stageX, stageY]];
+        if (includeStageNeighbors && xNeighbor !== 0) selectedStageCells.push([stageX + xNeighbor, stageY]);
+        if (includeStageNeighbors && yNeighbor !== 0) selectedStageCells.push([stageX, stageY + yNeighbor]);
+        if (includeStageNeighbors && xNeighbor !== 0 && yNeighbor !== 0)
+            selectedStageCells.push([stageX + xNeighbor, stageY + yNeighbor]);
         const wantedStageInstances = new Set<string>();
         const wantedStageIds = new Set<number>();
         const selectedCoarseCells = new Set<string>();
+        const stageContributions: {
+            fineCell: number[];
+            coarseCell: number[];
+            coarseStages: number[];
+            stages: number[];
+            bossStages: number[];
+            combined: number[];
+        }[] = [];
         for (const [x, y] of selectedStageCells) {
             if (x < 0 || y < 0 || x >= fineWidth || y >= fineHeight)
                 continue;
@@ -332,11 +237,22 @@ class SotCRenderer implements Viewer.SceneGfx {
             const coarseY = Math.floor(y / stageGrid.fineSide);
             const coarseKey = `${coarseX},${coarseY}`;
             const fineCell = stageGrid.fineCells[y * fineWidth + x];
+            const coarseStages = stageGrid.coarseCells[coarseY * stageGrid.coarseWidth + coarseX] ?? [];
+            const stages = fineCell?.stages ?? [];
+            const bossStages = this.aliveBosses ? fineCell?.aliveBosses ?? [] : fineCell?.deadBosses ?? [];
             const ids = [
-                ...(stageGrid.coarseCells[coarseY * stageGrid.coarseWidth + coarseX] ?? []),
-                ...(fineCell?.stages ?? []),
-                ...(this.aliveBosses ? fineCell?.aliveBosses ?? [] : fineCell?.deadBosses ?? []),
+                ...coarseStages,
+                ...stages,
+                ...bossStages,
             ];
+            stageContributions.push({
+                fineCell: [x, y],
+                coarseCell: [coarseX, coarseY],
+                coarseStages,
+                stages,
+                bossStages,
+                combined: [...new Set(ids)].sort((a, b) => a - b),
+            });
             selectedCoarseCells.add(coarseKey);
             for (const id of ids) {
                 wantedStageIds.add(id);
@@ -349,34 +265,110 @@ class SotCRenderer implements Viewer.SceneGfx {
                 this.pendingStages.add(key);
                 let bundle = this.stageBundles.get(id);
                 if (bundle === undefined) {
+                    const diagnostics: StageBundleDiagnostics = {};
+                    if (id === 373 || id === 378)
+                        this.stageBundleDiagnostics.set(id, diagnostics);
                     bundle = this.context.dataFetcher.fetchData(`${pathBase}/stage/${id}.bin`)
-                        .then((file) => ArrayBufferSlice.fromView(decompress(file.createTypedArray(Uint8Array))))
-                        .then((unpacked) => parseStageBundle(unpacked, id === 382 ? 'stage 382' : ''));
+                        .then((file) => decompress(file.createTypedArray(Uint8Array)))
+                        .then((bytes) => ({
+                            meshes: parseStageBundle(
+                                ArrayBufferSlice.fromView(bytes),
+                                id === 382 ? 'stage 382' : '',
+                                id === 373 || id === 378 ? diagnostics : undefined,
+                            ),
+                            textures: parseNto2Textures(bytes),
+                        }));
                     this.stageBundles.set(id, bundle);
                 }
-                bundle.then((meshes) => {
+                bundle.then(({ meshes, textures }) => {
                     this.pendingStages.delete(key);
                     if (this.destroyed || !wantedStageInstances.has(key))
                         return;
+                    this.textures.addTextures(device, textures);
                     const coarseCellSize = 6000 / stageGrid.coarseWidth;
                     const originX = 3000 - (coarseX + 0.5) * coarseCellSize;
                     const originZ = 3000 - (coarseY + 0.5) * coarseCellSize;
                     const placedMeshes = placeStageBundle(meshes, originX, originZ);
                     this.stageCells.set(key, placedMeshes.filter((mesh) => mesh.vertices.length !== 0)
                         .map((mesh) => new TerrainGeometry(device, mesh, this.textures)));
-                    const groundProbe = this.meshGroundHits(
-                        placedMeshes, this.probeWorldX, this.probeWorldZ,
-                    );
-                    console.warn('[SotC] stage instance loaded', {
+                    const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+                    const resources = new Map<string, {
+                        source: string;
+                        meshes: number;
+                        triangles: number;
+                        textures: Set<string>;
+                        bounds: number[];
+                    }>();
+                    const focusedMeshes: NonNullable<NonNullable<ReturnType<typeof this.stageDebug.get>>['focusedMeshes']> = [];
+                    let meshCount = 0, triangleCount = 0;
+                    for (let meshIndex = 0; meshIndex < placedMeshes.length; meshIndex++) {
+                        const mesh = placedMeshes[meshIndex];
+                        if (mesh.vertices.length === 0) continue;
+                        meshCount++;
+                        const triangles = mesh.vertices.length / 14 / 3;
+                        triangleCount += triangles;
+                        const resource = resources.get(mesh.sourceName) ?? {
+                            source: mesh.sourceName,
+                            meshes: 0,
+                            triangles: 0,
+                            textures: new Set<string>(),
+                            bounds: [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity],
+                        };
+                        resource.meshes++;
+                        resource.triangles += triangles;
+                        if (mesh.textureName !== null) resource.textures.add(mesh.textureName);
+                        if (mesh.secondaryTextureName !== null) resource.textures.add(mesh.secondaryTextureName);
+                        resources.set(mesh.sourceName, resource);
+                        const meshBounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+                        for (let i = 0; i < mesh.vertices.length; i += 14) {
+                            for (let axis = 0; axis < 3; axis++) {
+                                const value = mesh.vertices[i + axis];
+                                bounds[axis] = Math.min(bounds[axis], value);
+                                bounds[axis + 3] = Math.max(bounds[axis + 3], value);
+                                resource.bounds[axis] = Math.min(resource.bounds[axis], value);
+                                resource.bounds[axis + 3] = Math.max(resource.bounds[axis + 3], value);
+                                meshBounds[axis] = Math.min(meshBounds[axis], value);
+                                meshBounds[axis + 3] = Math.max(meshBounds[axis + 3], value);
+                            }
+                        }
+                        if (id === 378 && mesh.sourceName === 'nmo/home_spiral_stair.nmo') {
+                            focusedMeshes.push({
+                                mesh: meshIndex,
+                                texture: mesh.textureName,
+                                secondaryTexture: mesh.secondaryTextureName,
+                                triangles,
+                                bounds: { min: meshBounds.slice(0, 3), max: meshBounds.slice(3, 6) },
+                                layer1: mesh.isLayer1,
+                                specialLayer: mesh.isSpecialLayer,
+                                translucent: mesh.isTranslucent,
+                                water: mesh.isWater,
+                                disableCull: mesh.disableCull,
+                                gsAlpha: `0x${mesh.gsAlpha.toString(16).padStart(8, '0')}`,
+                                gsAlphaFix: mesh.gsAlphaFix,
+                            });
+                        }
+                    }
+                    this.stageDebug.set(key, {
                         stage: id,
                         coarseCell: [coarseX, coarseY],
                         cellOrigin: [originX, 0, originZ],
-                        parsedMeshes: meshes.length,
-                        placedMeshes: placedMeshes.filter((mesh) => mesh.vertices.length !== 0).length,
-                        triangles: placedMeshes.reduce((sum, mesh) => sum + mesh.vertices.length / 14 / 3, 0),
-                        placedBounds: groundProbe.overallBounds,
-                        probeWorldXZ: [this.probeWorldX, this.probeWorldZ],
-                        groundProbe,
+                        bounds: meshCount === 0 ? null : {
+                            min: bounds.slice(0, 3),
+                            max: bounds.slice(3, 6),
+                        },
+                        meshes: meshCount,
+                        triangles: triangleCount,
+                        focusedMeshes: focusedMeshes.length === 0 ? undefined : focusedMeshes,
+                        resources: [...resources.values()].map((resource) => ({
+                            source: resource.source,
+                            meshes: resource.meshes,
+                            triangles: resource.triangles,
+                            textures: [...resource.textures].sort(),
+                            bounds: resource.meshes === 0 ? null : {
+                                min: resource.bounds.slice(0, 3),
+                                max: resource.bounds.slice(3, 6),
+                            },
+                        })),
                     });
                 }).catch((error) => {
                     this.pendingStages.delete(key);
@@ -385,6 +377,45 @@ class SotCRenderer implements Viewer.SceneGfx {
                 });
             }
         }
+        const coarseCellSize = 6000 / stageGrid.coarseWidth;
+        this.streamingDebug = {
+            camera: {
+                x: input.camera.worldMatrix[12],
+                y: input.camera.worldMatrix[13],
+                z: input.camera.worldMatrix[14],
+            },
+            terrain: {
+                cell: [cellX, cellY],
+                pack: `hi/${Math.floor(cellY / 4).toString().padStart(2, '0')}-${Math.floor(cellX / 4).toString().padStart(2, '0')}.bin`,
+            },
+            stage: {
+                renderDistance: this.renderDistance,
+                includeNeighbors: includeStageNeighbors,
+                floatingCell: [stageFX, stageFY],
+                cell: [stageX, stageY],
+                enclosingCoarseCell: [
+                    Math.floor(stageX / stageGrid.fineSide),
+                    Math.floor(stageY / stageGrid.fineSide),
+                ],
+                selectedFineCells: selectedStageCells,
+                selectedCoarseCells: [...selectedCoarseCells],
+                bossVariant: this.aliveBosses ? 'alive' : 'dead',
+                wantedStageIds: [...wantedStageIds].sort((a, b) => a - b),
+                wantedInstances: [...wantedStageInstances].sort(),
+                coarseOrigins: [...selectedCoarseCells].map((key) => {
+                    const [x, y] = key.split(',').map(Number);
+                    return {
+                        coarseCell: [x, y],
+                        origin: [
+                            3000 - (x + 0.5) * coarseCellSize,
+                            0,
+                            3000 - (y + 0.5) * coarseCellSize,
+                        ],
+                    };
+                }),
+                contributions: stageContributions,
+            },
+        };
         const stageCellKey = `${stageX},${stageY}`;
         if (stageCellKey !== this.lastStageCell) {
             this.lastStageCell = stageCellKey;
@@ -400,16 +431,12 @@ class SotCRenderer implements Viewer.SceneGfx {
                 `loaded=[${[...loadedStageIds].sort((a, b) => a - b).join(' ')}] ` +
                 `pending=${this.pendingStages.size}`,
             );
-            this.debugGroundProbe(
-                cellX, cellY,
-                input.camera.worldMatrix[12],
-                input.camera.worldMatrix[14],
-            );
         }
         for (const [key, geometries] of this.stageCells) {
             if (!wantedStageInstances.has(key)) {
                 for (const geometry of geometries) geometry.destroy(device);
                 this.stageCells.delete(key);
+                this.stageDebug.delete(key);
             }
         }
     }
@@ -475,6 +502,7 @@ class SotCRenderer implements Viewer.SceneGfx {
 
     public destroy(device: GfxDevice): void {
         this.destroyed = true;
+        document.removeEventListener('keydown', this.onKeyDown);
         for (const geometries of this.cells.values())
             for (const geometry of geometries) geometry.destroy(device);
         for (const geometries of this.stageCells.values())
