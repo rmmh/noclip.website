@@ -579,7 +579,7 @@ export function parseStageBundle(
                     console.warn(`[SotC] skipped non-object ANB ${animationPath} at 0x${start.toString(16)}`, error);
             }
         }
-        const meshes = parseTerrainCell(sheet, sourceName);
+        const meshes = parseNmoXff(sheet, sourceName);
         if (sourceName !== '' || meshes.some((mesh) => mesh.vertices.length !== 0)) {
             const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
             for (const mesh of meshes)
@@ -904,65 +904,21 @@ export function placeStageBundle(meshes: TerrainMesh[], cellOriginX: number, cel
     return meshes.map((mesh) => mesh.stagePlacement === 'direct' ? mesh : transformMesh(mesh, translation));
 }
 
-function readNames(bytes: Uint8Array, start: number, end: number): string[] {
-    const names: string[] = [];
-    // Match the extractor's /([A-Za-z_][A-Za-z0-9_]{2,})\0/g scan.
-    // Names can begin after binary bytes without a preceding NUL, so treating
-    // the entire interval between two NULs as one string shifts the resource
-    // indices whenever that occurs.
-    for (let nul = Math.max(0, start); nul < end; nul++) {
-        if (bytes[nul] !== 0)
-            continue;
-        let nameStart = nul;
-        while (nameStart > start) {
-            const c = bytes[nameStart - 1];
-            const valid = c === 0x5F ||
-                (c >= 0x30 && c <= 0x39) ||
-                (c >= 0x41 && c <= 0x5A) ||
-                (c >= 0x61 && c <= 0x7A);
-            if (!valid)
-                break;
-            nameStart--;
-        }
-        if (nul - nameStart >= 3) {
-            const first = bytes[nameStart];
-            if (first === 0x5F || (first >= 0x41 && first <= 0x5A) || (first >= 0x61 && first <= 0x7A))
-                names.push(String.fromCharCode(...bytes.subarray(nameStart, nul)));
-        }
-    }
-    return names;
-}
-
-export function parseTerrainCell(buffer: ArrayBufferSlice, sourceNameHint = ''): TerrainMesh[] {
+function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): TerrainMesh[] {
+    const relocated = relocateLegacyXff(serialized);
+    // NMO draw chains contain loader-time packet fields among their relocation
+    // targets. Decode geometry from the serialized image; use the common XFF
+    // parser for section and entry metadata, and convert the NMO's serialized
+    // section-relative fields explicitly below.
+    const buffer = serialized;
     const bytes = buffer.createTypedArray(Uint8Array);
     const data = buffer.createDataView();
-    const findTag = (tag: string, last = false): number => {
-        const needle = Array.from(tag).map((c) => c.charCodeAt(0));
-        if (last) {
-            for (let i = bytes.length - needle.length; i >= 0; i--)
-                if (needle.every((v, j) => bytes[i + j] === v)) return i;
-        } else {
-            for (let i = 0; i <= bytes.length - needle.length; i++)
-                if (needle.every((v, j) => bytes[i + j] === v)) return i;
-        }
-        return -1;
-    };
-    const xff = findTag('xff\0');
-    const nmo = findTag('NMO\0', true);
-    if (xff < 0 || nmo < 0)
+    const nmo = relocated.entryOffset;
+    if (nmo + 0x80 > data.byteLength || ascii(bytes, nmo, 4) !== 'NMO\0')
         return [];
-
-    const sectionCount = data.getUint32(xff + 0x40, true);
-    const sectionTable = data.getUint32(xff + 0x5C, true);
-    let modelStart = Infinity;
-    for (let i = 0; i < sectionCount && i < 256; i++) {
-        const d = xff + sectionTable + i * 0x20;
-        if (d + 0x20 > data.byteLength) break;
-        if (data.getUint32(d + 0x10, true) === 1) {
-            const fileOffs = data.getUint32(d + 0x1C, true);
-            if (fileOffs !== 0) modelStart = Math.min(modelStart, xff + fileOffs);
-        }
-    }
+    const modelStart = Math.min(...relocated.sections
+        .filter((section) => section.type === 1 && section.size !== 0)
+        .map((section) => section.fileOffset));
     if (!Number.isFinite(modelStart))
         return [];
     // These are the same relocated NMO root fields consumed by the game.
@@ -988,21 +944,22 @@ export function parseTerrainCell(buffer: ArrayBufferSlice, sourceNameHint = ''):
     if (texRecords.some((record) => ascii(bytes, record + 3, 4) !== 'TEX\0') ||
         srfRecords.some((record) => ascii(bytes, record + 3, 4) !== 'SRF\0'))
         return [];
-    const xffNames = xff + data.getUint32(xff + 0x58, true);
-    const textureNames = readNames(bytes, xffNames, textureTable).slice(0, texRecords.length);
-    const nmoNames = readNames(bytes, nmo + 4, bytes.length);
-    const surfaceNames = nmoNames.slice(texRecords.length, texRecords.length + srfRecords.length);
-    let nmoPath = sourceNameHint || '(NMO)';
-    for (let i = 0; i + 4 < bytes.length; i++) {
-        if (bytes[i] !== 0x6E || bytes[i + 1] !== 0x6D || bytes[i + 2] !== 0x6F || bytes[i + 3] !== 0x2F)
-            continue;
-        let end = i + 4;
-        while (end < bytes.length && end - i < 256 && bytes[end] >= 0x20 && bytes[end] < 0x7F) end++;
-        if (end < bytes.length && bytes[end] === 0) {
-            nmoPath = new TextDecoder().decode(bytes.subarray(i, end));
-            break;
-        }
-    }
+    // The NMO root is followed by count-directed texture and surface names,
+    // then the model filename. These are model metadata, not XFF fingerprints.
+    let nameCursor = nmo + 0x80;
+    const readName = (): string => {
+        const start = nameCursor;
+        while (nameCursor < bytes.length && bytes[nameCursor] !== 0) nameCursor++;
+        if (nameCursor === bytes.length)
+            throw new Error('Unterminated NMO resource name');
+        const name = ascii(bytes, start, nameCursor - start);
+        nameCursor++;
+        return name;
+    };
+    const textureNames = Array.from({ length: textureCount }, readName);
+    const surfaceNames = Array.from({ length: surfaceCount }, readName);
+    const serializedName = readName();
+    const nmoPath = sourceNameHint || serializedName || '(NMO)';
     const unsupportedDraws: {
         draw: number;
         surface: string;
@@ -1359,6 +1316,44 @@ export function parseTerrainCell(buffer: ArrayBufferSlice, sourceNameHint = ''):
         skinningControl: output.skinningControl.length === 0 ? undefined : new Uint8Array(output.skinningControl),
         deformationData: output.deformationData.length === 0 ? undefined : new Uint32Array(output.deformationData),
     }));
+}
+
+// A seamless-map cell uses the older compact resource list, not the XFF2
+// SheetSegmentLoad container used by stages and texture sheets. Each record is
+// x/y/hash/pathSize/path/payloadSize/payload. Both formats converge at the
+// exact legacy-XFF payload and therefore share parseNmoXff below that layer.
+export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
+    const bytes = buffer.createTypedArray(Uint8Array);
+    const data = buffer.createDataView();
+    if (ascii(bytes, 0, 4) === 'xff\0')
+        return parseNmoXff(buffer);
+    if (data.byteLength < 4)
+        throw new Error('Truncated terrain-cell resource list');
+    const count = data.getUint32(0, true);
+    if (count > 0x10000)
+        throw new Error('Invalid terrain-cell resource count');
+    const output: TerrainMesh[] = [];
+    let cursor = 4;
+    for (let index = 0; index < count; index++) {
+        if (cursor + 0x10 > data.byteLength)
+            throw new Error(`Truncated terrain-cell resource ${index}`);
+        const pathSize = data.getUint32(cursor + 0x0C, true);
+        cursor += 0x10;
+        if (pathSize === 0 || cursor + pathSize + 4 > data.byteLength || bytes[cursor + pathSize - 1] !== 0)
+            throw new Error(`Invalid terrain-cell resource ${index} path`);
+        const path = ascii(bytes, cursor, pathSize - 1);
+        cursor += pathSize;
+        const payloadSize = data.getUint32(cursor, true);
+        cursor += 4;
+        if (cursor + payloadSize > data.byteLength)
+            throw new Error(`Invalid terrain-cell resource ${index} payload`);
+        if (/(?:^|\/)nmo\/.*\.nmo$/i.test(path) || /^[^/]+\.nmo$/i.test(path))
+            output.push(...parseNmoXff(buffer.slice(cursor, cursor + payloadSize), path));
+        cursor += payloadSize;
+    }
+    if (cursor !== data.byteLength)
+        throw new Error('Terrain-cell resource-list size mismatch');
+    return output;
 }
 
 export interface DecodedTexture {

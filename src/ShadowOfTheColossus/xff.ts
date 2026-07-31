@@ -24,6 +24,7 @@ export interface RelocatedXff {
     entryOffset: number;
     sections: XffSection[];
     relocationCount: number;
+    unresolvedSymbols: string[];
 }
 
 function align(value: number, alignment: number): number {
@@ -111,6 +112,7 @@ export function relocateLegacyXff(input: ArrayBufferSlice): RelocatedXff {
         view.setUint32(sectionTable + i * SECTION_SIZE + 4, sections[i].imageOffset, true);
 
     const symbols: number[] = [];
+    const unresolvedSymbols: string[] = [];
     for (let i = 0; i < symbolCount; i++) {
         const at = symbolTable + i * SYMBOL_SIZE;
         const value = serialized.getUint32(at + 4, true);
@@ -120,7 +122,10 @@ export function relocateLegacyXff(input: ArrayBufferSlice): RelocatedXff {
         if (sectionIndex === SHN_UNDEF) {
             const name = cstring(source, symbolStrings + serialized.getUint32(at, true));
             if (name !== '')
-                throw new Error(`Legacy XFF has external symbol ${JSON.stringify(name)}`);
+                unresolvedSymbols.push(name);
+            // A self-contained offset image cannot bind imports. Keep a null
+            // placeholder, just as the dynamic linker does before resolving
+            // the module against its resource group.
             address = 0;
         } else if (sectionIndex !== SHN_ABS && sectionIndex < sections.length && (info & 0x0F) < 4) {
             address = (sections[sectionIndex].imageOffset + value) >>> 0;
@@ -197,5 +202,6 @@ export function relocateLegacyXff(input: ArrayBufferSlice): RelocatedXff {
         entrySection.imageOffset + serialized.getUint32(0x4C, true);
     return {
         image: ArrayBufferSlice.fromView(bytes), entryOffset, sections, relocationCount,
+        unresolvedSymbols,
     };
 }
