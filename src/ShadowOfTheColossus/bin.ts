@@ -1,6 +1,7 @@
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
 import { GSPixelStorageFormat, gsMemoryMapNew, gsMemoryMapReadImagePSMT4_PSMCT32, gsMemoryMapReadImagePSMT8_PSMCT32, gsMemoryMapUploadImage } from '../Common/PS2/GS.js';
 import { getVifUnpackFormatByteSize, VifCmd } from '../Common/PS2/VIF.js';
+import { mat3, mat4, quat, vec3 } from 'gl-matrix';
 
 export interface PackEntry {
     x: number;
@@ -59,6 +60,11 @@ export function parseHiPack(file: ArrayBufferSlice, fallbackPath: string, decomp
 interface UnpackBatch {
     format: string;
     count: number;
+    address: number;
+    unsigned: boolean;
+    masked: boolean;
+    cycleCL: number;
+    cycleWL: number;
     payloadOffset: number;
 }
 
@@ -83,7 +89,19 @@ function collectVifBatches(data: DataView, start: number, size: number): UnpackB
             if (wl > cl)
                 sourceVectors = Math.floor(count / wl) * cl + Math.min(count % wl, cl);
             payloadBytes = sourceVectors * getVifUnpackFormatByteSize(command & VifCmd.UNPACK_PARAM);
-            batches.push({ format: `${componentNames[vn]}-${widthNames[vl]}`, count, payloadOffset: cursor });
+            batches.push({
+                format: `${componentNames[vn]}-${widthNames[vl]}`,
+                count,
+                // The microcode uses XTOP as the base; these are offsets into
+                // that double-buffered input block. Bit 15 selects TOPS and
+                // bit 14 is the UNPACK unsigned flag.
+                address: immediate & 0x03FF,
+                unsigned: (immediate & 0x4000) !== 0,
+                masked: (command & 0x10) !== 0,
+                cycleCL: cl,
+                cycleWL: wl,
+                payloadOffset: cursor,
+            });
         } else if (command === VifCmd.STCYCL) {
             cl = (immediate & 0xFF) || 256;
             wl = ((immediate >>> 8) & 0xFF) || 256;
@@ -107,22 +125,339 @@ function collectVifBatches(data: DataView, start: number, size: number): UnpackB
 }
 
 export interface TerrainMesh {
+    sourceName: string;
     textureName: string | null;
+    secondaryTextureName: string | null;
     isProp: boolean;
+    isLayer1: boolean;
+    isSpecialLayer: boolean;
+    isTranslucent: boolean;
+    isWater: boolean;
+    hasWaterEffect: boolean;
+    gsAlpha: number;
+    gsAlphaFix: number;
+    disableCull: boolean;
     clampS: boolean;
     clampT: boolean;
-    // Expanded triangles: position, normal, color, UV.
+    secondaryClampS: boolean;
+    secondaryClampT: boolean;
+    // Expanded triangles: position, normal, color, primary UV, secondary UV.
     vertices: Float32Array;
+    // Present for deformable six-stream prop packets. These are expanded in
+    // the same triangle-list order as vertices and retained for animation.
+    skinningControl?: Uint8Array;
+    deformationData?: Uint32Array;
 }
 
-function findTaggedOffsets(bytes: Uint8Array, tag: string, stride: number): number[] {
-    const needle = Array.from(tag).map((c) => c.charCodeAt(0));
-    const offsets: number[] = [];
-    for (let i = 3; i <= bytes.length - needle.length; i++) {
-        if (needle.every((v, j) => bytes[i + j] === v) && i - 3 + stride <= bytes.length)
-            offsets.push(i - 3);
+function findBytes(bytes: Uint8Array, needle: Uint8Array, start: number): number {
+    outer: for (let i = start; i + needle.length <= bytes.length; i++) {
+        for (let j = 0; j < needle.length; j++)
+            if (bytes[i + j] !== needle[j]) continue outer;
+        return i;
     }
-    return offsets;
+    return -1;
+}
+
+function transformMesh(mesh: TerrainMesh, matrix: mat4): TerrainMesh {
+    const vertices = mesh.vertices.slice();
+    const p = vec3.create(), n = vec3.create();
+    const normalMatrix = mat3.normalFromMat4(mat3.create(), matrix);
+    for (let i = 0; i < vertices.length; i += 14) {
+        vec3.set(p, vertices[i], vertices[i + 1], vertices[i + 2]);
+        vec3.transformMat4(p, p, matrix);
+        vertices[i] = p[0]; vertices[i + 1] = p[1]; vertices[i + 2] = p[2];
+        vec3.set(n, vertices[i + 3], vertices[i + 4], vertices[i + 5]);
+        if (normalMatrix !== null)
+            vec3.transformMat3(n, n, normalMatrix);
+        vec3.normalize(n, n);
+        vertices[i + 3] = n[0]; vertices[i + 4] = n[1]; vertices[i + 5] = n[2];
+    }
+    return { ...mesh, isProp: true, vertices };
+}
+
+function readSrfGsRegister(data: DataView, surface: number, wantedAddress: number): bigint | null {
+    const end = Math.min(data.byteLength, surface + 0xC0);
+    for (let cursor = surface + 0x60; cursor + 4 <= end;) {
+        const code = data.getUint32(cursor, true);
+        cursor += 4;
+        const command = code >>> 24 & 0x7F;
+        const immediate = code & 0xFFFF;
+        if (command !== VifCmd.DIRECT && command !== VifCmd.DIRECTHL)
+            continue;
+        const directEnd = Math.min(end, cursor + immediate * 0x10);
+        while (cursor + 0x10 <= directEnd) {
+            const loops = data.getUint32(cursor, true) & 0x7FFF;
+            const tag1 = data.getUint32(cursor + 4, true);
+            const format = tag1 >>> 26 & 3;
+            const registerCount = (tag1 >>> 28 & 0x0F) || 16;
+            const registers = data.getBigUint64(cursor + 8, true);
+            cursor += 0x10;
+            if (format !== 0)
+                break;
+            for (let loop = 0; loop < loops; loop++) {
+                for (let register = 0; register < registerCount; register++) {
+                    if (cursor + 0x10 > directEnd)
+                        break;
+                    const descriptor = Number(registers >> BigInt(register * 4) & 0x0Fn);
+                    if (descriptor === 0x0E && (data.getUint8(cursor + 8) & 0x7F) === wantedAddress)
+                        return data.getBigUint64(cursor, true);
+                    cursor += 0x10;
+                }
+            }
+        }
+        cursor = directEnd;
+    }
+    return null;
+}
+
+// Decode the static renderable contents of a stage sheet bundle. XFF2 symbols
+// identify the 0x4c StageLayout arrays; legacy xff modules own the actual NMO
+// model resources. Packed-reference linking determines ownership in-game, but
+// all models and all layout instances in one streamed bundle have the same
+// lifetime, so retaining both lists is also a safe static-viewer fallback for
+// bundles which import a prototype through an unsupported object class.
+export function parseStageBundle(buffer: ArrayBufferSlice, debugLabel = ''): TerrainMesh[] {
+    const bytes = buffer.createTypedArray(Uint8Array);
+    const data = buffer.createDataView();
+    interface XffSymbol {
+        name: string;
+        body: number;
+        byteSize: number;
+        moduleStart: number;
+        modulePaths: string[];
+    }
+    const symbols: XffSymbol[] = [];
+    const sheets = new Map<number, XffSymbol>();
+    const stageLayouts: { matrix: mat4; targetHash: number }[] = [];
+    const packedTarget = (field: number): { hash: number; type: number } | null => {
+        if (field < 0 || field + 4 > data.byteLength) return null;
+        const packed = data.getUint32(field, true);
+        const distance = packed & 0x3FFFF;
+        const anchor = field - distance;
+        if (distance === 0 || anchor < 0 || anchor + 0x0C > data.byteLength)
+            return null;
+        return {
+            hash: data.getUint32(anchor + 4, true),
+            type: data.getUint32(anchor + 8, true),
+        };
+    };
+    const xff2 = new TextEncoder().encode('xff2');
+    for (let moduleStart = findBytes(bytes, xff2, 0); moduleStart >= 0;
+        moduleStart = findBytes(bytes, xff2, moduleStart + 4)) {
+        if (moduleStart + 0x70 > bytes.length) break;
+        const moduleSize = data.getUint32(moduleStart + 0x14, true);
+        const symbolCount = data.getUint32(moduleStart + 0x24, true);
+        const symbolTable = data.getUint32(moduleStart + 0x54, true);
+        const strings = data.getUint32(moduleStart + 0x58, true);
+        const sectionCount = data.getUint32(moduleStart + 0x40, true);
+        const sectionTable = data.getUint32(moduleStart + 0x5C, true);
+        if (moduleSize < 0x70 || moduleStart + moduleSize > bytes.length ||
+            symbolCount > 0x10000 || symbolTable + symbolCount * 0x10 > moduleSize ||
+            sectionCount > 0x1000 || sectionTable + sectionCount * 0x20 > moduleSize)
+            continue;
+        const moduleText = ascii(bytes, moduleStart, moduleSize);
+        const modulePaths = [...moduleText.matchAll(/nmo\/[A-Za-z0-9_./-]+\.nmo\x00/g)]
+            .map((match) => match[0].slice(0, -1));
+        for (let i = 0; i < symbolCount; i++) {
+            const symbol = moduleStart + symbolTable + i * 0x10;
+            let nameAt = moduleStart + strings + data.getUint32(symbol, true);
+            let nameEnd = nameAt;
+            while (nameEnd < moduleStart + moduleSize && bytes[nameEnd] !== 0) nameEnd++;
+            const name = ascii(bytes, nameAt, nameEnd - nameAt);
+            const sectionIndex = data.getUint16(symbol + 0x0E, true);
+            if (sectionIndex >= sectionCount) continue;
+            const section = moduleStart + sectionTable + sectionIndex * 0x20;
+            const body = moduleStart + data.getUint32(section + 0x1C, true) + data.getUint32(symbol + 4, true);
+            const bodySize = data.getUint32(symbol + 8, true);
+            if (body < moduleStart || body + bodySize > moduleStart + moduleSize)
+                continue;
+            const parsedSymbol = { name, body, byteSize: bodySize, moduleStart, modulePaths };
+            symbols.push(parsedSymbol);
+            if (name.startsWith('SH_') && bodySize >= 0x10)
+                sheets.set(data.getUint32(body + 4, true), parsedSymbol);
+            if (!name.startsWith('_StageLayout')) continue;
+            for (let record = body; record + 0x4C <= body + bodySize; record += 0x4C) {
+                if (data.getUint32(record, true) === 0)
+                    continue;
+                const tx = -data.getFloat32(record + 0x18, true);
+                const ty = data.getFloat32(record + 0x1C, true);
+                const tz = data.getFloat32(record + 0x20, true);
+                const rx = data.getFloat32(record + 0x24, true);
+                const ry = -data.getFloat32(record + 0x28, true);
+                const rz = data.getFloat32(record + 0x2C, true);
+                const scale = vec3.fromValues(
+                    data.getFloat32(record + 0x30, true),
+                    data.getFloat32(record + 0x34, true),
+                    data.getFloat32(record + 0x38, true),
+                );
+                if (![tx, ty, tz, rx, ry, rz, ...scale].every(Number.isFinite))
+                    continue;
+                const rotation = quat.create();
+                // gl-matrix composes its Euler quaternion in ZYX order. Build
+                // the game's YXZ order explicitly.
+                const qy = quat.setAxisAngle(quat.create(), [0, 1, 0], ry * Math.PI / 180);
+                const qx = quat.setAxisAngle(quat.create(), [1, 0, 0], rx * Math.PI / 180);
+                const qz = quat.setAxisAngle(quat.create(), [0, 0, 1], rz * Math.PI / 180);
+                quat.multiply(rotation, qy, qx);
+                quat.multiply(rotation, rotation, qz);
+                // StageLayoutInstanceCreate constructs this transform in the
+                // game's coordinate system. Terrain vertices are decoded into
+                // noclip space by reflecting Z, so convert the complete affine
+                // transform with S * Mgame * S rather than adjusting Euler
+                // components independently.
+                const gameMatrix = mat4.fromRotationTranslationScale(
+                    mat4.create(), rotation, [tx, ty, -tz], scale,
+                );
+                const reflectZ = mat4.fromScaling(mat4.create(), [1, 1, -1]);
+                const viewerMatrix = mat4.multiply(mat4.create(), reflectZ, gameMatrix);
+                mat4.multiply(viewerMatrix, viewerMatrix, reflectZ);
+                stageLayouts.push({
+                    matrix: viewerMatrix,
+                    targetHash: packedTarget(record + 4)?.hash ?? 0,
+                });
+            }
+        }
+    }
+
+    const models = new Map<string, TerrainMesh[]>();
+    const modelInventory: {
+        source: string;
+        moduleOffset: string;
+        meshes: number;
+        triangles: number;
+        bounds: { min: number[]; max: number[] } | null;
+    }[] = [];
+    const legacyXff = new Uint8Array([0x78, 0x66, 0x66, 0x00]);
+    for (let start = findBytes(bytes, legacyXff, 0); start >= 0;
+        start = findBytes(bytes, legacyXff, start + 4)) {
+        if (start + 0x70 > bytes.length) break;
+        const size = data.getUint32(start + 0x14, true);
+        if (size < 0x70 || start + size > bytes.length) continue;
+        const sheet = buffer.slice(start, start + size);
+        const prefix = ascii(bytes, Math.max(0, start - 512), Math.min(512, start));
+        const paths = [...prefix.matchAll(/(?:nmo\/)?[A-Za-z0-9_./-]+\.nmo\x00/g)];
+        const sourceName = paths.length === 0 ? '' : paths[paths.length - 1][0].slice(0, -1);
+        const meshes = parseTerrainCell(sheet, sourceName);
+        if (sourceName !== '' || meshes.some((mesh) => mesh.vertices.length !== 0)) {
+            const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+            for (const mesh of meshes)
+                for (let i = 0; i < mesh.vertices.length; i += 14) {
+                    bounds[0] = Math.min(bounds[0], mesh.vertices[i]);
+                    bounds[1] = Math.min(bounds[1], mesh.vertices[i + 1]);
+                    bounds[2] = Math.min(bounds[2], mesh.vertices[i + 2]);
+                    bounds[3] = Math.max(bounds[3], mesh.vertices[i]);
+                    bounds[4] = Math.max(bounds[4], mesh.vertices[i + 1]);
+                    bounds[5] = Math.max(bounds[5], mesh.vertices[i + 2]);
+                }
+            modelInventory.push({
+                source: sourceName || '(unknown NMO)',
+                moduleOffset: `0x${start.toString(16)}`,
+                meshes: meshes.filter((mesh) => mesh.vertices.length !== 0).length,
+                triangles: meshes.reduce((sum, mesh) => sum + mesh.vertices.length / 14 / 3, 0),
+                bounds: Number.isFinite(bounds[0]) ? {
+                    min: bounds.slice(0, 3),
+                    max: bounds.slice(3, 6),
+                } : null,
+            });
+        }
+        if (meshes.some((mesh) => mesh.vertices.length !== 0))
+            models.set(sourceName.replace(/^nmo\//, '').toLowerCase(), meshes);
+    }
+    if (debugLabel !== '')
+        console.warn(`[SotC] ${debugLabel} stage bundle resources`, {
+            layoutInstances: stageLayouts.length,
+            renderableModels: models.size,
+            resources: modelInventory,
+            rawBounds: modelInventory.map(({ source, bounds }) =>
+                `${source}: ${bounds === null ? 'empty' : `${bounds.min.join(',')} .. ${bounds.max.join(',')}`}`),
+        });
+    if (models.size === 0)
+        return [];
+    if (stageLayouts.length === 0) {
+        return [...models.values()].flat();
+    }
+
+    const symbolForSheet = (sheet: XffSymbol): XffSymbol | undefined => {
+        const wanted = `_${sheet.name.slice(3)}`;
+        return symbols.find((symbol) =>
+            symbol.moduleStart === sheet.moduleStart && symbol.name === wanted);
+    };
+    const ownedModelPaths = (rootHash: number): Set<string> => {
+        const paths = new Set<string>();
+        const visited = new Set<number>();
+        const visit = (hash: number, allowAnimationLayout = false): void => {
+            const visitKey = hash * 2 + Number(allowAnimationLayout);
+            if (visited.has(visitKey)) return;
+            visited.add(visitKey);
+            const sheet = sheets.get(hash);
+            if (sheet === undefined) return;
+            const element = symbolForSheet(sheet);
+            if (element === undefined) return;
+            if (element.name.includes('DispObjDef') ||
+                element.name.startsWith('_ScriptCharObjDef') ||
+                element.name.startsWith('_AnimObjDef'))
+                for (const path of element.modulePaths)
+                    paths.add(path.replace(/^nmo\//, '').toLowerCase());
+            let fields: number[];
+            if (element.name.startsWith('_GameObject')) {
+                // StageLayoutInstanceCreate resolves GameObject +0x10. The
+                // exported element symbol begins at that field.
+                fields = [element.body];
+            } else if (element.name.startsWith('_LayoutObjDef')) {
+                // Each 0x18-byte layout definition selects its display object
+                // at +0x04. Multiple definitions share one typed sheet.
+                fields = [];
+                for (let record = element.body; record + 8 <= element.body + element.byteSize; record += 0x18)
+                    fields.push(record + 4);
+            } else if (element.name.startsWith('_ScriptLwsorientObjDef')) {
+                fields = [element.body + 4, element.body + 0x10];
+            } else if (element.name.startsWith('_ScriptCharObjDef')) {
+                // The render and animation definitions are at +0x14/+0xE0.
+                fields = [element.body + 0x14, element.body + 0xE0];
+            } else if (element.name.startsWith('_ScriptLayoutObjDef')) {
+                fields = [element.body, element.body + 8];
+            } else if (element.name.startsWith('_LwsorientRes')) {
+                fields = [element.body + 4];
+            } else if (element.name.startsWith('_ScriptAnimationObjDef')) {
+                fields = allowAnimationLayout ? [element.body + 0x28] : [];
+            } else {
+                fields = [];
+            }
+            for (const field of fields) {
+                const target = packedTarget(field);
+                if (target !== null && sheets.has(target.hash)) {
+                    visit(target.hash, element.name.startsWith('_LwsorientRes'));
+                }
+            }
+        };
+        visit(rootHash);
+        return paths;
+    };
+    const output: TerrainMesh[] = [];
+    const associations = [];
+    for (const layout of stageLayouts) {
+        const paths = ownedModelPaths(layout.targetHash);
+        associations.push({
+            target: sheets.get(layout.targetHash)?.name ?? `0x${layout.targetHash.toString(16)}`,
+            models: [...paths],
+        });
+        for (const path of paths) {
+            const model = models.get(path);
+            if (model === undefined) continue;
+            for (const mesh of model)
+                output.push(transformMesh(mesh, layout.matrix));
+        }
+    }
+    if (debugLabel !== '')
+        console.warn(`[SotC] ${debugLabel} resolved stage associations`, associations);
+    return output;
+}
+
+export function placeStageBundle(meshes: TerrainMesh[], cellOriginX: number, cellOriginZ: number): TerrainMesh[] {
+    // initlayout's game-space coarse origin has already been converted to the
+    // viewer's reflected-Z grid by the caller.
+    const translation = mat4.fromTranslation(mat4.create(), [cellOriginX, 0, cellOriginZ]);
+    return meshes.map((mesh) => transformMesh(mesh, translation));
 }
 
 function readNames(bytes: Uint8Array, start: number, end: number): string[] {
@@ -154,7 +489,7 @@ function readNames(bytes: Uint8Array, start: number, end: number): string[] {
     return names;
 }
 
-export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
+export function parseTerrainCell(buffer: ArrayBufferSlice, sourceNameHint = ''): TerrainMesh[] {
     const bytes = buffer.createTypedArray(Uint8Array);
     const data = buffer.createDataView();
     const findTag = (tag: string, last = false): number => {
@@ -169,9 +504,8 @@ export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
         return -1;
     };
     const xff = findTag('xff\0');
-    const tex = findTag('TEX\0');
     const nmo = findTag('NMO\0', true);
-    if (xff < 0 || tex < 3 || nmo < 0)
+    if (xff < 0 || nmo < 0)
         return [];
 
     const sectionCount = data.getUint32(xff + 0x40, true);
@@ -187,32 +521,84 @@ export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
     }
     if (!Number.isFinite(modelStart))
         return [];
+    // These are the same relocated NMO root fields consumed by the game.
+    // Do not search for tag text: XFF metadata can itself contain strings such
+    // as "TEX\0", which is not a serialized TEX record.
+    // TEX/SRF serialized records carry a three-byte prefix before the runtime
+    // object address (the tag itself). Convert the relocated runtime pointer
+    // back to the start of the on-disc record.
+    const textureTable = modelStart + data.getUint32(nmo + 0x40, true) - 3;
+    const textureCount = data.getUint32(nmo + 0x44, true);
+    const surfaceTable = modelStart + data.getUint32(nmo + 0x50, true) - 3;
+    const surfaceCount = data.getUint32(nmo + 0x54, true);
     const drawTable = modelStart + data.getUint32(nmo + 0x60, true);
     const drawCount = data.getUint32(nmo + 0x64, true);
-    if (drawCount > 100000 || drawTable + drawCount * 0x20 > data.byteLength)
+    if (textureCount > 100000 || surfaceCount > 100000 || drawCount > 100000 ||
+        textureTable + textureCount * 0x20 > data.byteLength ||
+        surfaceTable + surfaceCount * 0x120 > data.byteLength ||
+        drawTable + drawCount * 0x20 > data.byteLength)
         return [];
 
-    const texRecords = findTaggedOffsets(bytes, 'TEX\0', 0x20);
-    const srfRecords = findTaggedOffsets(bytes, 'SRF\0', 0x120);
+    const texRecords = Array.from({ length: textureCount }, (_, i) => textureTable + i * 0x20);
+    const srfRecords = Array.from({ length: surfaceCount }, (_, i) => surfaceTable + i * 0x120);
+    if (texRecords.some((record) => ascii(bytes, record + 3, 4) !== 'TEX\0') ||
+        srfRecords.some((record) => ascii(bytes, record + 3, 4) !== 'SRF\0'))
+        return [];
     const xffNames = xff + data.getUint32(xff + 0x58, true);
-    const textureNames = readNames(bytes, xffNames, tex - 3).slice(0, texRecords.length);
+    const textureNames = readNames(bytes, xffNames, textureTable).slice(0, texRecords.length);
     const nmoNames = readNames(bytes, nmo + 4, bytes.length);
     const surfaceNames = nmoNames.slice(texRecords.length, texRecords.length + srfRecords.length);
-    const pathMatch = new TextDecoder('latin1').decode(bytes.subarray(0, Math.min(bytes.length, 0x100)))
-        .match(/nmo\/[A-Za-z0-9_./-]+\.nmo/i);
-    const nmoPath = pathMatch?.[0] ?? '(unknown NMO)';
+    let nmoPath = sourceNameHint || '(NMO)';
+    for (let i = 0; i + 4 < bytes.length; i++) {
+        if (bytes[i] !== 0x6E || bytes[i + 1] !== 0x6D || bytes[i + 2] !== 0x6F || bytes[i + 3] !== 0x2F)
+            continue;
+        let end = i + 4;
+        while (end < bytes.length && end - i < 256 && bytes[end] >= 0x20 && bytes[end] < 0x7F) end++;
+        if (end < bytes.length && bytes[end] === 0) {
+            nmoPath = new TextDecoder().decode(bytes.subarray(i, end));
+            break;
+        }
+    }
     const unsupportedDraws: {
         draw: number;
         surface: string;
         chainSize: number;
+        chainOffset: string;
+        texture: string | null;
+        gsAlpha: string;
+        candidates: {
+            headerBatch: number;
+            headerCount: number;
+            positionBatch: number | null;
+            positionCount: number | null;
+            positionBounds: string | null;
+            streamDetails: string;
+            rejection: string[];
+        }[];
         unpackSequence: string;
     }[] = [];
+    const isInputStream = (batch: UnpackBatch, header: UnpackBatch, slot: number, format?: string): boolean =>
+        batch.address === ((header.address + slot) & 0x03FF) &&
+        !batch.masked && (format === undefined || batch.format === format);
     const outputs = new Map<string, {
         textureName: string | null;
+        secondaryTextureName: string | null;
         isProp: boolean;
+        isLayer1: boolean;
+        isSpecialLayer: boolean;
+        isTranslucent: boolean;
+        isWater: boolean;
+        hasWaterEffect: boolean;
+        gsAlpha: number;
+        gsAlphaFix: number;
+        disableCull: boolean;
         clampS: boolean;
         clampT: boolean;
+        secondaryClampS: boolean;
+        secondaryClampT: boolean;
         vertices: number[];
+        skinningControl: number[];
+        deformationData: number[];
     }>();
     for (let draw = 0; draw < drawCount; draw++) {
         const desc = drawTable + draw * 0x20;
@@ -220,50 +606,132 @@ export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
         const surface = srfRecords[surfaceIndex];
         const textureIndex = surface === undefined ? -1 : data.getUint32(surface + 0x2F, true);
         const textureName = textureNames[textureIndex] ?? null;
-        // The embedded GS packet words are serialized in big-endian byte
-        // order. Primary CLAMP is the data word at +0x90.
-        const clamp = surface === undefined ? 0 : data.getUint32(surface + 0x90, false);
+        const textureMode = surface === undefined ? 0 : data.getUint32(surface + 0x1F, true);
+        const secondaryTextureIndex = surface === undefined ? -1 : data.getUint32(surface + 0x3F, true);
+        const secondaryTextureName = textureMode === 2 ? textureNames[secondaryTextureIndex] ?? null : null;
+        const surfaceFlags = surface === undefined ? 0 : data.getUint32(surface + 0x1B, true);
+        const surfaceName = surfaceNames[surfaceIndex] ?? `surface_${surfaceIndex}`;
+        const hasWaterEffect = (surfaceFlags & 0x2200) === 0x2200;
+        const isWater = hasWaterEffect;
+        const alphaRegister = surface === undefined ? null : readSrfGsRegister(data, surface, 0x42);
+        const gsAlpha = alphaRegister === null ? 0x44 : Number(alphaRegister & 0xFFFFFFFFn);
+        const gsAlphaFix = alphaRegister === null ? 0x80 : Number(alphaRegister >> 32n & 0xFFn);
+        // Ordered exactly as modelGetDlLayer. The final ordinary-material
+        // branches depend on runtime model/fade state, but every nonordinary
+        // branch below is determined before those fields are consulted.
+        let fixedDisplayLayer: number | null = null;
+        if ((surfaceFlags & 0x01020000) !== 0) fixedDisplayLayer = 8;
+        else if ((surfaceFlags & 0x00800000) !== 0) fixedDisplayLayer = 10;
+        else if ((surfaceFlags & 0x02000000) !== 0) fixedDisplayLayer = 16;
+        else if ((surfaceFlags & 0x00000200) !== 0) fixedDisplayLayer = 17;
+        else if ((surfaceFlags & 0x00000400) !== 0)
+            fixedDisplayLayer = (surfaceFlags & 0x00000100) !== 0 ? 13 : 12;
+        else if ((surfaceFlags & 0x00004000) !== 0) fixedDisplayLayer = 1;
+        else if ((surfaceFlags & 0x00008000) !== 0) fixedDisplayLayer = 18;
+        const isLayer1 = fixedDisplayLayer === 1;
+        const isSpecialLayer = fixedDisplayLayer !== null && fixedDisplayLayer !== 1;
+        // modelGetDlLayer tests this bit in the final ordinary-material
+        // branch, selecting blended layer 3/6 instead of opaque layer 2/5.
+        const isTranslucent = fixedDisplayLayer === null && (surfaceFlags & 0x00000100) !== 0;
+        const clampRegister = surface === undefined ? null : readSrfGsRegister(data, surface, 0x08);
+        const clamp = clampRegister === null ? 0 : Number(clampRegister & 0xFFFFFFFFn);
         const wms = clamp & 0x03, wmt = (clamp >>> 2) & 0x03;
-        const key = `${textureName ?? `__untextured_${surfaceNames[surfaceIndex] ?? surfaceIndex}`}|${wms}|${wmt}`;
+        const secondaryClampRegister = surface === undefined ? null : readSrfGsRegister(data, surface, 0x09);
+        const secondaryClamp = secondaryClampRegister === null ? 0 : Number(secondaryClampRegister & 0xFFFFFFFFn);
+        const secondaryWms = secondaryClamp & 0x03, secondaryWmt = (secondaryClamp >>> 2) & 0x03;
+        // A translucent draw needs its own spatial bounds and sort key.
+        // Coalescing all uses of a material across an NMO made unrelated
+        // foliage, decals, and prop instances sort as one cell-sized object.
+        const sortGroup = isTranslucent ? `draw${draw}` : '';
+        const key = `${textureName ?? `__untextured_${surfaceName}`}|${secondaryTextureName ?? ''}|${wms}|${wmt}|${secondaryWms}|${secondaryWmt}|${surfaceFlags}|${gsAlpha}|${gsAlphaFix}|${isWater}|${sortGroup}`;
         const output = outputs.get(key) ?? {
             textureName,
-            // Temporary non-terrain material classification used by the
-            // render-hack checkbox; this is not a decoded layout/PRF owner.
-            isProp: !/^(?:world_|z_(?:iwahada|gake|rock)|ground|wall|road|cliff|mountain|water)/i
-                .test(surfaceNames[surfaceIndex] ?? ''),
+            secondaryTextureName,
+            // Terrain-cell NMO geometry is never controlled by Enable Props.
+            // Stage-layout ownership is assigned by parseStageBundle.
+            isProp: false,
+            isLayer1,
+            isSpecialLayer,
+            isTranslucent,
+            isWater,
+            hasWaterEffect,
+            gsAlpha,
+            gsAlphaFix,
+            disableCull: (surfaceFlags & 0x00010000) !== 0,
             clampS: wms !== 0,
             clampT: wmt !== 0,
+            secondaryClampS: secondaryWms !== 0,
+            secondaryClampT: secondaryWmt !== 0,
             vertices: [],
+            skinningControl: [],
+            deformationData: [],
         };
         const out = output.vertices;
         outputs.set(key, output);
         const chainSize = data.getUint32(desc, true);
         const chainStart = modelStart + data.getUint32(desc + 0x10, true);
-        if (chainStart + chainSize > tex - 3) continue;
+        if (chainStart + chainSize > textureTable) continue;
         const batches = collectVifBatches(data, chainStart, chainSize);
         let decodedThisDraw = false;
+        let decodedTriangleCount = 0;
         for (let i = 0; i + 2 < batches.length; i++) {
             const h = batches[i], p = batches[i + 1];
             let nrm: UnpackBatch | null = null;
+            let packedNrm: UnpackBatch | null = null;
+            let deformation: UnpackBatch | null = null;
+            let skinning = false;
             let uv: UnpackBatch | null;
             let c: UnpackBatch;
             let batchCount: number;
-            if (batches[i + 2].format === 'V4-8') {
+            if (i + 3 < batches.length &&
+                isInputStream(batches[i + 2], h, 2, 'V3-32') &&
+                isInputStream(batches[i + 3], h, 3, 'V4-8')) {
+                // VU 0x10a58 loads position, normal, and integer color from
+                // offsets 0, 1, and 2, then advances by three qwords at
+                // 0x10b78. The normal is transformed through vf13..vf16 and
+                // modulates the converted color at 0x10b48.
+                nrm = batches[i + 2];
+                uv = null;
+                c = batches[i + 3];
+                batchCount = 4;
+            } else if (isInputStream(batches[i + 2], h, 2, 'V4-8')) {
                 // Untextured/helper geometry omits the UV stream.
                 uv = null;
                 c = batches[i + 2];
                 batchCount = 3;
-            } else if (i + 4 < batches.length &&
-                batches[i + 2].format === 'V3-32' &&
+            } else if (i + 5 < batches.length &&
+                isInputStream(batches[i + 2], h, 2, 'V4-16') &&
+                isInputStream(batches[i + 3], h, 3) &&
                 (batches[i + 3].format === 'V2-16' || batches[i + 3].format === 'V4-16') &&
-                batches[i + 4].format === 'V4-8') {
+                isInputStream(batches[i + 4], h, 4, 'V4-8') &&
+                isInputStream(batches[i + 5], h, 5, 'V4-32') &&
+                p.count === batches[i + 2].count &&
+                p.count === batches[i + 3].count &&
+                p.count === batches[i + 4].count &&
+                p.count === batches[i + 5].count) {
+                // Deformable six-stream prop input. V4-16 is a signed
+                // fixed-point normal; V4-8 and the trailing V4-32 are skinning
+                // control/data, not vertex color or another strip header.
+                packedNrm = batches[i + 2];
+                uv = batches[i + 3];
+                c = batches[i + 4];
+                deformation = batches[i + 5];
+                skinning = true;
+                batchCount = 6;
+            } else if (i + 4 < batches.length &&
+                isInputStream(batches[i + 2], h, 2, 'V3-32') &&
+                isInputStream(batches[i + 3], h, 3) &&
+                (batches[i + 3].format === 'V2-16' || batches[i + 3].format === 'V4-16') &&
+                isInputStream(batches[i + 4], h, 4, 'V4-8')) {
                 // Lit geometry can provide a serialized normal for each
                 // position before its UV and color streams.
                 nrm = batches[i + 2];
                 uv = batches[i + 3];
                 c = batches[i + 4];
                 batchCount = 5;
-            } else if (i + 3 < batches.length) {
+            } else if (i + 3 < batches.length &&
+                isInputStream(batches[i + 2], h, 2) &&
+                isInputStream(batches[i + 3], h, 3, 'V4-8')) {
                 uv = batches[i + 2];
                 c = batches[i + 3];
                 batchCount = 4;
@@ -271,9 +739,26 @@ export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
                 continue;
             }
             if (h.format !== 'V4-32' || p.format !== 'V3-32' ||
+                h.count !== 1 || h.masked || h.unsigned || p.unsigned ||
+                !isInputStream(p, h, 1, 'V3-32') ||
                 (uv !== null && uv.format !== 'V2-16' && uv.format !== 'V4-16') ||
+                (uv !== null && uv.unsigned) || !c.unsigned ||
                 c.format !== 'V4-8' || (nrm !== null && p.count !== nrm.count) ||
                 (uv !== null && p.count !== uv.count) || p.count !== c.count)
+                continue;
+            // The game uploads a structure-of-arrays packet into an
+            // array-of-structures VU block with STCYCL(WL=1, CL=stride).
+            // Destination offsets 1..stride select each vertex member.
+            const vertexStreams = [p, nrm, packedNrm, uv, c, deformation]
+                .filter((batch): batch is UnpackBatch => batch !== null);
+            const inputStride = batchCount - 1;
+            if (!vertexStreams.every((batch) => batch.cycleWL === 1 && batch.cycleCL === inputStride))
+                continue;
+            // At 0x109f0 the VU reads header.x with ILWR and masks it with
+            // 0x7ff. This is the authoritative strip vertex count; do not
+            // infer topology solely from the adjacent UNPACK command.
+            const headerVertexCount = data.getUint32(h.payloadOffset, true) & 0x07FF;
+            if (headerVertexCount !== p.count)
                 continue;
             decodedThisDraw = true;
             const emit = (vertex: number, nx: number, ny: number, nz: number) => {
@@ -285,16 +770,40 @@ export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
                     nx = data.getFloat32(no, true);
                     ny = data.getFloat32(no + 4, true);
                     nz = -data.getFloat32(no + 8, true);
+                } else if (packedNrm !== null) {
+                    const no = packedNrm.payloadOffset + vertex * 8;
+                    nx = data.getInt16(no, true) / 4096;
+                    ny = data.getInt16(no + 2, true) / 4096;
+                    nz = -data.getInt16(no + 4, true) / 4096;
+                    const length = Math.hypot(nx, ny, nz);
+                    if (length > 1e-6) {
+                        nx /= length; ny /= length; nz /= length;
+                    }
                 }
                 // Flip Z to move the PS2 coordinate system into noclip space.
                 out.push(data.getFloat32(po, true), data.getFloat32(po + 4, true), -data.getFloat32(po + 8, true),
                     nx, ny, nz,
-                    Math.min(1, data.getUint8(co) / 128), Math.min(1, data.getUint8(co + 1) / 128),
-                    Math.min(1, data.getUint8(co + 2) / 128), Math.min(1, data.getUint8(co + 3) / 128),
+                    skinning ? 1 : Math.min(1, data.getUint8(co) / 128),
+                    skinning ? 1 : Math.min(1, data.getUint8(co + 1) / 128),
+                    skinning ? 1 : Math.min(1, data.getUint8(co + 2) / 128),
+                    skinning ? 1 : Math.min(1, data.getUint8(co + 3) / 128),
                     uv === null ? 0 : data.getInt16(uvo, true) / 4096,
-                    uv === null ? 0 : data.getInt16(uvo + 2, true) / 4096);
+                    uv === null ? 0 : data.getInt16(uvo + 2, true) / 4096,
+                    uv === null || uv.format !== 'V4-16' ? (uv === null ? 0 : data.getInt16(uvo, true) / 4096) : data.getInt16(uvo + 4, true) / 4096,
+                    uv === null || uv.format !== 'V4-16' ? (uv === null ? 0 : data.getInt16(uvo + 2, true) / 4096) : data.getInt16(uvo + 6, true) / 4096);
+                if (skinning && deformation !== null) {
+                    output.skinningControl.push(
+                        data.getUint8(co), data.getUint8(co + 1),
+                        data.getUint8(co + 2), data.getUint8(co + 3),
+                    );
+                    const deform = deformation.payloadOffset + vertex * 16;
+                    output.deformationData.push(
+                        data.getUint32(deform, true), data.getUint32(deform + 4, true),
+                        data.getUint32(deform + 8, true), data.getUint32(deform + 12, true),
+                    );
+                }
             };
-            for (let v = 2; v < p.count; v++) {
+            for (let v = 2; v < headerVertexCount; v++) {
                 let a = v - 2, b = v - 1;
                 if (v & 1) [a, b] = [b, a];
                 const po0 = p.payloadOffset + a * 12, po1 = p.payloadOffset + b * 12, po2 = p.payloadOffset + v * 12;
@@ -307,18 +816,69 @@ export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
                 const length = Math.hypot(nx, ny, nz);
                 if (length < 1e-6) continue;
                 nx /= length; ny /= length; nz /= length;
+                decodedTriangleCount++;
                 emit(a, nx, ny, nz); emit(b, nx, ny, nz); emit(v, nx, ny, nz);
             }
             i += batchCount - 1;
         }
-        if (!decodedThisDraw) {
+        if (!decodedThisDraw || decodedTriangleCount === 0) {
+            const candidates = batches.flatMap((header, headerBatch) => {
+                if (header.format !== 'V4-32' || header.count !== 1) return [];
+                const positionBatch = headerBatch + 1 < batches.length ? headerBatch + 1 : null;
+                const position = positionBatch === null ? null : batches[positionBatch];
+                const headerCount = data.getUint32(header.payloadOffset, true) & 0x07FF;
+                const rejection: string[] = [];
+                if (header.masked) rejection.push('header is masked');
+                if (header.unsigned) rejection.push('header is unsigned');
+                if (position === null) rejection.push('missing position stream');
+                else {
+                    if (position.format !== 'V3-32') rejection.push(`position format is ${position.format}`);
+                    if (position.address !== ((header.address + 1) & 0x03FF))
+                        rejection.push(`position destination is 0x${position.address.toString(16)}, expected 0x${((header.address + 1) & 0x03FF).toString(16)}`);
+                    if (position.unsigned) rejection.push('position is unsigned');
+                    if (position.count !== headerCount)
+                        rejection.push(`header count ${headerCount} != position count ${position.count}`);
+                }
+                let positionBounds: string | null = null;
+                if (position !== null && position.format === 'V3-32') {
+                    const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+                    for (let v = 0; v < position.count; v++) {
+                        const o = position.payloadOffset + v * 12;
+                        const x = data.getFloat32(o, true), y = data.getFloat32(o + 4, true), z = -data.getFloat32(o + 8, true);
+                        bounds[0] = Math.min(bounds[0], x); bounds[1] = Math.min(bounds[1], y); bounds[2] = Math.min(bounds[2], z);
+                        bounds[3] = Math.max(bounds[3], x); bounds[4] = Math.max(bounds[4], y); bounds[5] = Math.max(bounds[5], z);
+                    }
+                    positionBounds = `[${bounds.slice(0, 3).join(', ')}]..[${bounds.slice(3, 6).join(', ')}]`;
+                }
+                const streams = batches.slice(headerBatch, Math.min(batches.length, headerBatch + 7));
+                return [{
+                    headerBatch,
+                    headerCount,
+                    positionBatch,
+                    positionCount: position?.count ?? null,
+                    positionBounds,
+                    streamDetails: streams.map((b) =>
+                        `${b.format}@0x${b.address.toString(16)} x${b.count} ` +
+                        `cycle=${b.cycleCL}/${b.cycleWL} ${b.unsigned ? 'unsigned' : 'signed'}${b.masked ? ' masked' : ''}`,
+                    ).join(' | '),
+                    rejection: rejection.length === 0
+                        ? [decodedThisDraw ? 'layout decoded but emitted zero nondegenerate triangles' : 'stream layout did not match a supported VU path']
+                        : rejection,
+                }];
+            });
             unsupportedDraws.push({
                 draw,
                 surface: surfaceNames[surfaceIndex] ?? `surface_${surfaceIndex}`,
                 chainSize,
+                chainOffset: `0x${chainStart.toString(16)}`,
+                texture: textureName,
+                gsAlpha: `0x${gsAlpha.toString(16).padStart(8, '0')}`,
+                candidates,
                 unpackSequence: batches.length === 0
                     ? '(no recognized UNPACK commands)'
-                    : batches.slice(0, 24).map((batch) => `${batch.format}x${batch.count}`).join(' → ') +
+                    : batches.slice(0, 24).map((batch) =>
+                        `${batch.format}@${batch.address.toString(16)}x${batch.count}`,
+                    ).join(' → ') +
                         (batches.length > 24 ? ` → … (+${batches.length - 24})` : ''),
             });
         }
@@ -335,11 +895,25 @@ export function parseTerrainCell(buffer: ArrayBufferSlice): TerrainMesh[] {
             console.warn('[SotC] unsupported draw-chain trace budget exhausted; further examples are suppressed');
     }
     return [...outputs.values()].map((output) => ({
+        sourceName: nmoPath,
         textureName: output.textureName,
+        secondaryTextureName: output.secondaryTextureName,
         isProp: output.isProp,
+        isLayer1: output.isLayer1,
+        isSpecialLayer: output.isSpecialLayer,
+        isTranslucent: output.isTranslucent,
+        isWater: output.isWater,
+        hasWaterEffect: output.hasWaterEffect,
+        gsAlpha: output.gsAlpha,
+        gsAlphaFix: output.gsAlphaFix,
+        disableCull: output.disableCull,
         clampS: output.clampS,
         clampT: output.clampT,
+        secondaryClampS: output.secondaryClampS,
+        secondaryClampT: output.secondaryClampT,
         vertices: new Float32Array(output.vertices),
+        skinningControl: output.skinningControl.length === 0 ? undefined : new Uint8Array(output.skinningControl),
+        deformationData: output.deformationData.length === 0 ? undefined : new Uint32Array(output.deformationData),
     }));
 }
 
@@ -348,6 +922,9 @@ export interface DecodedTexture {
     width: number;
     height: number;
     pixels: Uint8Array;
+    alphaTest: number;
+    alphaReference: number;
+    alphaFail: number;
 }
 
 export function parseTexturePack(file: ArrayBufferSlice, physicalSheetCount: number, decompress: (src: Uint8Array) => Uint8Array): DecodedTexture[] {
@@ -366,11 +943,18 @@ export function parseTexturePack(file: ArrayBufferSlice, physicalSheetCount: num
     const paletteBasePointer = 0x2000;
     for (let offset = 0; offset + 0x20 <= payload.length;) {
         if (ascii(payload, offset, 4) !== 'NTO2') { offset++; continue; }
+        if (offset + 0x98 > payload.length) break;
         const data = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
         const pixelOffset = data.getUint32(offset + 0x14, true);
         const paletteOffset = data.getUint32(offset + 0x18, true);
         const packed = data.getUint32(offset + 0x1C, true);
         const psm = packed & 0x3F;
+        // texTransResolve copies these NTO2 fields directly into GS TEST:
+        // ATST[3:1], AREF[11:4], and AFAIL[13:12]. ATE is always enabled.
+        const alphaTest = data.getUint32(offset + 0x80, true);
+        const alphaReference = data.getUint32(offset + 0x84, true);
+        const alphaFail = data.getUint32(offset + 0x88, true);
+        const baseMipUsesPsmct32Transfer = (payload[offset + 0x1F] & 0x01) !== 0;
         const width = 1 << (data.getUint16(offset + 0x1E, true) & 0x0F);
         const height = 1 << ((packed >>> 20) & 0x0F);
         const paletteBytes = psm === 0x14 ? 0x40 : psm === 0x13 ? 0x400 : 0;
@@ -384,13 +968,14 @@ export function parseTexturePack(file: ArrayBufferSlice, physicalSheetCount: num
         if (psm === GSPixelStorageFormat.PSMT4 || psm === GSPixelStorageFormat.PSMT8) {
             const tbw = Math.max(1, Math.ceil(width / 64));
             const texels = ArrayBufferSlice.fromView(payload.subarray(offset + pixelOffset, offset + paletteOffset));
-            // The game transfers PSMT4 payloads through a PSMCT32 host-to-local
-            // transfer, then samples the resulting GS memory as PSMT4. This
-            // cross-format transfer performs the characteristic 4-bit swizzle.
-            if (psm === GSPixelStorageFormat.PSMT4)
+            // texTransResolve tests one bit per mip at NTO2 +0x1f. A set bit
+            // uploads indexed texels as PSMCT32 using the reduced transfer
+            // dimensions below, then samples that memory with the declared
+            // indexed PSM. A clear bit uploads directly in the declared PSM.
+            if (baseMipUsesPsmct32Transfer)
                 gsMemoryMapUploadImage(
                     gsMap, GSPixelStorageFormat.PSMCT32, textureBasePointer, Math.max(1, tbw >>> 1),
-                    0, 0, width >>> 1, height >>> 2, texels,
+                    0, 0, width >>> 1, height >>> (psm === GSPixelStorageFormat.PSMT4 ? 2 : 1), texels,
                 );
             else
                 gsMemoryMapUploadImage(
@@ -422,7 +1007,7 @@ export function parseTexturePack(file: ArrayBufferSlice, physicalSheetCount: num
             }
         } else { offset = nameEnd + 1; continue; }
         if (name.length !== 0 && !textures.has(name))
-            textures.set(name, { name, width, height, pixels });
+            textures.set(name, { name, width, height, pixels, alphaTest, alphaReference, alphaFail });
         offset = nameEnd + 1;
     }
     return [...textures.values()];

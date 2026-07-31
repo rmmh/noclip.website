@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-// SotC stores the world split into a 60x60 grid of individual levels.
+// SotC stores the world split into a 60x60 grid of individual cells.
 // They are duplicated in horizontal and vertical strips for better disc
-// streaming, and additionally in two LODs. 
+// streaming, and additionally in two LODs. Cells can reference "stages",
+// typically used for skyboxes and other larger common resources.
 //
 // The low LOD is only ~40% smaller than the high LOD, so this extractor
-// just packs the high LODs into 4x4 chunks (15x15 total), ~270KB each.
+// just packs the high LODs into 4x4 chunks (15x15 grid total), ~270KB each.
+// The textures go into one archive (6MB), and stages go into stage/$id.bin.
 
 import { mkdirSync, openSync, readSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -13,7 +15,7 @@ import { constants as zlibConstants, zstdCompressSync } from 'node:zlib';
 
 const ISO_SECTOR_SIZE = 2048;
 const PVD_SECTOR = 16;
-const ZSTD_LEVEL = 22;
+const ZSTD_LEVEL = 3;
 const ZSTD_OPTIONS = {
     params: { [zlibConstants.ZSTD_c_compressionLevel]: ZSTD_LEVEL },
 };
@@ -31,6 +33,10 @@ type WorldIndex = {
 type TextureIndex = {
     logicalIdMap: number[];
     commonRefs: FileRef[];
+};
+
+type StageIndex = TextureIndex & {
+    localizedRefs: FileRef[];
 };
 
 class RandomAccessFile {
@@ -128,6 +134,7 @@ function readRefs(reader: NicoReader, count: number): FileRef[] {
 }
 
 function parseNicoIndex(file: RandomAccessFile, nicoOffset: number): {
+    stages: StageIndex;
     textures: TextureIndex;
     world: WorldIndex;
 } {
@@ -138,13 +145,18 @@ function parseNicoIndex(file: RandomAccessFile, nicoOffset: number): {
     const stringPoolSize = reader.u32();
     const segmentNames = splitNullStrings(reader.bytes(stringPoolSize));
 
+    let stages: StageIndex;
     let textures: TextureIndex;
     for (let i = 0; i < segmentCount; i++) {
         const logicalIdCount = reader.u32();
         const logicalIdMap = Array.from({ length: logicalIdCount }, () => reader.u16());
         const commonRefCount = reader.u32();
         const localizedRefCount = reader.u32();
-        if (segmentNames[i] === 'stagetexseg_def') {
+        if (segmentNames[i] === 'stage') {
+            const commonRefs = readRefs(reader, commonRefCount);
+            const localizedRefs = readRefs(reader, localizedRefCount);
+            stages = { logicalIdMap, commonRefs, localizedRefs };
+        } else if (segmentNames[i] === 'stagetexseg_def') {
             const commonRefs = readRefs(reader, commonRefCount);
             reader.skip(localizedRefCount * 8);
             textures = { logicalIdMap, commonRefs };
@@ -169,7 +181,98 @@ function parseNicoIndex(file: RandomAccessFile, nicoOffset: number): {
         }
     }
 
-    return { textures: textures!, world: { name, hiRefs } };
+    return { stages: stages!, textures: textures!, world: { name, hiRefs } };
+}
+
+function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
+    const data = source.read(stages.commonRefs[0].isoOffset, stages.commonRefs[0].byteSize);
+    const coarse = Array.from({ length: 100 }, () => new Set<number>());
+    const fine = Array.from({ length: 1600 }, () => ({
+        stages: new Set<number>(), aliveBosses: new Set<number>(), deadBosses: new Set<number>(),
+    }));
+    for (let at = data.indexOf('xff2'); at >= 0; at = data.indexOf('xff2', at + 4)) {
+        const xff = data.subarray(at);
+        const symbolCount = xff.readUInt32LE(0x24);
+        const sectionCount = xff.readUInt32LE(0x40);
+        const symbolTable = xff.readUInt32LE(0x54);
+        const strings = xff.readUInt32LE(0x58);
+        const sectionTable = xff.readUInt32LE(0x5c);
+        if (symbolTable + symbolCount * 0x10 > xff.length ||
+            sectionTable + sectionCount * 0x20 > xff.length)
+            continue;
+        for (let i = 0; i < symbolCount; i++) {
+            const s = symbolTable + i * 0x10;
+            const end = xff.indexOf(0, strings + xff.readUInt32LE(s));
+            const name = xff.toString('ascii', strings + xff.readUInt32LE(s), end);
+            const match = /^_SeamlessLayoutNICOWORLD_([A-J])([0-9])(?:_|$)/.exec(name);
+            if (name !== '_WorldLayoutNICOWORLD' && !match)
+                continue;
+            const section = sectionTable + xff.readUInt16LE(s + 0x0e) * 0x20;
+            const body = xff.subarray(
+                xff.readUInt32LE(section + 0x1c) + xff.readUInt32LE(s + 4),
+                xff.readUInt32LE(section + 0x1c) + xff.readUInt32LE(s + 4) +
+                    xff.readUInt32LE(s + 8),
+            );
+            if (name === '_WorldLayoutNICOWORLD') {
+                for (let n = 0; n < 100; n++) {
+                    const ids = [0, 4].flatMap((o) => {
+                        const token = body.readUInt32LE(n * 0x9c + o);
+                        return token ? [(token >>> 18) & 0xfff] : [];
+                    });
+                    ids.forEach((id) => coarse[n].add(id));
+                }
+            }
+            if (match) {
+                const bx = match[1].charCodeAt(0) - 65;
+                const by = Number(match[2]);
+                for (let n = 0; n < 16; n++) {
+                    const cell = fine[(by * 4 + Math.floor(n / 4)) * 40 + bx * 4 + n % 4];
+                    for (const [o, set] of [
+                        [0, cell.stages], [8, cell.stages], [12, cell.stages], [16, cell.stages],
+                        [20, cell.aliveBosses], [28, cell.deadBosses],
+                    ] as const) {
+                        const token = body.readUInt32LE(n * 0x3c + o);
+                        if (token) set.add((token >>> 18) & 0xfff);
+                    }
+                }
+            }
+        }
+    }
+    const coarseCells = coarse.map((cell) => [...cell].sort((a, b) => a - b));
+    const fineCells = fine.map((cell) => ({
+        stages: [...cell.stages].sort((a, b) => a - b),
+        aliveBosses: [...cell.aliveBosses].sort((a, b) => a - b),
+        deadBosses: [...cell.deadBosses].sort((a, b) => a - b),
+    }));
+    return {
+        coarseWidth: 10,
+        coarseHeight: 10,
+        fineSide: 4,
+        coarseCells,
+        fineCells,
+        ids: [...new Set([...coarseCells.flat(), ...fineCells.flatMap((cell) =>
+            [...cell.stages, ...cell.aliveBosses, ...cell.deadBosses])])].sort((a, b) => a - b),
+    };
+}
+
+function writeStages(
+    source: RandomAccessFile,
+    outDir: string,
+    stages: StageIndex,
+    ids: number[],
+) {
+    const dir = join(outDir, 'stage');
+    mkdirSync(dir, { recursive: true });
+    let byteSize = 0;
+    for (const id of ids) {
+        const encoded = stages.logicalIdMap[id];
+        const refs = encoded & 0x8000 ? stages.localizedRefs : stages.commonRefs;
+        const ref = refs[encoded & 0x7fff];
+        const packed = zstdCompressSync(source.read(ref.isoOffset, ref.byteSize), ZSTD_OPTIONS);
+        writeFileSync(join(dir, `${id}.bin`), packed);
+        byteSize += packed.length;
+    }
+    return byteSize;
 }
 
 const HI_PACK_SIDE = 4;
@@ -262,6 +365,8 @@ function main(): void {
     mkdirSync(outDir, { recursive: true });
     const levels = writeHiPacks(file, outDir, index.world);
     const textures = writeTexturePack(file, outDir, index.textures);
+    const stageGrid = worldStageGrid(file, index.stages);
+    const stageBytes = writeStages(file, outDir, index.stages, stageGrid.ids);
 
     const manifest = {
         format: 'sotc-viewer-pack-manifest-v1',
@@ -275,12 +380,20 @@ function main(): void {
             file: textures.file,
             logicalIdMap: textures.logicalIdMap,
         },
+        stageGrid: {
+            coarseWidth: stageGrid.coarseWidth,
+            coarseHeight: stageGrid.coarseHeight,
+            fineSide: stageGrid.fineSide,
+            coarseCells: stageGrid.coarseCells,
+            fineCells: stageGrid.fineCells,
+        },
     };
     writeFileSync(join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 
     console.log(
         `Wrote ${(levels.byteSize / 1_000_000).toFixed(2)} MB of levels and ` +
-        `${(textures.byteSize / 1_000_000).toFixed(2)} MB of textures`,
+        `${(textures.byteSize / 1_000_000).toFixed(2)} MB of textures and ` +
+        `${(stageBytes / 1_000_000).toFixed(2)} MB of stages`,
     );
 }
 
