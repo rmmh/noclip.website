@@ -171,6 +171,85 @@ function transformMesh(mesh: TerrainMesh, matrix: mat4): TerrainMesh {
     return { ...mesh, isProp: true, vertices };
 }
 
+interface SheetSegmentEntry {
+    path: string;
+    payloadStart: number;
+    payloadSize: number;
+}
+
+// Mirrors MANAGER.XFF__SheetSegmentLoad: a primary XFF2 directory followed by
+// optional per-sheet secondary resource blocks.
+function parseSheetSegmentEntries(bytes: Uint8Array): SheetSegmentEntry[] {
+    const data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (data.byteLength < 4)
+        throw new Error('Truncated sheet-segment header');
+    const entryCount = data.getUint32(0, true);
+    const directoryEnd = 4 + entryCount * 0x10;
+    if (entryCount > 0x10000 || directoryEnd > data.byteLength)
+        throw new Error('Invalid sheet-segment directory');
+    const entries: SheetSegmentEntry[] = [];
+    const directoryEntries = Array.from({ length: entryCount }, (_, index) => {
+        const directory = 4 + index * 0x10;
+        return {
+            primarySize: data.getUint32(directory + 0x08, true),
+            secondarySize: data.getUint32(directory + 0x0C, true),
+        };
+    });
+    let entryStart = directoryEnd;
+    for (let index = 0; index < entryCount; index++) {
+        const entrySize = directoryEntries[index].primarySize;
+        if (entrySize < 8 || entryStart + entrySize > data.byteLength)
+            throw new Error(`Invalid sheet-segment entry ${index} size`);
+        const pathSize = data.getUint32(entryStart, true);
+        const payloadSize = data.getUint32(entryStart + 4, true);
+        const payloadStart = entryStart + 8 + pathSize;
+        if (pathSize === 0 || bytes[payloadStart - 1] !== 0 ||
+            8 + pathSize + payloadSize > entrySize)
+            throw new Error(`Invalid sheet-segment entry ${index} payload`);
+        entries.push({
+            path: ascii(bytes, entryStart + 8, pathSize - 1),
+            payloadStart,
+            payloadSize,
+        });
+        entryStart += entrySize;
+    }
+    for (let index = 0; index < entryCount; index++) {
+        const blockSize = directoryEntries[index].secondarySize;
+        if (blockSize === 0)
+            continue;
+        const blockEnd = entryStart + blockSize;
+        if (entryStart + 8 > data.byteLength || blockEnd > data.byteLength)
+            throw new Error(`Invalid sheet-segment resource block ${index}`);
+        const resourceCount = data.getUint32(entryStart, true);
+        const groupNameSize = data.getUint32(entryStart + 4, true);
+        entryStart += 8;
+        if (groupNameSize === 0 || entryStart + groupNameSize > blockEnd ||
+            bytes[entryStart + groupNameSize - 1] !== 0)
+            throw new Error(`Invalid sheet-segment resource group ${index}`);
+        entryStart += groupNameSize;
+        for (let resource = 0; resource < resourceCount; resource++) {
+            if (entryStart + 0x10 > blockEnd)
+                throw new Error(`Invalid sheet-segment resource ${index}:${resource}`);
+            const pathSize = data.getUint32(entryStart + 8, true);
+            const payloadSize = data.getUint32(entryStart + 0x0C, true);
+            entryStart += 0x10;
+            const payloadStart = entryStart + pathSize;
+            if (pathSize === 0 || payloadStart + payloadSize > blockEnd ||
+                bytes[payloadStart - 1] !== 0)
+                throw new Error(`Invalid sheet-segment resource payload ${index}:${resource}`);
+            entries.push({
+                path: ascii(bytes, entryStart, pathSize - 1),
+                payloadStart,
+                payloadSize,
+            });
+            entryStart = payloadStart + payloadSize;
+        }
+        if (entryStart !== blockEnd)
+            throw new Error(`Sheet-segment resource block ${index} size mismatch`);
+    }
+    return entries;
+}
+
 function readSrfGsRegister(data: DataView, surface: number, wantedAddress: number): bigint | null {
     const end = Math.min(data.byteLength, surface + 0xC0);
     for (let cursor = surface + 0x60; cursor + 4 <= end;) {
@@ -354,70 +433,7 @@ export function parseStageBundle(
 ): TerrainMesh[] {
     const bytes = buffer.createTypedArray(Uint8Array);
     const data = buffer.createDataView();
-    const entryCount = data.getUint32(0, true);
-    const directoryEnd = 4 + entryCount * 0x10;
-    if (entryCount > 0x10000 || directoryEnd > data.byteLength)
-        throw new Error('Invalid stage-bundle directory');
-    const entries: { path: string; payloadStart: number; payloadSize: number }[] = [];
-    const directoryEntries = Array.from({ length: entryCount }, (_, index) => {
-        const directory = 4 + index * 0x10;
-        return {
-            primarySize: data.getUint32(directory + 0x08, true),
-            secondarySize: data.getUint32(directory + 0x0C, true),
-        };
-    });
-    let entryStart = directoryEnd;
-    for (let index = 0; index < entryCount; index++) {
-        const entrySize = directoryEntries[index].primarySize;
-        if (entrySize < 8 || entryStart + entrySize > data.byteLength)
-            throw new Error(`Invalid stage-bundle entry ${index} size`);
-        const pathSize = data.getUint32(entryStart, true);
-        const payloadSize = data.getUint32(entryStart + 4, true);
-        const payloadStart = entryStart + 8 + pathSize;
-        if (pathSize === 0 || bytes[payloadStart - 1] !== 0 ||
-            8 + pathSize + payloadSize > entrySize)
-            throw new Error(`Invalid stage-bundle entry ${index} payload`);
-        entries.push({
-            path: ascii(bytes, entryStart + 8, pathSize - 1),
-            payloadStart,
-            payloadSize,
-        });
-        entryStart += entrySize;
-    }
-    for (let index = 0; index < entryCount; index++) {
-        const blockSize = directoryEntries[index].secondarySize;
-        if (blockSize === 0)
-            continue;
-        const blockEnd = entryStart + blockSize;
-        if (entryStart + 8 > data.byteLength || blockEnd > data.byteLength)
-            throw new Error(`Invalid stage-bundle resource block ${index}`);
-        const resourceCount = data.getUint32(entryStart, true);
-        const groupNameSize = data.getUint32(entryStart + 4, true);
-        entryStart += 8;
-        if (groupNameSize === 0 || entryStart + groupNameSize > blockEnd ||
-            bytes[entryStart + groupNameSize - 1] !== 0)
-            throw new Error(`Invalid stage-bundle resource group ${index}`);
-        entryStart += groupNameSize;
-        for (let resource = 0; resource < resourceCount; resource++) {
-            if (entryStart + 0x10 > blockEnd)
-                throw new Error(`Invalid stage-bundle resource ${index}:${resource}`);
-            const pathSize = data.getUint32(entryStart + 8, true);
-            const payloadSize = data.getUint32(entryStart + 0x0C, true);
-            entryStart += 0x10;
-            const payloadStart = entryStart + pathSize;
-            if (pathSize === 0 || payloadStart + payloadSize > blockEnd ||
-                bytes[payloadStart - 1] !== 0)
-                throw new Error(`Invalid stage-bundle resource payload ${index}:${resource}`);
-            entries.push({
-                path: ascii(bytes, entryStart, pathSize - 1),
-                payloadStart,
-                payloadSize,
-            });
-            entryStart = payloadStart + payloadSize;
-        }
-        if (entryStart !== blockEnd)
-            throw new Error(`Stage-bundle resource block ${index} size mismatch`);
-    }
+    const entries = parseSheetSegmentEntries(bytes);
     interface XffSymbol {
         name: string;
         body: number;
@@ -1359,14 +1375,26 @@ export interface DecodedTexture {
 export function parseTexturePack(file: ArrayBufferSlice, physicalSheetCount: number, decompress: (src: Uint8Array) => Uint8Array): DecodedTexture[] {
     const bytes = file.createTypedArray(Uint8Array);
     const view = file.createDataView();
-    let payload: Uint8Array;
-    if (ascii(bytes, 0, 8) === 'SOTCTX1\0') {
-        const tableSize = view.getUint32(0x10, true);
-        payload = decompress(bytes.subarray(0x30 + tableSize));
-    } else {
-        payload = decompress(bytes.subarray(physicalSheetCount * 4));
+    if (ascii(bytes, 0, 8) === 'SOTCTX1\0')
+        throw new Error('Unsupported SOTCTX1 texture-pack directory');
+    const tableSize = physicalSheetCount * 4;
+    if (tableSize > bytes.length)
+        throw new Error('Truncated stage-texture size table');
+    const payload = decompress(bytes.subarray(tableSize));
+    const textures = new Map<string, DecodedTexture>();
+    let offset = 0;
+    for (let index = 0; index < physicalSheetCount; index++) {
+        const byteSize = view.getUint32(index * 4, true);
+        if (offset + byteSize > payload.length)
+            throw new Error(`Truncated stage-texture sheet ${index}`);
+        for (const texture of parseNto2Textures(payload.subarray(offset, offset + byteSize)))
+            if (!textures.has(texture.name))
+                textures.set(texture.name, texture);
+        offset += byteSize;
     }
-    return parseNto2Textures(payload);
+    if (offset !== payload.length)
+        throw new Error('Stage-texture payload size mismatch');
+    return [...textures.values()];
 }
 
 export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
@@ -1374,10 +1402,42 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
     const gsMap = gsMemoryMapNew();
     const textureBasePointer = 0;
     const paletteBasePointer = 0x2000;
-    for (let offset = 0; offset + 0x20 <= payload.length;) {
-        if (ascii(payload, offset, 4) !== 'NTO2') { offset++; continue; }
-        if (offset + 0x98 > payload.length) break;
-        const data = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const data = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    for (const entry of parseSheetSegmentEntries(payload)) {
+        const moduleStart = entry.payloadStart;
+        const moduleEnd = moduleStart + entry.payloadSize;
+        if (entry.payloadSize < 0x70 || ascii(payload, moduleStart, 4) !== 'xff\0')
+            continue;
+        const symbolCount = data.getUint32(moduleStart + 0x24, true);
+        const sectionCount = data.getUint32(moduleStart + 0x40, true);
+        const symbolTable = data.getUint32(moduleStart + 0x54, true);
+        const symbolStrings = data.getUint32(moduleStart + 0x58, true);
+        const sectionTable = data.getUint32(moduleStart + 0x5C, true);
+        if (symbolCount > 0x10000 || sectionCount > 0x1000 ||
+            symbolTable + symbolCount * 0x10 > entry.payloadSize ||
+            sectionTable + sectionCount * 0x20 > entry.payloadSize)
+            continue;
+        const wantedName = entry.path.replace(/^nto\//i, '').replace(/\.nto$/i, '');
+        let offset = -1;
+        for (let index = 0; index < symbolCount; index++) {
+            const symbol = moduleStart + symbolTable + index * 0x10;
+            const nameStart = moduleStart + symbolStrings + data.getUint32(symbol, true);
+            let nameEnd = nameStart;
+            while (nameEnd < moduleEnd && payload[nameEnd] !== 0) nameEnd++;
+            if (nameEnd >= moduleEnd || ascii(payload, nameStart, nameEnd - nameStart) !== wantedName)
+                continue;
+            const sectionIndex = data.getUint16(symbol + 0x0E, true);
+            if (sectionIndex >= sectionCount)
+                continue;
+            const section = moduleStart + sectionTable + sectionIndex * 0x20;
+            const candidate = moduleStart + data.getUint32(section + 0x1C, true) +
+                data.getUint32(symbol + 4, true);
+            if (candidate + 0x98 <= moduleEnd && ascii(payload, candidate, 4) === 'NTO2')
+                offset = candidate;
+        }
+        if (offset < 0)
+            continue;
+        const payloadEnd = moduleEnd;
         const pixelOffset = data.getUint32(offset + 0x14, true);
         const paletteOffset = data.getUint32(offset + 0x18, true);
         const packed = data.getUint32(offset + 0x1C, true);
@@ -1392,11 +1452,10 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
         const width = 1 << (data.getUint16(offset + 0x1E, true) & 0x0F);
         const height = 1 << ((packed >>> 20) & 0x0F);
         const paletteBytes = psm === 0x14 ? 0x40 : psm === 0x13 ? 0x400 : 0;
-        const nameStart = offset + paletteOffset + paletteBytes;
-        let nameEnd = nameStart;
-        while (nameEnd < payload.length && payload[nameEnd] !== 0 && nameEnd - nameStart < 256) nameEnd++;
-        if (pixelOffset < 0x20 || paletteOffset < pixelOffset || nameEnd >= payload.length) { offset += 4; continue; }
-        const name = ascii(payload, nameStart, nameEnd - nameStart).replace(/\.nto$/i, '');
+        if (pixelOffset < 0x20 || paletteOffset < pixelOffset ||
+            offset + paletteOffset + paletteBytes > payloadEnd)
+            continue;
+        const name = wantedName;
         const levels: Uint8Array[] = [];
         const palette = offset + paletteOffset;
         let mipPixelOffset = offset + pixelOffset;
@@ -1455,10 +1514,9 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
                 levels.push(pixels);
                 mipPixelOffset += mipBytes;
             }
-        } else { offset = nameEnd + 1; continue; }
+        } else { continue; }
         if (name.length !== 0 && levels.length !== 0 && !textures.has(name))
             textures.set(name, { name, width, height, pixels: levels[0], levels, alphaTest, alphaReference, alphaFail });
-        offset = nameEnd + 1;
     }
     return [...textures.values()];
 }
