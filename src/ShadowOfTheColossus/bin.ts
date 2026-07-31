@@ -230,6 +230,15 @@ export interface StageBundleDiagnostics {
 interface AnbFrameZeroTrack {
     type: number;
     name: string;
+    descriptorOffset: number;
+    trackOffset: number;
+    positionPointer: number;
+    rotationPointer: number;
+    scalePointer: number;
+    modes: { position: number; rotation: number; scale: number };
+    position: vec3;
+    rotation: quat;
+    scale: vec3;
     matrix: mat4;
 }
 
@@ -316,22 +325,33 @@ function decodeAnbFrameZero(module: RelocatedXff): AnbFrameZeroTrack[] {
         const track = view.getUint32(descriptor + 8, true);
         if (track + 0x10 > view.byteLength)
             throw new Error('ANB transform track exceeds relocated XFF image');
-        const position = decodeAnbVector(view, view.getUint32(track + 4, true), view.getUint8(track + 2), false);
+        const positionPointer = view.getUint32(track + 4, true);
         const rotationPointer = view.getUint32(track + 8, true);
+        const scalePointer = view.getUint32(track + 0x0C, true);
+        const modes = {
+            position: view.getUint8(track + 2),
+            rotation: view.getUint8(track + 1),
+            scale: view.getUint8(track),
+        };
+        const position = decodeAnbVector(view, positionPointer, modes.position, false);
         const rotation = quat.create();
         if (rotationPointer !== 0) {
-            if (view.getUint8(track + 1) !== 0 || rotationPointer + 0x10 > view.byteLength)
-                throw new Error(`Unsupported frame-zero ANB quaternion mode ${view.getUint8(track + 1)}`);
+            if (modes.rotation !== 0 || rotationPointer + 0x10 > view.byteLength)
+                throw new Error(`Unsupported frame-zero ANB quaternion mode ${modes.rotation}`);
             quat.set(rotation,
                 view.getFloat32(rotationPointer, true), view.getFloat32(rotationPointer + 4, true),
                 view.getFloat32(rotationPointer + 8, true), view.getFloat32(rotationPointer + 0x0C, true));
             quat.normalize(rotation, rotation);
         }
-        const scale = decodeAnbVector(view, view.getUint32(track + 0x0C, true), view.getUint8(track), true);
+        const scale = decodeAnbVector(view, scalePointer, modes.scale, true);
         const gameMatrix = mat4.fromRotationTranslationScale(mat4.create(), rotation, position, scale);
         const viewerMatrix = mat4.multiply(mat4.create(), reflectZ, gameMatrix);
         mat4.multiply(viewerMatrix, viewerMatrix, reflectZ);
-        tracks.push({ type, name, matrix: viewerMatrix });
+        tracks.push({
+            type, name, descriptorOffset: descriptor, trackOffset: track,
+            positionPointer, rotationPointer, scalePointer, modes,
+            position, rotation, scale, matrix: viewerMatrix,
+        });
     }
     return tracks;
 }
@@ -352,7 +372,14 @@ export function parseStageBundle(
     }
     const symbols: XffSymbol[] = [];
     const sheets = new Map<number, XffSymbol>();
-    const stageLayouts: { matrix: mat4; targetHash: number }[] = [];
+    const stageLayouts: {
+        matrix: mat4;
+        targetHash: number;
+        recordOffset: number;
+        serializedTranslation: vec3;
+        serializedRotationDegrees: vec3;
+        serializedScale: vec3;
+    }[] = [];
     const packedTarget = (field: number): { hash: number; type: number } | null => {
         if (field < 0 || field + 4 > data.byteLength) return null;
         const packed = data.getUint32(field, true);
@@ -419,7 +446,10 @@ export function parseStageBundle(
                 const rotation = quat.create();
                 // gl-matrix composes its Euler quaternion in ZYX order. Build
                 // the game's YXZ order explicitly.
-                const qy = quat.setAxisAngle(quat.create(), [0, 1, 0], ry * Math.PI / 180);
+                // StageLayoutInstanceCreate converts serialized layout space
+                // to engine space as translation (-x,+y,-z) and Euler YXZ
+                // (x,-y,z) before constructing the matrix.
+                const qy = quat.setAxisAngle(quat.create(), [0, 1, 0], -ry * Math.PI / 180);
                 const qx = quat.setAxisAngle(quat.create(), [1, 0, 0], rx * Math.PI / 180);
                 const qz = quat.setAxisAngle(quat.create(), [0, 0, 1], rz * Math.PI / 180);
                 quat.multiply(rotation, qy, qx);
@@ -430,7 +460,7 @@ export function parseStageBundle(
                 // transform with S * Mgame * S rather than adjusting Euler
                 // components independently.
                 const gameMatrix = mat4.fromRotationTranslationScale(
-                    mat4.create(), rotation, [tx, ty, tz], scale,
+                    mat4.create(), rotation, [-tx, ty, -tz], scale,
                 );
                 const reflectZ = mat4.fromScaling(mat4.create(), [1, 1, -1]);
                 const viewerMatrix = mat4.multiply(mat4.create(), reflectZ, gameMatrix);
@@ -438,6 +468,10 @@ export function parseStageBundle(
                 stageLayouts.push({
                     matrix: viewerMatrix,
                     targetHash: packedTarget(record + 4)?.hash ?? 0,
+                    recordOffset: record,
+                    serializedTranslation: vec3.fromValues(tx, ty, tz),
+                    serializedRotationDegrees: vec3.fromValues(rx, ry, rz),
+                    serializedScale: scale,
                 });
             }
         }
@@ -542,15 +576,19 @@ export function parseStageBundle(
     };
     const ownedModelPaths = (rootHash: number): {
         paths: Set<string>;
-        animatedChildren: { path: string; matrix: mat4 }[];
+        animatedChildren: { path: string; animationPath: string; track: AnbFrameZeroTrack }[];
+        baseLayoutDebug: unknown;
         trace: unknown[];
         directPlacement: boolean;
+        suppressStaticBase: boolean;
     } => {
         const paths = new Set<string>();
-        const animatedChildren: { path: string; matrix: mat4 }[] = [];
+        const animatedChildren: { path: string; animationPath: string; track: AnbFrameZeroTrack }[] = [];
+        let baseLayoutDebug: unknown = null;
         const visited = new Set<number>();
         const trace: unknown[] = [];
         let directPlacement = false;
+        let suppressStaticBase = false;
         const visit = (hash: number): void => {
             if (visited.has(hash)) {
                 trace.push({ hash: `0x${hash.toString(16)}`, result: 'already visited' });
@@ -600,10 +638,32 @@ export function parseStageBundle(
             } else if (element.name.startsWith('_LwsorientRes')) {
                 fields = [element.body + 4];
             } else if (element.name.startsWith('_ScriptAnimationObjDef')) {
+                // The referenced layout is the prototype used to instantiate
+                // the ANB tracks. Rendering it once more as an ordinary static
+                // leaf creates an extra segment at the controller origin.
+                suppressStaticBase = true;
                 // CreateScriptAnimationObj initializes the controller's base
                 // layout from +0x28. The animation-definition references at
                 // +0x04/+0x08 subsequently drive that layout's child state.
                 fields = [element.body + 0x28];
+                const baseTarget = packedTarget(element.body + 0x28);
+                const baseSheet = baseTarget === null ? undefined : sheets.get(baseTarget.hash);
+                const baseElement = baseSheet === undefined ? undefined : symbolForSheet(baseSheet);
+                if (baseElement !== undefined) {
+                    const dumpStart = Math.max(baseElement.moduleStart, baseElement.body - 0x20);
+                    const dumpEnd = Math.min(bytes.length, baseElement.body + 0x60);
+                    baseLayoutDebug = {
+                        sheet: baseSheet!.name,
+                        symbol: baseElement.name,
+                        symbolBody: `0x${baseElement.body.toString(16)}`,
+                        symbolByteSize: baseElement.byteSize,
+                        dumpStart: `0x${dumpStart.toString(16)}`,
+                        words: Array.from(
+                            { length: Math.floor((dumpEnd - dumpStart) / 4) },
+                            (_, i) => `0x${data.getUint32(dumpStart + i * 4, true).toString(16)}`,
+                        ),
+                    };
+                }
                 const seenAnimations = new Set<string>();
                 for (const field of [element.body + 4, element.body + 8]) {
                     const target = packedTarget(field);
@@ -623,7 +683,7 @@ export function parseStageBundle(
                             if (track.type !== 1 && track.type !== 5)
                                 continue;
                             const path = `${track.name.replace(/^nmo\//, '')}.nmo`.toLowerCase();
-                            animatedChildren.push({ path, matrix: track.matrix });
+                            animatedChildren.push({ path, animationPath, track });
                         }
                     }
                 }
@@ -675,22 +735,55 @@ export function parseStageBundle(
             }
         };
         visit(rootHash);
-        return { paths, animatedChildren, trace, directPlacement };
+        return { paths, animatedChildren, baseLayoutDebug, trace, directPlacement, suppressStaticBase };
     };
     const output: TerrainMesh[] = [];
     const associations = [];
     const associatedModels = new Set<string>();
     for (const layout of stageLayouts) {
-        const { paths, animatedChildren, trace, directPlacement } = ownedModelPaths(layout.targetHash);
+        const {
+            paths, animatedChildren, baseLayoutDebug, trace, directPlacement, suppressStaticBase,
+        } = ownedModelPaths(layout.targetHash);
+        const parentOrigin = [layout.matrix[12], layout.matrix[13], layout.matrix[14]];
         associations.push({
             targetHash: `0x${layout.targetHash.toString(16)}`,
             target: sheets.get(layout.targetHash)?.name ?? `0x${layout.targetHash.toString(16)}`,
             models: [...paths],
-            animatedChildren: animatedChildren.map((child) => child.path),
+            stageLayout: {
+                recordOffset: `0x${layout.recordOffset.toString(16)}`,
+                serializedTranslation: [...layout.serializedTranslation],
+                serializedRotationDegrees: [...layout.serializedRotationDegrees],
+                serializedScale: [...layout.serializedScale],
+                viewerOrigin: parentOrigin,
+            },
+            baseLayoutDebug,
+            animatedChildren: animatedChildren.map((child, index) => {
+                const composed = mat4.multiply(mat4.create(), layout.matrix, child.track.matrix);
+                return {
+                    index,
+                    path: child.path,
+                    animationPath: child.animationPath,
+                    type: child.track.type,
+                    descriptorOffset: `0x${child.track.descriptorOffset.toString(16)}`,
+                    trackOffset: `0x${child.track.trackOffset.toString(16)}`,
+                    pointers: {
+                        position: `0x${child.track.positionPointer.toString(16)}`,
+                        rotation: `0x${child.track.rotationPointer.toString(16)}`,
+                        scale: `0x${child.track.scalePointer.toString(16)}`,
+                    },
+                    modes: child.track.modes,
+                    position: [...child.track.position],
+                    rotation: [...child.track.rotation],
+                    scale: [...child.track.scale],
+                    localViewerOrigin: [child.track.matrix[12], child.track.matrix[13], child.track.matrix[14]],
+                    composedViewerOrigin: [composed[12], composed[13], composed[14]],
+                };
+            }),
             placement: directPlacement ? 'direct' : 'stage-layout',
+            suppressStaticBase,
             trace,
         });
-        for (const path of paths) {
+        for (const path of suppressStaticBase ? [] : paths) {
             const model = models.get(path);
             if (model === undefined) continue;
             associatedModels.add(path);
@@ -705,7 +798,7 @@ export function parseStageBundle(
             const model = models.get(child.path);
             if (model === undefined) continue;
             associatedModels.add(child.path);
-            const childMatrix = mat4.multiply(mat4.create(), layout.matrix, child.matrix);
+            const childMatrix = mat4.multiply(mat4.create(), layout.matrix, child.track.matrix);
             for (const mesh of model)
                 output.push(transformMesh(mesh, childMatrix));
         }

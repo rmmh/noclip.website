@@ -11,7 +11,7 @@ import { GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
 import { SceneContext } from '../SceneBase.js';
 import * as Viewer from '../viewer.js';
 import * as UI from '../ui.js';
-import { DecodedTexture, parseHiPack, parseNto2Textures, parseStageBundle, parseTerrainCell, parseTexturePack, placeStageBundle, TerrainMesh } from './bin.js';
+import { DecodedTexture, parseHiPack, parseNto2Textures, parseStageBundle, parseTerrainCell, parseTexturePack, placeStageBundle, type StageBundleDiagnostics, TerrainMesh } from './bin.js';
 import { fillSceneParams, makeTerrainPipeline, TerrainGeometry, TerrainTextures } from './render.js';
 
 interface Manifest {
@@ -70,10 +70,15 @@ class SotCRenderer implements Viewer.SceneGfx {
             triangles: number;
             bounds: { min: number[]; max: number[] } | null;
         }[];
+        himejiBridge?: unknown;
     }>();
     // Parsed without a cell origin so a stage ID shared by multiple grid cells
     // only needs to be decompressed and parsed once.
-    private stageBundles = new Map<number, Promise<{ meshes: TerrainMesh[]; textures: DecodedTexture[] }>>();
+    private stageBundles = new Map<number, Promise<{
+        meshes: TerrainMesh[];
+        textures: DecodedTexture[];
+        diagnostics: StageBundleDiagnostics;
+    }>>();
     // A missing or malformed stage is terminal for this scene lifetime. Keep
     // it separate from pendingStages so streaming does not fetch it every frame.
     private failedStageBundles = new Set<number>();
@@ -276,16 +281,21 @@ class SotCRenderer implements Viewer.SceneGfx {
                 if (bundle === undefined) {
                     bundle = this.context.dataFetcher.fetchData(`${pathBase}/stage/${id}.bin`)
                         .then((file) => decompress(file.createTypedArray(Uint8Array)))
-                        .then((bytes) => ({
-                            meshes: parseStageBundle(
-                                ArrayBufferSlice.fromView(bytes),
-                                id === 382 ? 'stage 382' : '',
-                            ),
-                            textures: parseNto2Textures(bytes),
-                        }));
+                        .then((bytes) => {
+                            const diagnostics: StageBundleDiagnostics = {};
+                            return {
+                                meshes: parseStageBundle(
+                                    ArrayBufferSlice.fromView(bytes),
+                                    id === 382 ? 'stage 382' : '',
+                                    diagnostics,
+                                ),
+                                textures: parseNto2Textures(bytes),
+                                diagnostics,
+                            };
+                        });
                     this.stageBundles.set(id, bundle);
                 }
-                bundle.then(({ meshes, textures }) => {
+                bundle.then(({ meshes, textures, diagnostics }) => {
                     this.pendingStages.delete(key);
                     if (this.destroyed || !wantedStageInstances.has(key))
                         return;
@@ -304,6 +314,16 @@ class SotCRenderer implements Viewer.SceneGfx {
                         bounds: number[];
                     }>();
                     const focusedMeshes: NonNullable<NonNullable<ReturnType<typeof this.stageDebug.get>>['focusedMeshes']> = [];
+                    const himejiBridge = id !== 344 ? undefined :
+                        (diagnostics.layouts as {
+                            target?: string;
+                            stageLayout?: unknown;
+                            baseLayoutDebug?: unknown;
+                            animatedChildren?: unknown[];
+                        }[] | undefined)?.filter((layout) => (layout.animatedChildren?.length ?? 0) !== 0)
+                            .map(({ target, stageLayout, baseLayoutDebug, animatedChildren }) => ({
+                                target, stageLayout, baseLayoutDebug, animatedChildren,
+                            }));
                     let meshCount = 0, triangleCount = 0;
                     for (let meshIndex = 0; meshIndex < placedMeshes.length; meshIndex++) {
                         const mesh = placedMeshes[meshIndex];
@@ -358,6 +378,7 @@ class SotCRenderer implements Viewer.SceneGfx {
                         meshes: meshCount,
                         triangles: triangleCount,
                         focusedMeshes: focusedMeshes.length === 0 ? undefined : focusedMeshes,
+                        himejiBridge,
                         resources: [...resources.values()].map((resource) => ({
                             source: resource.source,
                             meshes: resource.meshes,
