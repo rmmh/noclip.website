@@ -189,8 +189,39 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
     const coarse = Array.from({ length: 100 }, () => new Set<number>());
     const fine = Array.from({ length: 1600 }, () => ({
         stages: new Set<number>(), aliveBosses: new Set<number>(), deadBosses: new Set<number>(),
-        slowStages: new Set<number>(),
+        slowStages: new Set<number>(), linkedCells: new Set<number>(),
     }));
+    const seamlessNames = new Set<string>();
+    const xffSymbols: { name: string; body: number; byteSize: number }[] = [];
+    for (let at = data.indexOf('xff2'); at >= 0; at = data.indexOf('xff2', at + 4)) {
+        const xff = data.subarray(at);
+        const symbolCount = xff.readUInt32LE(0x24);
+        const sectionCount = xff.readUInt32LE(0x40);
+        const symbolTable = xff.readUInt32LE(0x54);
+        const strings = xff.readUInt32LE(0x58);
+        const sectionTable = xff.readUInt32LE(0x5c);
+        if (symbolTable + symbolCount * 0x10 > xff.length ||
+            sectionTable + sectionCount * 0x20 > xff.length)
+            continue;
+        for (let i = 0; i < symbolCount; i++) {
+            const s = symbolTable + i * 0x10;
+            const nameAt = strings + xff.readUInt32LE(s);
+            const end = xff.indexOf(0, nameAt);
+            if (end < nameAt)
+                continue;
+            const name = xff.toString('ascii', nameAt, end);
+            seamlessNames.add(name);
+            const sectionIndex = xff.readUInt16LE(s + 0x0e);
+            if (sectionIndex >= sectionCount)
+                continue;
+            const section = sectionTable + sectionIndex * 0x20;
+            xffSymbols.push({
+                name,
+                body: at + xff.readUInt32LE(section + 0x1c) + xff.readUInt32LE(s + 4),
+                byteSize: xff.readUInt32LE(s + 8),
+            });
+        }
+    }
     for (let at = data.indexOf('xff2'); at >= 0; at = data.indexOf('xff2', at + 4)) {
         const xff = data.subarray(at);
         const symbolCount = xff.readUInt32LE(0x24);
@@ -208,6 +239,15 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
             const match = /^_SeamlessLayoutNICOWORLD_([A-J])([0-9])(?:_|$)/.exec(name);
             if (name !== '_WorldLayoutNICOWORLD' && !match)
                 continue;
+            if (match) {
+                const baseName = `_SeamlessLayoutNICOWORLD_${match[1]}${match[2]}`;
+                const withoutBossName = `${baseName}_WITHOUT_BOSS`;
+                const defaultName = `${baseName}_DEFAULT`;
+                if (seamlessNames.has(withoutBossName) ? name !== withoutBossName :
+                    seamlessNames.has(defaultName) ? name !== defaultName :
+                    seamlessNames.has(baseName) && name !== baseName)
+                    continue;
+            }
             const section = sectionTable + xff.readUInt16LE(s + 0x0e) * 0x20;
             const body = xff.subarray(
                 xff.readUInt32LE(section + 0x1c) + xff.readUInt32LE(s + 4),
@@ -236,6 +276,40 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
                         const token = body.readUInt32LE(n * 0x3c + o);
                         if (token) set.add((token >>> 18) & 0xfff);
                     }
+                    const linkField = at + xff.readUInt32LE(section + 0x1c) +
+                        xff.readUInt32LE(s + 4) + n * 0x3c + 0x38;
+                    const linkToken = data.readUInt32LE(linkField);
+                    if (linkToken !== 0) {
+                        const packageAnchor = linkField - (linkToken & 0x3ffff);
+                        const packageHash = data.readUInt32LE(packageAnchor + 4);
+                        const packageSheet = xffSymbols.find((candidate) =>
+                            candidate.name.startsWith('SH_SeamlessExceptionPackage') &&
+                            candidate.body + 8 <= data.length &&
+                            data.readUInt32LE(candidate.body + 4) === packageHash);
+                        const packageElements = packageSheet === undefined ? undefined :
+                            xffSymbols.find((candidate) =>
+                                candidate.name === `_${packageSheet.name.slice(3)}`);
+                        if (packageElements !== undefined) {
+                            for (let entry = 0; entry * 4 < packageElements.byteSize; entry++) {
+                                const field = packageElements.body + entry * 4;
+                                const token = data.readUInt32LE(field);
+                                if (token === 0) continue;
+                                const targetAnchor = field - (token & 0x3ffff);
+                                const targetHash = data.readUInt32LE(targetAnchor + 4);
+                                const targetSheet = xffSymbols.find((candidate) =>
+                                    candidate.name.startsWith('SH_SeamlessLayoutNICOWORLD_') &&
+                                    candidate.body + 8 <= data.length &&
+                                    data.readUInt32LE(candidate.body + 4) === targetHash);
+                                const targetMatch = targetSheet === undefined ? null :
+                                    /^SH_SeamlessLayoutNICOWORLD_([A-J])([0-9])(?:_|$)/.exec(targetSheet.name);
+                                if (targetMatch === null) continue;
+                                const targetIndex = (token >>> 18) & 0xfff;
+                                const tx = (targetMatch[1].charCodeAt(0) - 65) * 4 + targetIndex % 4;
+                                const ty = Number(targetMatch[2]) * 4 + Math.floor(targetIndex / 4);
+                                cell.linkedCells.add(ty * 40 + tx);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -246,6 +320,7 @@ function worldStageGrid(source: RandomAccessFile, stages: StageIndex) {
         aliveBosses: [...cell.aliveBosses].sort((a, b) => a - b),
         deadBosses: [...cell.deadBosses].sort((a, b) => a - b),
         slowStages: [...cell.slowStages].sort((a, b) => a - b),
+        linkedCells: [...cell.linkedCells].sort((a, b) => a - b),
     }));
     return {
         coarseWidth: 10,

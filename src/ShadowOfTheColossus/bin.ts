@@ -133,6 +133,7 @@ export interface TerrainMesh {
     isLayer1: boolean;
     isSpecialLayer: boolean;
     isTranslucent: boolean;
+    alphaBlend: boolean;
     isWater: boolean;
     hasWaterEffect: boolean;
     gsAlpha: number;
@@ -251,8 +252,11 @@ function parseSheetSegmentEntries(bytes: Uint8Array): SheetSegmentEntry[] {
 }
 
 function readSrfGsRegister(data: DataView, surface: number, wantedAddress: number): bigint | null {
-    const end = Math.min(data.byteLength, surface + 0xC0);
-    for (let cursor = surface + 0x60; cursor + 4 <= end;) {
+    // `surface` includes the serialized three-byte packed-reference prefix;
+    // runtime SRF offsets begin at the following "SRF\0" object.
+    const runtime = surface + 3;
+    const end = Math.min(data.byteLength, runtime + 0xC0);
+    for (let cursor = runtime + 0x60; cursor + 4 <= end;) {
         const code = data.getUint32(cursor, true);
         cursor += 4;
         const command = code >>> 24 & 0x7F;
@@ -995,6 +999,7 @@ function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): Terrain
         isLayer1: boolean;
         isSpecialLayer: boolean;
         isTranslucent: boolean;
+        alphaBlend: boolean;
         isWater: boolean;
         hasWaterEffect: boolean;
         gsAlpha: number;
@@ -1041,6 +1046,9 @@ function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): Terrain
         // modelGetDlLayer tests this bit in the final ordinary-material
         // branch, selecting blended layer 3/6 instead of opaque layer 2/5.
         const isTranslucent = fixedDisplayLayer === null && (surfaceFlags & 0x00000100) !== 0;
+        // modelGetDlLayer uses 0x100 for ordinary translucent-layer sorting,
+        // but the same authored bit still controls PRIM.ABE on fixed layers.
+        const alphaBlend = (surfaceFlags & 0x00000100) !== 0;
         const clampRegister = surface === undefined ? null : readSrfGsRegister(data, surface, 0x08);
         const clamp = clampRegister === null ? 0 : Number(clampRegister & 0xFFFFFFFFn);
         const wms = clamp & 0x03, wmt = (clamp >>> 2) & 0x03;
@@ -1061,6 +1069,7 @@ function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): Terrain
             isLayer1,
             isSpecialLayer,
             isTranslucent,
+            alphaBlend,
             isWater,
             hasWaterEffect,
             gsAlpha,
@@ -1310,6 +1319,7 @@ function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): Terrain
         isLayer1: output.isLayer1,
         isSpecialLayer: output.isSpecialLayer,
         isTranslucent: output.isTranslucent,
+        alphaBlend: output.alphaBlend,
         isWater: output.isWater,
         hasWaterEffect: output.hasWaterEffect,
         gsAlpha: output.gsAlpha,
@@ -1372,6 +1382,8 @@ export interface DecodedTexture {
     alphaTest: number;
     alphaReference: number;
     alphaFail: number;
+    magFilter: number;
+    minFilter: number;
 }
 
 export function parseTexturePack(file: ArrayBufferSlice, physicalSheetCount: number, decompress: (src: Uint8Array) => Uint8Array): DecodedTexture[] {
@@ -1449,6 +1461,9 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
         const alphaTest = data.getUint32(offset + 0x80, true);
         const alphaReference = data.getUint32(offset + 0x84, true);
         const alphaFail = data.getUint32(offset + 0x88, true);
+        // texTransResolve copies these directly into TEX1.MMAG/MMIN.
+        const magFilter = data.getUint32(offset + 0x74, true);
+        const minFilter = data.getUint32(offset + 0x78, true);
         const mipTransferModes = payload[offset + 0x1F];
         const mipCount = Math.max(1, (packed >>> 12) & 0x07);
         const width = 1 << (data.getUint16(offset + 0x1E, true) & 0x0F);
@@ -1518,7 +1533,8 @@ export function parseNto2Textures(payload: Uint8Array): DecodedTexture[] {
             }
         } else { continue; }
         if (name.length !== 0 && levels.length !== 0 && !textures.has(name))
-            textures.set(name, { name, width, height, pixels: levels[0], levels, alphaTest, alphaReference, alphaFail });
+            textures.set(name, { name, width, height, pixels: levels[0], levels,
+                alphaTest, alphaReference, alphaFail, magFilter, minFilter });
     }
     return [...textures.values()];
 }

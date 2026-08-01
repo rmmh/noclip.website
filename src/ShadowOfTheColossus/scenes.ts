@@ -28,6 +28,7 @@ interface Manifest {
             aliveBosses: number[];
             deadBosses: number[];
             slowStages?: number[];
+            linkedCells?: number[];
         }[];
     };
 }
@@ -55,11 +56,13 @@ class SotCRenderer implements Viewer.SceneGfx {
         triangles: number;
         focusedMeshes?: {
             mesh: number;
+            texture: string | null;
             triangles: number;
             bounds: { min: number[]; max: number[] };
             layer1: boolean;
             specialLayer: boolean;
             translucent: boolean;
+            alphaBlend: boolean;
             water: boolean;
             disableCull: boolean;
             gsAlpha: string;
@@ -87,6 +90,7 @@ class SotCRenderer implements Viewer.SceneGfx {
     private destroyed = false;
     private enableStages = true;
     private enableSlowStages = true;
+    private highlightHomeProxy = false;
     private aliveBosses = true;
     // Literal terrain-cell footprint width. The game defaults to a 6x6
     // resident square (2x2 hi center plus a two-cell lo ring); this viewer uses
@@ -94,8 +98,11 @@ class SotCRenderer implements Viewer.SceneGfx {
     private renderDistance = 6;
     private warnedMissingStageGrid = false;
     private lastStageCell = '';
+    private stageNeighbor: [number, number] | null = null;
     private slowGridCell: [number, number] | null = null;
     private streamingDebug: Record<string, unknown> | null = null;
+    private debugFrustum: Viewer.ViewerRenderInput['camera']['frustum'] | null = null;
+    private debugClipFromWorld = mat4.create();
 
     private onKeyDown = (event: KeyboardEvent): void => {
         if (event.code !== 'KeyY' || event.repeat)
@@ -105,14 +112,29 @@ class SotCRenderer implements Viewer.SceneGfx {
             (target.isContentEditable || target instanceof HTMLInputElement ||
              target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement))
             return;
-        const loaded = [...this.stageCells].map(([key, geometries]) => ({
-            key,
-            ...(this.stageDebug.get(key) ?? {
+        const loaded = [...this.stageCells].map(([key, geometries]) => {
+            const visible = this.debugFrustum === null ? [] : geometries.filter((geometry) => geometry.isVisible(this.debugFrustum!));
+            const focusedDraws = visible.filter((geometry) =>
+                geometry.sourceName.startsWith('nmo/slow_') ||
+                geometry.sourceName === 'nmo/himeji_parts.nmo' ||
+                geometry.sourceName.startsWith('nmo/home_'))
+                .map((geometry) => geometry.debugDraw(this.debugClipFromWorld));
+            return {
+                key,
+                ...(this.stageDebug.get(key) ?? {
                 coarseCell: key.substring(0, key.lastIndexOf(':')),
                 stage: Number(key.substring(key.lastIndexOf(':') + 1)),
                 meshes: geometries.length,
-            }),
-        }));
+                }),
+                frustumVisibleMeshes: visible.length,
+                visibleSlowHome: visible.filter((geometry) => geometry.sourceName === 'nmo/slow_f4.nmo')
+                    .map((geometry) => geometry.textureName),
+                visibleHomeModels: [...new Set(visible.filter((geometry) =>
+                    geometry.sourceName.startsWith('nmo/home_'))
+                    .map((geometry) => geometry.sourceName))],
+                focusedDraws: focusedDraws.length === 0 ? undefined : focusedDraws,
+            };
+        });
         console.warn('[SotC] position/stage debug dump (Y)\n' + JSON.stringify({
             ...this.streamingDebug,
             loaded,
@@ -145,6 +167,7 @@ class SotCRenderer implements Viewer.SceneGfx {
     }
 
     private updateStreaming(device: GfxDevice, input: Viewer.ViewerRenderInput): void {
+        this.debugFrustum = input.camera.frustum;
         // Terrain positions are absolute. The stage grid runs in reverse from
         // (+2950,+2950), and Z was flipped during vertex decoding.
         const cellX = Math.max(0, Math.min(59, Math.floor((3000 - input.camera.worldMatrix[12]) / 100)));
@@ -157,13 +180,21 @@ class SotCRenderer implements Viewer.SceneGfx {
         const stageFY = fineHeight === 0 ? 0 : (3000 - input.camera.worldMatrix[14]) / fineCellSize;
         const stageX = Math.max(0, Math.min(fineWidth - 1, Math.floor(stageFX)));
         const stageY = Math.max(0, Math.min(fineHeight - 1, Math.floor(stageFY)));
-        // The stage manager begins transitions before the cell boundary,
-        // retaining edge/corner neighbors through its 0.42/0.58 hysteresis.
-        const edgeLow = 0.42;
-        const edgeHigh = 0.58;
+        // StageCellSelectionUpdate compares the remainder against half a cell
+        // plus/minus one sixty-fourth. The wider 0.42/0.58 thresholds belong
+        // to the separate resident-data-window rebuild path; using them here
+        // drops linked distant-view stages such as HOME (stage 373).
+        const edgeLow = 31 / 64;
+        const edgeHigh = 33 / 64;
         const fracX = stageFX - Math.floor(stageFX), fracY = stageFY - Math.floor(stageFY);
-        const xNeighbor = fracX < edgeLow ? -1 : fracX > edgeHigh ? 1 : 0;
-        const yNeighbor = fracY < edgeLow ? -1 : fracY > edgeHigh ? 1 : 0;
+        // The dead band is hysteresis, not an inactive region: retain which
+        // side of the cell was selected until the camera crosses the opposite
+        // threshold. Dropping the neighbor here loses diagonal StageLayouts
+        // (notably HOME at [21,16]) while the game keeps a 2x2 quartet active.
+        const previousNeighbor = this.stageNeighbor ?? [fracX < 0.5 ? -1 : 1, fracY < 0.5 ? -1 : 1];
+        const xNeighbor = fracX < edgeLow ? -1 : fracX > edgeHigh ? 1 : previousNeighbor[0];
+        const yNeighbor = fracY < edgeLow ? -1 : fracY > edgeHigh ? 1 : previousNeighbor[1];
+        this.stageNeighbor = [xNeighbor, yNeighbor];
         // SlowCellSelectionUpdate uses a separate grid whose cells span two
         // 150-unit stage-context cells. It retains the previous coarse cell
         // only within 20 world units of a boundary.
@@ -191,11 +222,28 @@ class SotCRenderer implements Viewer.SceneGfx {
             this.slowGridCell[0] * slowFineSpan,
             this.slowGridCell[1] * slowFineSpan,
         ];
-        const selectedStageCells: [number, number][] = [[stageX, stageY]];
-        if (xNeighbor !== 0) selectedStageCells.push([stageX + xNeighbor, stageY]);
-        if (yNeighbor !== 0) selectedStageCells.push([stageX, stageY + yNeighbor]);
-        if (xNeighbor !== 0 && yNeighbor !== 0)
-            selectedStageCells.push([stageX + xNeighbor, stageY + yNeighbor]);
+        const selectedStageCells: [number, number][] = [
+            [stageX, stageY],
+            [stageX + xNeighbor, stageY],
+            [stageX, stageY + yNeighbor],
+            [stageX + xNeighbor, stageY + yNeighbor],
+        ];
+        // Some boundary records reference a SeamlessExceptionPackage. The
+        // package contains authored record links which the game considers in
+        // StageCellSelectionUpdate (not extra stage IDs). F3's last row links
+        // the first F4 row so HOME's distant-view stage remains resident.
+        const selectedKeys = new Set(selectedStageCells.map(([x, y]) => `${x},${y}`));
+        for (const [x, y] of [...selectedStageCells]) {
+            if (x < 0 || y < 0 || x >= fineWidth || y >= fineHeight) continue;
+            for (const linked of stageGrid?.fineCells[y * fineWidth + x]?.linkedCells ?? []) {
+                const linkedX = linked % fineWidth, linkedY = Math.floor(linked / fineWidth);
+                const key = `${linkedX},${linkedY}`;
+                if (!selectedKeys.has(key)) {
+                    selectedKeys.add(key);
+                    selectedStageCells.push([linkedX, linkedY]);
+                }
+            }
+        }
         const ordinaryStageCells = new Set(selectedStageCells.map(([x, y]) => `${x},${y}`));
         if (!ordinaryStageCells.has(`${slowStageCell[0]},${slowStageCell[1]}`))
             selectedStageCells.push(slowStageCell);
@@ -267,6 +315,7 @@ class SotCRenderer implements Viewer.SceneGfx {
         // opposite sign.
         const includeStageNeighbors = true;
         const wantedStageInstances = new Set<string>();
+        const wantedSlowInstances = new Set<string>();
         const wantedStageIds = new Set<number>();
         const selectedCoarseCells = new Set<string>();
         const stageContributions: {
@@ -320,6 +369,8 @@ class SotCRenderer implements Viewer.SceneGfx {
                 // References from all four-by-four fine records share the
                 // enclosing coarse coordinate frame in initlayout.
                 wantedStageInstances.add(key);
+                if (slowOnly)
+                    wantedSlowInstances.add(key);
                 if (this.stageCells.has(key) || this.pendingStages.has(key) || this.failedStageBundles.has(id))
                     continue;
                 this.pendingStages.add(key);
@@ -401,14 +452,17 @@ class SotCRenderer implements Viewer.SceneGfx {
                                 meshBounds[axis + 3] = Math.max(meshBounds[axis + 3], value);
                             }
                         }
-                        if (id === 378 && mesh.sourceName === 'nmo/home_spiral_stair.nmo') {
+                        if ((id === 378 && mesh.sourceName === 'nmo/home_spiral_stair.nmo') ||
+                            (id === 1659 && mesh.sourceName === 'nmo/slow_f4.nmo')) {
                             focusedMeshes.push({
                                 mesh: meshIndex,
+                                texture: mesh.textureName,
                                 triangles,
                                 bounds: { min: meshBounds.slice(0, 3), max: meshBounds.slice(3, 6) },
                                 layer1: mesh.isLayer1,
                                 specialLayer: mesh.isSpecialLayer,
                                 translucent: mesh.isTranslucent,
+                                alphaBlend: mesh.alphaBlend,
                                 water: mesh.isWater,
                                 disableCull: mesh.disableCull,
                                 gsAlpha: `0x${mesh.gsAlpha.toString(16).padStart(8, '0')}`,
@@ -504,8 +558,16 @@ class SotCRenderer implements Viewer.SceneGfx {
                 `pending=${this.pendingStages.size}`,
             );
         }
+        // SlowCellSelectionUpdate switches the selected group immediately, but
+        // the game's streaming keeps the resident group usable until its
+        // replacement has finished loading. Preserve the old backdrop during
+        // that handoff so an asynchronous fetch cannot expose the clear color.
+        const slowReplacementReady = [...wantedSlowInstances]
+            .every((key) => this.stageCells.has(key));
         for (const [key, geometries] of this.stageCells) {
             if (!wantedStageInstances.has(key)) {
+                if (key.startsWith('slow:') && !slowReplacementReady)
+                    continue;
                 for (const geometry of geometries) geometry.destroy(device);
                 this.stageCells.delete(key);
                 this.stageDebug.delete(key);
@@ -515,6 +577,8 @@ class SotCRenderer implements Viewer.SceneGfx {
 
     private prepare(device: GfxDevice, input: Viewer.ViewerRenderInput): void {
         this.updateStreaming(device, input);
+        this.debugFrustum = input.camera.frustum;
+        mat4.copy(this.debugClipFromWorld, input.camera.clipFromWorldMatrix);
         const manager = this.helper.renderInstManager;
         const template = this.helper.pushTemplateRenderInst();
         fillSceneParams(template, input.camera.clipFromWorldMatrix, input.backbufferWidth, input.backbufferHeight, input.time);
@@ -529,7 +593,8 @@ class SotCRenderer implements Viewer.SceneGfx {
             if (key.startsWith('slow:') ? this.enableSlowStages : this.enableStages)
                 for (const geometry of geometries)
                     if (geometry.isLayer1)
-                        geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix);
+                        geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix,
+                            this.highlightHomeProxy && geometry.sourceName === 'nmo/slow_f4.nmo' && geometry.textureName === 'slow_himejidai');
         manager.setCurrentList(this.terrainList);
         for (const geometries of this.cells.values())
             for (const geometry of geometries)
@@ -600,6 +665,9 @@ class SotCRenderer implements Viewer.SceneGfx {
         const slowStages = new UI.Checkbox('Show Slow Stages', this.enableSlowStages);
         slowStages.onchanged = () => this.enableSlowStages = slowStages.checked;
         panel.contents.appendChild(slowStages.elem);
+        const highlightHome = new UI.Checkbox('Highlight Home Proxy', this.highlightHomeProxy);
+        highlightHome.onchanged = () => this.highlightHomeProxy = highlightHome.checked;
+        panel.contents.appendChild(highlightHome.elem);
 
         const bosses = new UI.Checkbox('Alive Bosses', this.aliveBosses);
         bosses.onchanged = () => this.aliveBosses = bosses.checked;
