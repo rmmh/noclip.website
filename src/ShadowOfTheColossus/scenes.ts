@@ -128,7 +128,8 @@ class SotCRenderer implements Viewer.SceneGfx {
                 }),
                 frustumVisibleMeshes: visible.length,
                 visibleSlowHome: visible.filter((geometry) => geometry.sourceName === 'nmo/slow_f4.nmo')
-                    .map((geometry) => geometry.textureName),
+                    .filter((geometry) => geometry.surfaceName.startsWith('slow_home'))
+                    .map((geometry) => ({ surface: geometry.surfaceName, texture: geometry.textureName })),
                 visibleHomeModels: [...new Set(visible.filter((geometry) =>
                     geometry.sourceName.startsWith('nmo/home_'))
                     .map((geometry) => geometry.sourceName))],
@@ -195,33 +196,25 @@ class SotCRenderer implements Viewer.SceneGfx {
         const xNeighbor = fracX < edgeLow ? -1 : fracX > edgeHigh ? 1 : previousNeighbor[0];
         const yNeighbor = fracY < edgeLow ? -1 : fracY > edgeHigh ? 1 : previousNeighbor[1];
         this.stageNeighbor = [xNeighbor, yNeighbor];
-        // SlowCellSelectionUpdate uses a separate grid whose cells span two
-        // 150-unit stage-context cells. It retains the previous coarse cell
-        // only within 20 world units of a boundary.
-        const slowFineSpan = 2;
-        const slowCellSize = fineCellSize * slowFineSpan;
-        const slowWorldX = stageFX * fineCellSize;
-        const slowWorldY = stageFY * fineCellSize;
-        let slowX = Math.floor(slowWorldX / slowCellSize);
-        let slowY = Math.floor(slowWorldY / slowCellSize);
+        // SlowCellSelectionUpdate indexes the same 150-unit fine records as
+        // StageCellSelectionUpdate. It differs only in retaining the previous
+        // adjacent record while the camera is within 20 world units of an edge.
+        // The selected record's +0x34 field then supplies the slow stage.
+        let slowX = stageX;
+        let slowY = stageY;
         if (this.slowGridCell !== null) {
-            const remX = slowWorldX - slowX * slowCellSize;
-            const remY = slowWorldY - slowY * slowCellSize;
-            if (slowX < this.slowGridCell[0] && remX > slowCellSize - 20) slowX++;
+            const remX = (stageFX - slowX) * fineCellSize;
+            const remY = (stageFY - slowY) * fineCellSize;
+            if (slowX < this.slowGridCell[0] && remX > fineCellSize - 20) slowX++;
             else if (this.slowGridCell[0] < slowX && remX < 20) slowX--;
-            if (slowY < this.slowGridCell[1] && remY > slowCellSize - 20) slowY++;
+            if (slowY < this.slowGridCell[1] && remY > fineCellSize - 20) slowY++;
             else if (this.slowGridCell[1] < slowY && remY < 20) slowY--;
         }
-        const slowGridWidth = Math.ceil(fineWidth / slowFineSpan);
-        const slowGridHeight = Math.ceil(fineHeight / slowFineSpan);
         this.slowGridCell = [
-            Math.max(0, Math.min(slowGridWidth - 1, slowX)),
-            Math.max(0, Math.min(slowGridHeight - 1, slowY)),
+            Math.max(0, Math.min(fineWidth - 1, slowX)),
+            Math.max(0, Math.min(fineHeight - 1, slowY)),
         ];
-        const slowStageCell: [number, number] = [
-            this.slowGridCell[0] * slowFineSpan,
-            this.slowGridCell[1] * slowFineSpan,
-        ];
+        const slowStageCell: [number, number] = [...this.slowGridCell];
         const selectedStageCells: [number, number][] = [
             [stageX, stageY],
             [stageX + xNeighbor, stageY],
@@ -248,12 +241,18 @@ class SotCRenderer implements Viewer.SceneGfx {
         if (!ordinaryStageCells.has(`${slowStageCell[0]},${slowStageCell[1]}`))
             selectedStageCells.push(slowStageCell);
         const wantedCells = new Set<string>();
+        const wantedHighCells = new Set<string>();
         const wantedPacks = new Set<string>();
-        // The game defaults to highRadius=1 and middleRadius=2: an inner 2x2
-        // hi square plus a lo ring making a 6x6 resident footprint. We retain
-        // those exact coordinates but deliberately use each coordinate's hi
-        // payload throughout. The slider overrides the combined footprint size
-        // without affecting the independent stage-cell set.
+        // MapCellLodCheck (FUN_4123ef20) assigns map-data type 0 only to the
+        // inner highRadius square. Type 1 occupies the surrounding middle
+        // ring. This release disc has no populated type-1 world table, so do
+        // not substitute type-0/high payloads into that ring: those invented
+        // draws run after the layer-1 depth clear and hide authored SLOWMODEL
+        // backdrops such as the distant Shrine and its approach road.
+        //
+        // Keep the wider footprint calculation for diagnostics and eventual
+        // support for releases with a populated middle table. Only the inner
+        // 2x2 footprint is currently backed by indexed map data.
         const terrainDistance = this.renderDistance;
         const lowRadius = Math.floor(terrainDistance / 2);
         const highRadius = terrainDistance - lowRadius;
@@ -262,7 +261,14 @@ class SotCRenderer implements Viewer.SceneGfx {
                 if (x < 0 || y < 0 || x >= this.manifest.grid.width || y >= this.manifest.grid.height) continue;
                 wantedCells.add(`${x},${y}`);
             }
-        for (const key of wantedCells) {
+        const authoredHighRadius = Math.min(1, lowRadius);
+        const authoredHighExtent = Math.min(2, terrainDistance);
+        for (let y = cellY - authoredHighRadius; y < cellY - authoredHighRadius + authoredHighExtent; y++)
+            for (let x = cellX - authoredHighRadius; x < cellX - authoredHighRadius + authoredHighExtent; x++) {
+                if (x < 0 || y < 0 || x >= this.manifest.grid.width || y >= this.manifest.grid.height) continue;
+                wantedHighCells.add(`${x},${y}`);
+            }
+        for (const key of wantedHighCells) {
                 const [x, y] = key.split(',').map(Number);
                 if (x < 0 || y < 0 || x >= this.manifest.grid.width || y >= this.manifest.grid.height) continue;
                 const p = `hi/${Math.floor(y / 4).toString().padStart(2, '0')}-${Math.floor(x / 4).toString().padStart(2, '0')}.bin`;
@@ -282,14 +288,14 @@ class SotCRenderer implements Viewer.SceneGfx {
             });
         }
         for (const [key, geometries] of this.cells) {
-            if (!wantedCells.has(key)) {
+            if (!wantedHighCells.has(key)) {
                 for (const geometry of geometries) geometry.destroy(device);
                 this.cells.delete(key);
             }
         }
         for (const entries of this.packs.values()) for (const entry of entries) {
             const key = `${entry.x},${entry.y}`;
-            if (wantedCells.has(key) && !this.cells.has(key)) {
+            if (wantedHighCells.has(key) && !this.cells.has(key)) {
                 const meshes = parseTerrainCell(entry.data);
                 const geometries = meshes.filter((mesh) => mesh.vertices.length !== 0)
                     .map((mesh) => new TerrainGeometry(device, mesh, this.textures));
@@ -512,6 +518,8 @@ class SotCRenderer implements Viewer.SceneGfx {
             terrain: {
                 cell: [cellX, cellY],
                 pack: `hi/${Math.floor(cellY / 4).toString().padStart(2, '0')}-${Math.floor(cellX / 4).toString().padStart(2, '0')}.bin`,
+                residentFootprint: [...wantedCells].sort(),
+                submittedHighCells: [...wantedHighCells].sort(),
             },
             stage: {
                 renderDistance: this.renderDistance,
@@ -594,7 +602,7 @@ class SotCRenderer implements Viewer.SceneGfx {
                 for (const geometry of geometries)
                     if (geometry.isLayer1)
                         geometry.prepareToRender(manager, this.pipeline, input.camera.frustum, input.camera.viewMatrix,
-                            this.highlightHomeProxy && geometry.sourceName === 'nmo/slow_f4.nmo' && geometry.textureName === 'slow_himejidai');
+                            this.highlightHomeProxy && geometry.sourceName === 'nmo/slow_f4.nmo' && geometry.surfaceName.startsWith('slow_home'));
         manager.setCurrentList(this.terrainList);
         for (const geometries of this.cells.values())
             for (const geometry of geometries)
@@ -665,7 +673,7 @@ class SotCRenderer implements Viewer.SceneGfx {
         const slowStages = new UI.Checkbox('Show Slow Stages', this.enableSlowStages);
         slowStages.onchanged = () => this.enableSlowStages = slowStages.checked;
         panel.contents.appendChild(slowStages.elem);
-        const highlightHome = new UI.Checkbox('Highlight Home Proxy', this.highlightHomeProxy);
+        const highlightHome = new UI.Checkbox('Highlight Shrine Proxy', this.highlightHomeProxy);
         highlightHome.onchanged = () => this.highlightHomeProxy = highlightHome.checked;
         panel.contents.appendChild(highlightHome.elem);
 

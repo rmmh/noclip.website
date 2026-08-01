@@ -72,12 +72,38 @@ export class TerrainGeometry {
     public vertexCount: number;
     public isProp: boolean;
     public sourceName: string;
+    public surfaceName: string;
     public textureName: string | null;
+    private textureDebug: Record<string, number> | null = null;
     constructor(device: GfxDevice, mesh: TerrainMesh, textures: TerrainTextures) {
         this.buffer = createBufferFromData(device, GfxBufferUsage.Vertex, GfxBufferFrequencyHint.Static, mesh.vertices.buffer);
         this.descriptor = [{ buffer: this.buffer }];
         this.mapping = [textures.getMapping(mesh.textureName, mesh.clampS, mesh.clampT)];
         const texture = textures.getTexture(mesh.textureName);
+        if (texture !== null) {
+            let alphaMin = 0xFF, alphaMax = 0, alphaPassing = 0;
+            for (let i = 3; i < texture.pixels.length; i += 4) {
+                const alpha = texture.pixels[i];
+                alphaMin = Math.min(alphaMin, alpha);
+                alphaMax = Math.max(alphaMax, alpha);
+                if (texture.alphaTest === 1 ||
+                    (texture.alphaTest === 2 && alpha < texture.alphaReference) ||
+                    (texture.alphaTest === 3 && alpha <= texture.alphaReference) ||
+                    (texture.alphaTest === 4 && alpha === texture.alphaReference) ||
+                    (texture.alphaTest === 5 && alpha >= texture.alphaReference) ||
+                    (texture.alphaTest === 6 && alpha > texture.alphaReference) ||
+                    (texture.alphaTest === 7 && alpha !== texture.alphaReference))
+                    alphaPassing++;
+            }
+            this.textureDebug = {
+                width: texture.width,
+                height: texture.height,
+                alphaMin,
+                alphaMax,
+                alphaPassing,
+                texels: texture.pixels.length / 4,
+            };
+        }
         this.alphaTest = texture?.alphaTest ?? 1;
         this.alphaReference = texture?.alphaReference ?? 0;
         this.alphaFail = texture?.alphaFail ?? 0;
@@ -86,6 +112,7 @@ export class TerrainGeometry {
         }
         this.isProp = mesh.isProp;
         this.sourceName = mesh.sourceName;
+        this.surfaceName = mesh.surfaceName;
         this.textureName = mesh.textureName;
         this.isLayer1 = mesh.isLayer1;
         this.isSpecialLayer = mesh.isSpecialLayer;
@@ -139,6 +166,7 @@ export class TerrainGeometry {
         const round = (value: number): number => Math.round(value * 1000) / 1000;
         return {
             source: this.sourceName,
+            surface: this.surfaceName,
             texture: this.textureName,
             bounds: { min: [...this.bounds.min], max: [...this.bounds.max] },
             ndc: frontCorners === 0 ? null : {
@@ -152,6 +180,7 @@ export class TerrainGeometry {
             alphaTest: this.alphaTest,
             alphaReference: this.alphaReference,
             alphaFail: this.alphaFail,
+            texturePixels: this.textureDebug,
             gsAlpha: `0x${this.gsAlpha.toString(16)}`,
         };
     }

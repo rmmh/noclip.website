@@ -127,6 +127,7 @@ function collectVifBatches(data: DataView, start: number, size: number): UnpackB
 
 export interface TerrainMesh {
     sourceName: string;
+    surfaceName: string;
     textureName: string | null;
     secondaryTextureName: string | null;
     isProp: boolean;
@@ -993,6 +994,7 @@ function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): Terrain
         batch.address === ((header.address + slot) & 0x03FF) &&
         !batch.masked && (format === undefined || batch.format === format);
     const outputs = new Map<string, {
+        surfaceName: string;
         textureName: string | null;
         secondaryTextureName: string | null;
         isProp: boolean;
@@ -1059,8 +1061,13 @@ function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): Terrain
         // Coalescing all uses of a material across an NMO made unrelated
         // foliage, decals, and prop instances sort as one cell-sized object.
         const sortGroup = isTranslucent ? `draw${draw}` : '';
-        const key = `${textureName ?? `__untextured_${surfaceName}`}|${secondaryTextureName ?? ''}|${wms}|${wmt}|${secondaryWms}|${secondaryWmt}|${surfaceFlags}|${gsAlpha}|${gsAlphaFix}|${isWater}|${sortGroup}`;
+        // Keep authored SRF objects distinct. Besides preserving their draw
+        // identity for diagnostics, this prevents unrelated objects which
+        // happen to share a texture and GS state from acquiring one combined
+        // cell-sized sort/bounds record.
+        const key = `${surfaceName}|${textureName ?? '__untextured'}|${secondaryTextureName ?? ''}|${wms}|${wmt}|${secondaryWms}|${secondaryWmt}|${surfaceFlags}|${gsAlpha}|${gsAlphaFix}|${isWater}|${sortGroup}`;
         const output = outputs.get(key) ?? {
+            surfaceName,
             textureName,
             secondaryTextureName,
             // Terrain-cell NMO geometry is never controlled by Enable Stages.
@@ -1313,6 +1320,7 @@ function parseNmoXff(serialized: ArrayBufferSlice, sourceNameHint = ''): Terrain
     }
     return [...outputs.values()].map((output) => ({
         sourceName: nmoPath,
+        surfaceName: output.surfaceName,
         textureName: output.textureName,
         secondaryTextureName: output.secondaryTextureName,
         isProp: output.isProp,
