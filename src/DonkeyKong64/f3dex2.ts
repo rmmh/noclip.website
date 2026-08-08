@@ -6,25 +6,95 @@ import { nArray, assert, assertExists, hexzero } from "../util.js";
 import { ImageFormat } from "../Common/N64/Image.js";
 import { vec4 } from 'gl-matrix';
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
+import { F3DEX2_GBI, RSP_Geometry } from '../PokemonSnap/f3dex2.js';
 
-// Interpreter for N64 F3DEX2 microcode.
-export enum RSP_Geometry {
-    G_ZBUFFER            = 1 << 0,
-    G_SHADE              = 1 << 2,
-    G_CULL_FRONT         = 1 << 9,
-    G_CULL_BACK          = 1 << 10,
-    G_FOG                = 1 << 16,
-    G_LIGHTING           = 1 << 17,
-    G_TEXTURE_GEN        = 1 << 18,
-    G_TEXTURE_GEN_LINEAR = 1 << 19,
-    G_SHADING_SMOOTH     = 1 << 21,
-    G_CLIPPING           = 1 << 23,
+export { RSP_Geometry };
+export const G_NOOP = F3DEX2_GBI.G_NOOP;
+
+const G_MTX_LOAD = 0x02;
+const G_MTX_PUSH = 0x04;
+
+// RDP.TileState.cacheKey is derived from a 32-bit address. Offset animated texture
+// frames above 32-bit address space so they don't collide.
+export const animatedTextureCacheKeyBase = 0x100000000;
+
+// Standard RSP stride-- xyz, bone index, uv, rgba
+export const vertexStride = 10;
+
+export interface DrawTextureAnimation {
+    textureIndices: number[];
+    frameDuration: number;
+    frameOffset: number;
+    crossfadeGroup: number | null;
+}
+
+export interface DrawTextureBinding {
+    animation: DrawTextureAnimation | undefined;
+    scrollSpeed: number;
 }
 
 export class DrawCall extends F3DEX.DrawCall {
     public DP_PrimColor = vec4.fromValues(1, 1, 1, 1);
     public DP_EnvColor = vec4.fromValues(1, 1, 1, 1);
     public DP_PrimLOD = 0;
+    public textureBindings: DrawTextureBinding[] = [];
+}
+
+export interface AnimatedTextureParams {
+    segment: number;
+    group: number;
+    frameDuration: number;
+    frames: ArrayBufferSlice[];
+    frameOffset?: number;
+    crossfade?: boolean;
+}
+
+export class AnimatedTexture {
+    public segment: number;
+    public group: number;
+    public frameDuration: number;
+    public frames: ArrayBufferSlice[];
+    public frameOffset: number;
+    public crossfade: boolean;
+
+    constructor(params: AnimatedTextureParams) {
+        this.segment = params.segment;
+        this.group = params.group;
+        this.frameDuration = params.frameDuration;
+        this.frames = params.frames;
+        this.frameOffset = params.frameOffset ?? 0;
+        this.crossfade = params.crossfade ?? false;
+    }
+
+    public matches(segment: number, address: number): boolean {
+        return segment === 0
+            ? this.segment === 0 && this.group === address
+            : this.segment === segment;
+    }
+
+    public selectFrame(frame: number): AnimatedTexture {
+        return new AnimatedTexture({
+            segment: this.segment,
+            group: this.group,
+            frameDuration: 0,
+            frames: [this.frames[frame]],
+            crossfade: this.crossfade,
+        });
+    }
+}
+
+export class RSPSharedOutput extends F3DEX.RSPSharedOutput {
+    private animatedTextureSourceIDs = new WeakMap<ArrayBufferSlice, number>();
+    private nextAnimatedTextureSourceID = 1;
+
+    public getAnimatedTextureCacheKey(frame: ArrayBufferSlice): number {
+        let sourceID = this.animatedTextureSourceIDs.get(frame);
+        if (sourceID === undefined) {
+            sourceID = this.nextAnimatedTextureSourceID++;
+            this.animatedTextureSourceIDs.set(frame, sourceID);
+        }
+        return animatedTextureCacheKeyBase + sourceID;
+    }
 }
 
 // same logic, just with the new type
@@ -41,16 +111,26 @@ export class RSPOutput extends F3DEX.RSPOutput {
     }
 }
 
-class TMemUploadCache {
+class TMemUpload {
     constructor(public addr: number, public dxt: number = -1) {
     }
+}
+
+// DK64 needs to trace each output vertex back to the DRAM address it was loaded from
+// (for animated-texture relighting) and to the modelview matrices in effect when it was
+// loaded (for prop animation), so the vertex cache carries both alongside the vertex.
+class StagingVertex extends F3DEX.StagingVertex {
+    public sourceAddress: number = 0;
+    public modelViewMatrixIndices: number[] = [];
 }
 
 export class RSPState {
     private output = new RSPOutput();
 
     private stateChanged: boolean = false;
-    private vertexCache = nArray(64, () => new F3DEX.StagingVertex());
+    private vertexCache = nArray(64, () => new StagingVertex());
+    public vertexSourceAddresses: number[] = [];
+    public vertexModelViewMatrixIndices: number[][] = [];
 
     private SP_GeometryMode: number = 0;
     private SP_TextureState = new F3DEX.TextureState();
@@ -61,16 +141,19 @@ export class RSPState {
     private DP_CombineH: number = 0;
     private DP_TextureImageState = new F3DEX.TextureImageState();
     private DP_TileState = nArray(8, () => new RDP.TileState());
-    private DP_TMemUploadTracker = new Map<number, TMemUploadCache>();
+    private DP_TMemUploadTracker = new Map<number, TMemUpload>();
 
     private DP_PrimColor = vec4.create();
     private DP_EnvColor = vec4.create();
     private DP_PrimLOD = 0;
+    private textureScrollSpeeds: number[] = [];
 
     public SP_MatrixIndex = 0;
+    // Animated props need to recompute a transform each frame: this stores matrix source indices.
+    private matrixStack: number[][] = [];
     public DP_Half1 = 0;
 
-    constructor(public textureBuffers: ArrayBufferSlice[], public segmentBuffers: ArrayBufferSlice[], public sharedOutput: F3DEX.RSPSharedOutput) {
+    constructor(public textureBuffers: ArrayBufferSlice[], public segmentBuffers: ArrayBufferSlice[], public sharedOutput: RSPSharedOutput, private animatedTextures: AnimatedTexture[] = []) {
     }
 
     public finish(): RSPOutput | null {
@@ -91,6 +174,10 @@ export class RSPState {
             this.vertexCache[i].matrixIndex = 1;
             this.vertexCache[i].outputIndex = -1;
         }
+    }
+
+    public setTextureScrollSpeeds(speeds: number[]): void {
+        this.textureScrollSpeeds = speeds;
     }
 
     private _setGeometryMode(newGeometryMode: number) {
@@ -117,28 +204,86 @@ export class RSPState {
         const view = this.segmentBuffers[(dramAddr >>> 24)].createDataView(dramAddr & 0x00FFFFFF);
 
         for (let i = 0; i < n; i++) {
-            this.vertexCache[v0 + i].setFromView(view, i * 0x10);
-            this.vertexCache[v0 + i].matrixIndex = this.SP_MatrixIndex;
+            const vertex = this.vertexCache[v0 + i];
+            vertex.setFromView(view, i * 0x10);
+            vertex.matrixIndex = this.SP_MatrixIndex;
+            vertex.modelViewMatrixIndices = this.matrixStack[this.matrixStack.length - 1] ?? [];
+            vertex.sourceAddress = dramAddr + i * 0x10;
         }
     }
 
-    private _translateTileTexture(tileIndex: number): number {
+    public gSPMatrix(dramAddr: number, matrixParams: number): void {
+        const segment = dramAddr >>> 24;
+        if (segment !== 0x04 && segment !== 0x09) {
+            if (matrixParams & G_MTX_PUSH)
+                this.matrixStack.push(this.matrixStack[this.matrixStack.length - 1] ?? []);
+            return;
+        }
+        const matrixIndex = (dramAddr & 0x00FFFFFF) >>> 6;
+        const mvMatrix = this.matrixStack.pop() ?? [];
+        if (matrixParams & G_MTX_PUSH)
+            this.matrixStack.push(mvMatrix);
+        this.matrixStack.push(
+            matrixParams & G_MTX_LOAD ? [matrixIndex] : [...mvMatrix, matrixIndex],
+        );
+        this.SP_MatrixIndex = matrixIndex;
+    }
+
+    public gSPPopMatrix(): void {
+        this.matrixStack.pop();
+        const mvMatrix = this.matrixStack[this.matrixStack.length - 1] ?? [];
+        this.SP_MatrixIndex = mvMatrix[mvMatrix.length - 1] ?? 0;
+    }
+
+    private _translateAnimatedTextureFrames(frames: ArrayBufferSlice[], segment: number, dramAddr: number, tile: RDP.TileState, deinterleave: boolean): number[] {
+        const oldCacheKey = tile.cacheKey;
+        const segmentBuffers: ArrayBufferSlice[] = [];
+        const textureIndices = frames.map((frame) => {
+            segmentBuffers[segment] = frame;
+            tile.cacheKey = this.sharedOutput.getAnimatedTextureCacheKey(frame);
+            return this.sharedOutput.textureCache.translateTileTexture(segmentBuffers, dramAddr, 0, tile, deinterleave);
+        });
+        tile.cacheKey = oldCacheKey;
+        return textureIndices;
+    }
+
+    private _translateTileTexture(tileIndex: number): { textureIndex: number; animation?: DrawTextureAnimation } {
         const tile = this.DP_TileState[tileIndex];
         const cache = assertExists(this.DP_TMemUploadTracker.get(tile.tmem));
         const segment = (cache.addr >>> 24) & 0xFF;
+
+        const animation = this.animatedTextures.find((entry) => entry.matches(segment, cache.addr));
+        if (animation !== undefined) {
+            const textureIndices = this._translateAnimatedTextureFrames(
+                animation.frames,
+                segment === 0 ? 0x01 : segment,
+                segment === 0 ? 0x01000000 : cache.addr,
+                tile,
+                cache.dxt === 0,
+            );
+            return {
+                textureIndex: textureIndices[0],
+                animation: segment !== 0 || textureIndices.length > 1 ? {
+                    textureIndices,
+                    frameDuration: animation.frameDuration,
+                    frameOffset: animation.frameOffset,
+                    crossfadeGroup: segment === 0 && animation.crossfade ? animation.group : null,
+                } : undefined,
+            };
+        }
 
         if (segment === 0x00) {
             // Load from texture index.
             const segmentBuffers: ArrayBufferSlice[] = [];
             segmentBuffers[0x01] = assertExists(this.textureBuffers[cache.addr]);
-    
+
             tile.cacheKey = cache.addr;
-    
+
             let dramPalAddr: number;
             if (tile.fmt === ImageFormat.G_IM_FMT_CI) {
                 const textlut = (this.DP_OtherModeH >>> 14) & 0x03;
                 // assert(textlut === RDP.TextureLUT.G_TT_RGBA16);
-    
+
                 const palTmem = 0x100 + (tile.palette << 4);
                 const palCache = assertExists(this.DP_TMemUploadTracker.get(palTmem));
                 segmentBuffers[0x02] = assertExists(this.textureBuffers[palCache.addr]);
@@ -148,16 +293,19 @@ export class RSPState {
             }
 
             const deinterleave = cache.dxt === 0;
-            return this.sharedOutput.textureCache.translateTileTexture(segmentBuffers, 0x01000000, dramPalAddr, tile, deinterleave);
-        } else {
-            console.warn(`Unknown texture segment type ${hexzero(segment, 0x02)}`);
-            return 0;
+            return {
+                textureIndex: this.sharedOutput.textureCache.translateTileTexture(segmentBuffers, 0x01000000, dramPalAddr, tile, deinterleave),
+            };
         }
+        console.warn(`Unknown texture segment type ${hexzero(segment, 0x02)}`);
+        return { textureIndex: 0 };
     }
 
-    private _flushTextures(dc: F3DEX.DrawCall): void {
+    private _flushTextures(dc: DrawCall): void {
         // If textures are not on, then we have no textures.
-        if (!this.SP_TextureState.on)
+        // If combiners are not reading textures, then we have no textures.
+        if (!this.SP_TextureState.on
+            || (!RDP.combineParamsUsesT0(dc.DP_Combine) && !RDP.combineParamsUsesT1(dc.DP_Combine)))
             return;
 
         const lod_en = !!((this.DP_OtherModeH >>> 16) & 0x01);
@@ -169,11 +317,20 @@ export class RSPState {
             const cycletype = RDP.getCycleTypeFromOtherModeH(this.DP_OtherModeH);
             assert(cycletype === RDP.OtherModeH_CycleType.G_CYC_1CYCLE || cycletype === RDP.OtherModeH_CycleType.G_CYC_2CYCLE);
 
-            dc.textureIndices.push(this._translateTileTexture(this.SP_TextureState.tile));
+            const texture0 = this._translateTileTexture(this.SP_TextureState.tile);
+            dc.textureIndices.push(texture0.textureIndex);
+            dc.textureBindings.push({ animation: texture0.animation, scrollSpeed: this.textureScrollSpeeds[0] ?? 0 });
 
-            if (!lod_en && this.SP_TextureState.level === 0 && RDP.combineParamsUsesT1(dc.DP_Combine)) {
+            if (!lod_en && RDP.combineParamsUsesT1(dc.DP_Combine)) {
                 // In 2CYCLE mode, it uses tile and tile + 1.
-                dc.textureIndices.push(this._translateTileTexture(this.SP_TextureState.tile + 1));
+                const texture1 = this._translateTileTexture(this.SP_TextureState.tile + 1);
+                const crossfadeGroup = texture0.animation?.crossfadeGroup;
+                const animation1 = texture1.animation;
+                if (crossfadeGroup !== null && crossfadeGroup !== undefined
+                    && animation1?.crossfadeGroup === crossfadeGroup)
+                    animation1.frameOffset++;
+                dc.textureIndices.push(texture1.textureIndex);
+                dc.textureBindings.push({ animation: texture1.animation, scrollSpeed: this.textureScrollSpeeds[1] ?? 0 });
             }
         }
     }
@@ -191,22 +348,29 @@ export class RSPState {
             vec4.copy(dc.DP_PrimColor, this.DP_PrimColor);
             vec4.copy(dc.DP_EnvColor, this.DP_EnvColor);
             dc.DP_PrimLOD = this.DP_PrimLOD;
- 
+
             this._flushTextures(dc);
         }
     }
 
     public gSPTri(i0: number, i1: number, i2: number): void {
         this._flushDrawCall();
-        this.sharedOutput.loadVertex(this.vertexCache[i0]);
-        this.sharedOutput.loadVertex(this.vertexCache[i1]);
-        this.sharedOutput.loadVertex(this.vertexCache[i2]);
+        this.loadTriVertex(i0);
+        this.loadTriVertex(i1);
+        this.loadTriVertex(i2);
         this.sharedOutput.indices.push(
             this.vertexCache[i0].outputIndex,
             this.vertexCache[i1].outputIndex,
             this.vertexCache[i2].outputIndex,
         );
         this.output.currentDrawCall.indexCount += 3;
+    }
+
+    private loadTriVertex(i: number): void {
+        const vertex = this.vertexCache[i];
+        this.sharedOutput.loadVertex(vertex);
+        this.vertexSourceAddresses[vertex.outputIndex] = vertex.sourceAddress;
+        this.vertexModelViewMatrixIndices[vertex.outputIndex] = vertex.modelViewMatrixIndices;
     }
 
     public gDPSetTextureImage(fmt: number, siz: number, w: number, addr: number): void {
@@ -220,7 +384,7 @@ export class RSPState {
     public gDPLoadTLUT(tile: number, count: number): void {
         // Track the TMEM destination back to the originating DRAM address.
         const tmemDst = this.DP_TileState[tile].tmem;
-        this.DP_TMemUploadTracker.set(tmemDst, new TMemUploadCache(this.DP_TextureImageState.addr));
+        this.DP_TMemUploadTracker.set(tmemDst, new TMemUpload(this.DP_TextureImageState.addr));
     }
 
     public gDPLoadBlock(tileIndex: number, uls: number, ult: number, texels: number, dxt: number): void {
@@ -232,7 +396,7 @@ export class RSPState {
         const tile = this.DP_TileState[tileIndex];
 
         // Track the TMEM destination back to the originating DRAM address.
-        this.DP_TMemUploadTracker.set(tile.tmem, new TMemUploadCache(this.DP_TextureImageState.addr, dxt));
+        this.DP_TMemUploadTracker.set(tile.tmem, new TMemUpload(this.DP_TextureImageState.addr, dxt));
         this.stateChanged = true;
     }
 
@@ -279,59 +443,6 @@ export class RSPState {
     }
 }
 
-enum F3DEX2_GBI {
-    G_SNOOP             = 0x00, //used in DK64
-    // DMA
-    G_VTX               = 0x01,
-    G_MODIFYVTX         = 0x02,
-    G_CULLDL            = 0x03,
-    G_BRANCH_Z          = 0x04,
-    G_TRI1              = 0x05,
-    G_TRI2              = 0x06,
-    G_QUAD              = 0x07,
-    G_LINE3D            = 0x08,
-
-    G_TEXTURE           = 0xD7,
-    G_POPMTX            = 0xD8,
-    G_GEOMETRYMODE      = 0xD9,
-    G_MTX               = 0xDA,
-    G_MOVEWORD          = 0XDB,
-    G_DL                = 0xDE,
-    G_ENDDL             = 0xDF,
-
-    // RDP
-    G_SETCIMG           = 0xFF,
-    G_SETZIMG           = 0xFE,
-    G_SETTIMG           = 0xFD,
-    G_SETCOMBINE        = 0xFC,
-    G_SETENVCOLOR       = 0xFB,
-    G_SETPRIMCOLOR      = 0xFA,
-    G_SETBLENDCOLOR     = 0xF9,
-    G_SETFOGCOLOR       = 0xF8,
-    G_SETFILLCOLOR      = 0xF7,
-    G_FILLRECT          = 0xF6,
-    G_SETTILE           = 0xF5,
-    G_LOADTILE          = 0xF4,
-    G_LOADBLOCK         = 0xF3,
-    G_SETTILESIZE       = 0xF2,
-    G_LOADTLUT          = 0xF0,
-    G_RDPSETOTHERMODE   = 0xEF,
-    G_SETPRIMDEPTH      = 0xEE,
-    G_SETSCISSOR        = 0xED,
-    G_SETCONVERT        = 0xEC,
-    G_SETKEYR           = 0xEB,
-    G_SETKEYFB          = 0xEA,
-    G_RDPFULLSYNC       = 0xE9,
-    G_RDPTILESYNC       = 0xE8,
-    G_RDPPIPESYNC       = 0xE7,
-    G_RDPLOADSYNC       = 0xE6,
-    G_TEXRECTFLIP       = 0xE5,
-    G_TEXRECT           = 0xE4,
-    G_SETOTHERMODE_H    = 0xE3,
-    G_SETOTHERMODE_L    = 0xE2,
-    G_RDPHALF_1         = 0XE1,
-}
-
 export function runDL_F3DEX2(state: RSPState, addr: number): void {
     const segmentBuffer = state.segmentBuffers[(addr >>> 24) & 0xFF];
     const view = segmentBuffer.createDataView();
@@ -341,7 +452,6 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
         const w1 = view.getUint32(i + 0x04);
 
         const cmd: F3DEX2_GBI = w0 >>> 24;
-        // console.log(hexzero(i, 8), F3DEX2_GBI[cmd], hexzero(w0, 8), hexzero(w1, 8));
 
         switch (cmd) {
             case F3DEX2_GBI.G_ENDDL:
@@ -350,7 +460,7 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
             case F3DEX2_GBI.G_GEOMETRYMODE: {
                 state.gSPClearGeometryMode(~(w0 & 0x00FFFFFF));
                 state.gSPSetGeometryMode(w1);
-             } break;
+            } break;
 
             case F3DEX2_GBI.G_SETTIMG: {
                 const fmt = (w0 >>> 21) & 0x07;
@@ -397,6 +507,11 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
                 state.gSPVertex(w1, n, v0);
             } break;
 
+            case F3DEX2_GBI.G_MTX:
+                // Note that G_MTX_PUSH is inverted.
+                state.gSPMatrix(w1, (w0 & 0xFF) ^ G_MTX_PUSH);
+                break;
+
             case F3DEX2_GBI.G_TRI1: {
                 const i0 = ((w0 >>> 16) & 0xFF) / 2;
                 const i1 = ((w0 >>> 8) & 0xFF) / 2;
@@ -421,6 +536,9 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
 
             case F3DEX2_GBI.G_DL: {
                 runDL_F3DEX2(state, w1);
+                // PUSH (0) resumes this list, NOPUSH(1) doesn't.
+                if ((w0 & 0x00010000) !== 0)
+                    return;
             } break;
 
             case F3DEX2_GBI.G_RDPSETOTHERMODE: {
@@ -446,7 +564,7 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
 
             case F3DEX2_GBI.G_TEXTURE: {
                 const level = (w0 >>> 11) & 0x07;
-                let tile = (w0 >>> 8) & 0x07;
+                const tile = (w0 >>> 8) & 0x07;
                 const on = !!((w0 >>> 0) & 0x7F);
                 const s = (w1 >>> 16) & 0xFFFF;
                 const t = (w1 >>> 0) & 0xFFFF;
@@ -463,7 +581,7 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
             } break;
 
             case F3DEX2_GBI.G_POPMTX: {
-                // state.gSPPopMatrix();
+                state.gSPPopMatrix();
             } break;
 
             case F3DEX2_GBI.G_SETPRIMCOLOR: {
@@ -500,7 +618,7 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
             case F3DEX2_GBI.G_RDPTILESYNC:
             case F3DEX2_GBI.G_RDPPIPESYNC:
             case F3DEX2_GBI.G_RDPLOADSYNC:
-            case F3DEX2_GBI.G_SNOOP:
+            case F3DEX2_GBI.G_NOOP:
                 // Implementation not necessary.
                 break;
 
@@ -509,5 +627,7 @@ export function runDL_F3DEX2(state: RSPState, addr: number): void {
         }
     }
 
-    throw new Error("whoops");
+    // Every display list must terminate with G_ENDDL; running past the end of the segment
+    // means we mis-parsed a command length or followed a bad branch.
+    throw new Error(`DK64: display list at ${hexzero(addr, 8)} ran past the end of its segment`);
 }

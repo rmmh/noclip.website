@@ -3,446 +3,88 @@ import * as Viewer from '../viewer.js';
 import * as BYML from '../byml.js';
 import * as UI from '../ui.js';
 
-import { GfxDevice, GfxCullMode, GfxProgram, GfxMegaStateDescriptor, makeTextureDescriptor2D, GfxFormat, GfxSampler, GfxTexture, GfxTexFilterMode, GfxMipFilterMode, GfxBindingLayoutDescriptor, GfxBlendMode, GfxBlendFactor, GfxBuffer, GfxInputLayout, GfxBufferUsage, GfxBufferFrequencyHint, GfxVertexAttributeDescriptor, GfxInputLayoutBufferDescriptor, GfxVertexBufferFrequency, GfxVertexBufferDescriptor, GfxIndexBufferDescriptor } from '../gfx/platform/GfxPlatform.js';
+import { GfxDevice } from '../gfx/platform/GfxPlatform.js';
 import { SceneContext } from '../SceneBase.js';
 import { makeBackbufferDescSimple, standardFullClearRenderPassDescriptor } from '../gfx/helpers/RenderGraphHelpers.js';
-import { F3DEX_Program } from '../BanjoKazooie/render.js';
-import { nArray, align, assert } from '../util.js';
-import { DeviceProgram } from '../Program.js';
+import { assert, hexzero } from '../util.js';
 import { mat4, vec3 } from 'gl-matrix';
 import { GfxRenderCache } from '../gfx/render/GfxRenderCache.js';
-import { TextureMapping, FakeTextureHolder } from '../TextureHolder.js';
-import { DrawCall, RSP_Geometry, RSPState, runDL_F3DEX2, RSPOutput } from './f3dex2.js';
-import { translateBlendMode, translateCullMode } from '../PokemonSnap/f3dex2.js';
-import { GfxRenderInstList, GfxRenderInstManager } from '../gfx/render/GfxRenderInstManager.js';
-import { computeViewMatrixSkybox, computeViewMatrix, CameraController } from '../Camera.js';
-import { fillMatrix4x3, fillMatrix4x2, fillVec4, fillMatrix4x4 } from '../gfx/helpers/UniformBufferHelpers.js';
-import { translateCM, Texture, OtherModeH_Layout, OtherModeH_CycleType } from '../Common/N64/RDP.js';
+import { FakeTextureHolder } from '../TextureHolder.js';
+import { GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
+import { CameraController } from '../Camera.js';
 import { GfxRenderHelper } from '../gfx/render/GfxRenderHelper.js';
-import { TextFilt, ImageFormat, ImageSize } from "../Common/N64/Image.js";
-import { RSPSharedOutput, Vertex } from '../BanjoKazooie/f3dex.js';
-import { setAttachmentStateSimple } from '../gfx/helpers/GfxMegaStateDescriptorHelpers.js';
-import { Vec3UnitY, Vec3Zero } from '../MathHelpers.js';
+import { MathConstants } from '../MathHelpers.js';
 
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
 import * as Deflate from '../Common/Compression/Deflate.js';
-import { calcTextureMatrixFromRSPState } from '../Common/N64/RSP.js';
 import { GfxrAttachmentSlot } from '../gfx/render/GfxRenderGraph.js';
-import { createBufferFromData } from '../gfx/helpers/BufferHelpers.js';
+import { RSPSharedOutput, RSPState, runDL_F3DEX2 } from './f3dex2.js';
+import { ActiveLightCache, buildDynamicLights, buildMapChunkLighting, buildObjectLighting, buildObjectLightingEnvironment } from './light.js';
+import type { DynamicLight, ObjectLightingEnvironment } from './light.js';
+import { ActorAnimationPose, actorModelScale, buildActorGeometry, getActorAnimationSpeed, getActorRenderDefinition } from './actors.js';
+import type { ActorRenderDefinition } from './actors.js';
+import { addModel2Props, buildTerrainTriangles } from './props.js';
+import {
+    SceneNodeMaterial, initDL,
+    initSceneNodeMaterial,
+} from './material.js';
+import { DK64Map, parseInstanceScripts, parseSetup } from './parse.js';
+import type { SetupActor } from './parse.js';
+import { createBackdropRenderer } from './background.js';
+import type { BackdropData, BackdropRenderer } from './background.js';
+import {
+    bindingLayouts, fogPositionToViewDistance, DK64TextureCache,
+    GeometryData, GeometryRenderer, DK64Layer,
+} from './render.js';
+import type { FogParams, MeshInput } from './render.js';
+import { addEnvironmentalEffects } from './particles.js';
+import type { EnvironmentParticleData, SpriteData } from './particles.js';
 
 const pathBase = `DonkeyKong64`;
 
-function translateTexture(device: GfxDevice, texture: Texture): GfxTexture {
-    const gfxTexture = device.createTexture(makeTextureDescriptor2D(GfxFormat.U8_RGBA_NORM, texture.width, texture.height, 1));
-    device.setResourceName(gfxTexture, texture.name);
-    device.uploadTextureData(gfxTexture, 0, [texture.pixels]);
-    return gfxTexture;
-}
-
-function translateSampler(cache: GfxRenderCache, texture: Texture): GfxSampler {
-    return cache.createSampler({
-        wrapS: translateCM(texture.tile.cms),
-        wrapT: translateCM(texture.tile.cmt),
-        minFilter: GfxTexFilterMode.Point,
-        magFilter: GfxTexFilterMode.Point,
-        mipFilter: GfxMipFilterMode.Nearest,
-        minLOD: 0, maxLOD: 0,
-    });
-}
-
-function initDL(rspState: RSPState, opaque: boolean): void {
-    rspState.gSPSetGeometryMode(RSP_Geometry.G_SHADE);
-    if (opaque) {
-        rspState.gDPSetOtherModeL(0, 29, 0x0C192078); // opaque surfaces
-        rspState.gSPSetGeometryMode(RSP_Geometry.G_LIGHTING);
-    } else
-        rspState.gDPSetOtherModeL(0, 29, 0x005049D8); // translucent surfaces
-    rspState.gDPSetOtherModeH(OtherModeH_Layout.G_MDSFT_TEXTFILT, 2, TextFilt.G_TF_BILERP << OtherModeH_Layout.G_MDSFT_TEXTFILT);
-    // initially 2-cycle, though this can change
-    rspState.gDPSetOtherModeH(OtherModeH_Layout.G_MDSFT_CYCLETYPE, 2, OtherModeH_CycleType.G_CYC_2CYCLE << OtherModeH_Layout.G_MDSFT_CYCLETYPE);
-    // some objects seem to assume this gets set, might rely on stage rendering first
-    rspState.gDPSetTile(ImageFormat.G_IM_FMT_RGBA, ImageSize.G_IM_SIZ_16b, 0, 0x100, 5, 0, 0, 0, 0, 0, 0, 0);
-}
-
-const viewMatrixScratch = mat4.create();
-const texMatrixScratch = mat4.create();
-class DrawCallInstance {
-    private textureEntry: Texture[] = [];
-    private vertexColorsEnabled = true;
-    private texturesEnabled = true;
-    private monochromeVertexColorsEnabled = false;
-    private alphaVisualizerEnabled = false;
-    private megaStateFlags: Partial<GfxMegaStateDescriptor>;
-    private program!: DeviceProgram;
-    private gfxProgram: GfxProgram | null = null;
-    private textureMappings = nArray(2, () => new TextureMapping());
-    public visible = true;
-
-    constructor(device: GfxDevice, cache: GfxRenderCache, sharedOutput: RSPSharedOutput, private drawCall: DrawCall) {
-        for (let i = 0; i < this.textureMappings.length; i++) {
-            const textureIndex = drawCall.textureIndices[i];
-            const tex = sharedOutput.textureCache.textures[textureIndex];
-
-            if (tex) {
-                this.textureEntry[i] = tex;
-                this.textureMappings[i].gfxTexture = translateTexture(device, tex);
-                this.textureMappings[i].gfxSampler = translateSampler(cache, tex);
-            }
-        }
-
-        this.megaStateFlags = translateBlendMode(this.drawCall.SP_GeometryMode, this.drawCall.DP_OtherModeL);
-        this.setBackfaceCullingEnabled(true);
-        this.createProgram();
-    }
-
-    private createProgram(): void {
-        const program = new F3DEX_Program(this.drawCall.DP_OtherModeH, this.drawCall.DP_OtherModeL, this.drawCall.DP_Combine);
-        program.defines.set('BONE_MATRIX_COUNT', '1');
-
-        if (this.texturesEnabled && this.textureEntry.length)
-            program.defines.set('USE_TEXTURE', '1');
-
-        if (!!(this.drawCall.SP_GeometryMode & RSP_Geometry.G_LIGHTING))
-            program.defines.set('LIGHTING', '1');
-
-        // FIXME: Levels disable the SHADE flags. wtf?
-        const shade = true; // (this.drawCall.SP_GeometryMode & RSP_Geometry.G_SHADING_SMOOTH) !== 0;
-        if (this.vertexColorsEnabled && shade)
-            program.defines.set('USE_VERTEX_COLOR', '1');
-
-        if (this.drawCall.SP_GeometryMode & RSP_Geometry.G_TEXTURE_GEN)
-            program.defines.set('TEXTURE_GEN', '1');
-
-        // many display lists seem to set this flag without setting texture_gen,
-        // despite this one being dependent on it
-        if (this.drawCall.SP_GeometryMode & RSP_Geometry.G_TEXTURE_GEN_LINEAR)
-            program.defines.set('TEXTURE_GEN_LINEAR', '1');
-
-        if (this.monochromeVertexColorsEnabled)
-            program.defines.set('USE_MONOCHROME_VERTEX_COLOR', '1');
-
-        if (this.alphaVisualizerEnabled)
-            program.defines.set('USE_ALPHA_VISUALIZER', '1');
-
-        this.program = program;
-        this.gfxProgram = null;
-    }
-
-    public setBackfaceCullingEnabled(v: boolean): void {
-        const cullMode = v ? translateCullMode(this.drawCall.SP_GeometryMode) : GfxCullMode.None;
-        this.megaStateFlags.cullMode = cullMode;
-    }
-
-    public setVertexColorsEnabled(v: boolean): void {
-        this.vertexColorsEnabled = v;
-        this.createProgram();
-    }
-
-    public setTexturesEnabled(v: boolean): void {
-        this.texturesEnabled = v;
-        this.createProgram();
-    }
-
-    public setMonochromeVertexColorsEnabled(v: boolean): void {
-        this.monochromeVertexColorsEnabled = v;
-        this.createProgram();
-    }
-
-    public setAlphaVisualizerEnabled(v: boolean): void {
-        this.alphaVisualizerEnabled = v;
-        this.createProgram();
-    }
-
-    private computeTextureMatrix(m: mat4, textureEntryIndex: number): void {
-        if (this.textureEntry[textureEntryIndex] !== undefined) {
-            const entry = this.textureEntry[textureEntryIndex];
-            calcTextureMatrixFromRSPState(m, this.drawCall.SP_TextureState.s, this.drawCall.SP_TextureState.t, entry.width, entry.height, entry.tile.shifts, entry.tile.shiftt);
-        } else {
-            mat4.identity(m);
-        }
-    }
-
-    public prepareToRender(device: GfxDevice, renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput, modelMatrix: mat4, isSkybox: boolean): void {
-        if (!this.visible)
-            return;
-
-        if (this.gfxProgram === null)
-            this.gfxProgram = renderInstManager.gfxRenderCache.createProgram(this.program);
-
-        const renderInst = renderInstManager.newRenderInst();
-        renderInst.setGfxProgram(this.gfxProgram);
-        renderInst.setSamplerBindingsFromTextureMappings(this.textureMappings);
-        renderInst.setMegaStateFlags(this.megaStateFlags);
-        renderInst.setDrawCount(this.drawCall.indexCount, this.drawCall.firstIndex);
-
-        let offs = renderInst.allocateUniformBuffer(F3DEX_Program.ub_DrawParams, 12 + 8*2);
-        const mappedF32 = renderInst.mapUniformBufferF32(F3DEX_Program.ub_DrawParams);
-
-        if (isSkybox)
-            computeViewMatrixSkybox(viewMatrixScratch, viewerInput.camera);
-        else
-            computeViewMatrix(viewMatrixScratch, viewerInput.camera);
-        mat4.mul(viewMatrixScratch, viewMatrixScratch, modelMatrix);
-
-        offs += fillMatrix4x3(mappedF32, offs, viewMatrixScratch); // u_ModelView
-
-        this.computeTextureMatrix(texMatrixScratch, 0);
-        offs += fillMatrix4x2(mappedF32, offs, texMatrixScratch); // u_TexMatrix[0]
-
-        this.computeTextureMatrix(texMatrixScratch, 1);
-        offs += fillMatrix4x2(mappedF32, offs, texMatrixScratch); // u_TexMatrix[1]
-
-        offs = renderInst.allocateUniformBuffer(F3DEX_Program.ub_CombineParams, 8);
-        const comb = renderInst.mapUniformBufferF32(F3DEX_Program.ub_CombineParams);
-        offs += fillVec4(comb, offs, 0, 0, 0, 0); // primitive color
-        offs += fillVec4(comb, offs, 0, 0, 0, 0); // environment color
-        renderInstManager.submitRenderInst(renderInst);
-    }
-
-    public destroy(device: GfxDevice): void {
-        for (let i = 0; i < this.textureMappings.length; i++)
-            if (this.textureMappings[i].gfxTexture !== null)
-                device.destroyTexture(this.textureMappings[i].gfxTexture!);
-    }
-}
-
-function makeVertexBufferData(v: Vertex[]): Float32Array {
-    const buf = new Float32Array(10 * v.length);
-    let j = 0;
-    for (let i = 0; i < v.length; i++) {
-        buf[j++] = v[i].x;
-        buf[j++] = v[i].y;
-        buf[j++] = v[i].z;
-        buf[j++] = 1.0;
-
-        buf[j++] = v[i].tx;
-        buf[j++] = v[i].ty;
-
-        buf[j++] = v[i].c0;
-        buf[j++] = v[i].c1;
-        buf[j++] = v[i].c2;
-        buf[j++] = v[i].a;
-    }
-    return buf;
-}
-
-export class RenderData {
-    public vertexBuffer: GfxBuffer;
-    public inputLayout: GfxInputLayout;
-    public vertexBufferDescriptors: GfxVertexBufferDescriptor[];
-    public indexBufferDescriptor: GfxIndexBufferDescriptor;
-    public vertexBufferData: Float32Array;
-    public indexBuffer: GfxBuffer;
-
-    constructor(device: GfxDevice, cache: GfxRenderCache, public sharedOutput: RSPSharedOutput, dynamic = false) {
-        assert(sharedOutput.vertices.length <= 0xFFFFFFFF);
-        this.vertexBufferData = makeVertexBufferData(sharedOutput.vertices);
-        this.vertexBuffer = createBufferFromData(device, GfxBufferUsage.Vertex, dynamic ? GfxBufferFrequencyHint.Dynamic : GfxBufferFrequencyHint.Static, this.vertexBufferData.buffer);
-
-        const indexBufferData = new Uint32Array(sharedOutput.indices);
-        this.indexBuffer = createBufferFromData(device, GfxBufferUsage.Index, GfxBufferFrequencyHint.Static, indexBufferData.buffer);
-
-        const vertexAttributeDescriptors: GfxVertexAttributeDescriptor[] = [
-            { location: F3DEX_Program.a_Position, bufferIndex: 0, format: GfxFormat.F32_RGBA, bufferByteOffset: 0*0x04, },
-            { location: F3DEX_Program.a_TexCoord, bufferIndex: 0, format: GfxFormat.F32_RG,   bufferByteOffset: 4*0x04, },
-            { location: F3DEX_Program.a_Color   , bufferIndex: 0, format: GfxFormat.F32_RGBA, bufferByteOffset: 6*0x04, },
-        ];
-
-        const vertexBufferDescriptors: GfxInputLayoutBufferDescriptor[] = [
-            { byteStride: 10*0x04, frequency: GfxVertexBufferFrequency.PerVertex, },
-        ];
-
-        this.inputLayout = cache.createInputLayout({
-            indexBufferFormat: GfxFormat.U32_R,
-            vertexBufferDescriptors,
-            vertexAttributeDescriptors,
-        });
-
-        this.vertexBufferDescriptors = [{ buffer: this.vertexBuffer }];
-        this.indexBufferDescriptor = { buffer: this.indexBuffer };
-    }
-
-    public destroy(device: GfxDevice): void {
-        device.destroyBuffer(this.indexBuffer);
-        device.destroyBuffer(this.vertexBuffer);
-    }
-}
-
-export interface Mesh {
-    sharedOutput: RSPSharedOutput;
-    rspState: RSPState;
-    rspOutput: RSPOutput | null;
-}
-
-export class MeshData {
-    public renderData: RenderData;
-
-    constructor(device: GfxDevice, cache: GfxRenderCache, public mesh: Mesh) {
-        this.renderData = new RenderData(device, cache, mesh.sharedOutput, false);
-    }
-
-    public destroy(device: GfxDevice): void {
-        this.renderData.destroy(device);
-    }
-}
-
-class MeshRenderer {
-    public drawCallInstances: DrawCallInstance[] = [];
-
-    public prepareToRender(device: GfxDevice, renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput, modelMatrix: mat4, isSkybox: boolean): void {
-        for (let i = 0; i < this.drawCallInstances.length; i++)
-            this.drawCallInstances[i].prepareToRender(device, renderInstManager, viewerInput, modelMatrix, isSkybox);
-    }
-
-    public setBackfaceCullingEnabled(v: boolean): void {
-        for (let i = 0; i < this.drawCallInstances.length; i++)
-            this.drawCallInstances[i].setBackfaceCullingEnabled(v);
-    }
-
-    public setVertexColorsEnabled(v: boolean): void {
-        for (let i = 0; i < this.drawCallInstances.length; i++)
-            this.drawCallInstances[i].setVertexColorsEnabled(v);
-    }
-
-    public setTexturesEnabled(v: boolean): void {
-        for (let i = 0; i < this.drawCallInstances.length; i++)
-            this.drawCallInstances[i].setTexturesEnabled(v);
-    }
-
-    public setMonochromeVertexColorsEnabled(v: boolean): void {
-        for (let i = 0; i < this.drawCallInstances.length; i++)
-            this.drawCallInstances[i].setMonochromeVertexColorsEnabled(v);
-    }
-
-    public setAlphaVisualizerEnabled(v: boolean): void {
-        for (let i = 0; i < this.drawCallInstances.length; i++)
-            this.drawCallInstances[i].setAlphaVisualizerEnabled(v);
-    }
-
-    public destroy(device: GfxDevice): void {
-        for (let i = 0; i < this.drawCallInstances.length; i++)
-            this.drawCallInstances[i].destroy(device);
-    }
-}
-
-const lookatScratch = vec3.create();
-const modelViewScratch = mat4.create();
-export class RootMeshRenderer {
-    private visible = true;
-    private megaStateFlags: Partial<GfxMegaStateDescriptor>;
-    public isSkybox = false;
-    public sortKeyBase: number;
-    public modelMatrix = mat4.create();
-
-    public objectFlags = 0;
-    private rootNodeRenderer: MeshRenderer;
-
-    constructor(device: GfxDevice, cache: GfxRenderCache, private geometryData: MeshData) {
-        this.megaStateFlags = {};
-        setAttachmentStateSimple(this.megaStateFlags, {
-            blendMode: GfxBlendMode.Add,
-            blendSrcFactor: GfxBlendFactor.SrcAlpha,
-            blendDstFactor: GfxBlendFactor.OneMinusSrcAlpha,
-        });
-
-        const geo = this.geometryData.mesh;
-
-        // Traverse the node tree.
-        this.rootNodeRenderer = this.buildGeoNodeRenderer(device, cache, geo);
-    }
-
-    private buildGeoNodeRenderer(device: GfxDevice, cache: GfxRenderCache, node: Mesh): MeshRenderer {
-        const geoNodeRenderer = new MeshRenderer();
-
-        if (node.rspOutput !== null) {
-            for (let i = 0; i < node.rspOutput.drawCalls.length; i++) {
-                const drawCallInstance = new DrawCallInstance(device, cache, node.sharedOutput, node.rspOutput.drawCalls[i]);
-                geoNodeRenderer.drawCallInstances.push(drawCallInstance);
-            }
-        }
-
-        return geoNodeRenderer;
-    }
-
-    public setBackfaceCullingEnabled(v: boolean): void {
-        this.rootNodeRenderer.setBackfaceCullingEnabled(v);
-    }
-
-    public setVertexColorsEnabled(v: boolean): void {
-        this.rootNodeRenderer.setVertexColorsEnabled(v);
-    }
-
-    public setTexturesEnabled(v: boolean): void {
-        this.rootNodeRenderer.setTexturesEnabled(v);
-    }
-
-    public setMonochromeVertexColorsEnabled(v: boolean): void {
-        this.rootNodeRenderer.setMonochromeVertexColorsEnabled(v);
-    }
-
-    public setAlphaVisualizerEnabled(v: boolean): void {
-        this.rootNodeRenderer.setAlphaVisualizerEnabled(v);
-    }
-
-    public prepareToRender(device: GfxDevice, renderInstManager: GfxRenderInstManager, viewerInput: Viewer.ViewerRenderInput): void {
-        if (!this.visible)
-            return;
-
-        const renderData = this.geometryData.renderData;
-
-        const template = renderInstManager.pushTemplate();
-        template.setBindingLayouts(bindingLayouts);
-        template.setVertexInput(renderData.inputLayout, renderData.vertexBufferDescriptors, renderData.indexBufferDescriptor);
-        template.setMegaStateFlags(this.megaStateFlags);
-
-        template.sortKey = this.sortKeyBase;
-
-        const computeLookAt = false; // FIXME: or true?
-        const sceneParamsSize = 16 + (computeLookAt ? 8 : 0);
-
-        let offs = template.allocateUniformBuffer(F3DEX_Program.ub_SceneParams, sceneParamsSize);
-        const mappedF32 = template.mapUniformBufferF32(F3DEX_Program.ub_SceneParams);
-        offs += fillMatrix4x4(mappedF32, offs, viewerInput.camera.projectionMatrix);
-
-        if (computeLookAt) {
-            // compute lookat X and Y in view space, since that's the transform the shader will have
-            mat4.getTranslation(lookatScratch, this.modelMatrix);
-            vec3.transformMat4(lookatScratch, lookatScratch, viewerInput.camera.viewMatrix);
-
-            mat4.lookAt(modelViewScratch, Vec3Zero, lookatScratch, Vec3UnitY);
-            offs += fillVec4(mappedF32, offs, modelViewScratch[0], modelViewScratch[4], modelViewScratch[8]);
-            offs += fillVec4(mappedF32, offs, modelViewScratch[1], modelViewScratch[5], modelViewScratch[9]);
-        }
-
-        this.rootNodeRenderer.prepareToRender(device, renderInstManager, viewerInput, this.modelMatrix, this.isSkybox);
-
-        renderInstManager.popTemplate();
-    }
-
-    public destroy(device: GfxDevice): void {
-        this.rootNodeRenderer.destroy(device);
-    }
-}
-
-const bindingLayouts: GfxBindingLayoutDescriptor[] = [
-    { numUniformBuffers: 3, numSamplers: 2, },
-];
-
-class DK64Renderer implements Viewer.SceneGfx {
+export class DK64Renderer implements Viewer.SceneGfx {
     public renderHelper: GfxRenderHelper;
     private renderInstListMain = new GfxRenderInstList();
+    private backdropRenderer: BackdropRenderer | null;
+    private activeLightCache: ActiveLightCache;
+    public gfxTextureCache = new DK64TextureCache();
 
-    public meshDatas: MeshData[] = [];
-    public meshRenderers: RootMeshRenderer[] = [];
+    public geoDatas: GeometryData[] = [];
+    public geoRenderers: GeometryRenderer[] = [];
+    public fogParams: FogParams;
 
-    public textureHolder = new FakeTextureHolder([]);
+    public textureHolder = new FakeTextureHolder(this.gfxTextureCache.viewerTextures);
 
-    constructor(device: GfxDevice) {
+    constructor(device: GfxDevice, sceneID: number, clipNear: number, clipFar: number, backdrop: BackdropData | null, dynamicLights: readonly DynamicLight[]) {
         this.renderHelper = new GfxRenderHelper(device);
+        this.backdropRenderer = createBackdropRenderer(device, this.renderHelper.renderCache, backdrop, sceneID);
+        this.activeLightCache = new ActiveLightCache(dynamicLights);
+        // from func_global_asm_80648C84: Aztec has custom fog pos overrides.
+        const fogNearPosition = sceneID === 0x26 ? 995 : 990;
+        this.fogParams = {
+            // Note that fog positions are in DK64 projected-depth units.
+            near: fogPositionToViewDistance(fogNearPosition, clipNear, clipFar),
+            far: fogPositionToViewDistance(999, clipNear, clipFar),
+            color: sceneID === 0x26
+                ? [0x8A / 0xFF, 0x52 / 0xFF, 0x16 / 0xFF, 0]
+                : [0, 0, 0, 0],
+        };
+    }
+
+    public addGeoData(device: GfxDevice, cache: GfxRenderCache, geo: MeshInput): GeometryData {
+        const geoData = new GeometryData(device, cache, geo);
+        this.geoDatas.push(geoData);
+        return geoData;
+    }
+
+    public addGeometryRenderer(device: GfxDevice, cache: GfxRenderCache, geoData: GeometryData, layer: DK64Layer, sharedRenderer: GeometryRenderer | null = null): GeometryRenderer {
+        const renderer = new GeometryRenderer(device, cache, geoData, layer, this.fogParams, this.gfxTextureCache, sharedRenderer);
+        this.geoRenderers.push(renderer);
+        return renderer;
     }
 
     public adjustCameraController(c: CameraController) {
-        c.setSceneMoveSpeedMult(30/60);
+        c.setSceneMoveSpeedMult(30 / 60);
     }
 
     public createPanels(): UI.Panel[] {
@@ -452,38 +94,68 @@ class DK64Renderer implements Viewer.SceneGfx {
 
         const enableCullingCheckbox = new UI.Checkbox('Enable Culling', true);
         enableCullingCheckbox.onchanged = () => {
-            for (const meshRenderer of this.meshRenderers)
-                meshRenderer.setBackfaceCullingEnabled(enableCullingCheckbox.checked);
+            for (const geoRenderer of this.geoRenderers)
+                geoRenderer.setBackfaceCullingEnabled(enableCullingCheckbox.checked);
         };
         renderHacksPanel.contents.appendChild(enableCullingCheckbox.elem);
 
         const enableVertexColorsCheckbox = new UI.Checkbox('Enable Vertex Colors', true);
         enableVertexColorsCheckbox.onchanged = () => {
-            for (const meshRenderer of this.meshRenderers)
-                meshRenderer.setVertexColorsEnabled(enableVertexColorsCheckbox.checked);
+            for (const geoRenderer of this.geoRenderers)
+                geoRenderer.setVertexColorsEnabled(enableVertexColorsCheckbox.checked);
         };
         renderHacksPanel.contents.appendChild(enableVertexColorsCheckbox.elem);
 
+        const enableDynamicLightingCheckbox = new UI.Checkbox('Enable Dynamic Lighting', true);
+        enableDynamicLightingCheckbox.onchanged = () => {
+            for (const geoData of this.geoDatas)
+                geoData.setDynamicLightingEnabled(enableDynamicLightingCheckbox.checked);
+        };
+        renderHacksPanel.contents.appendChild(enableDynamicLightingCheckbox.elem);
+
         const enableTextures = new UI.Checkbox('Enable Textures', true);
         enableTextures.onchanged = () => {
-            for (const meshRenderer of this.meshRenderers)
-                meshRenderer.setTexturesEnabled(enableTextures.checked);
+            for (const geoRenderer of this.geoRenderers)
+                geoRenderer.setTexturesEnabled(enableTextures.checked);
         };
         renderHacksPanel.contents.appendChild(enableTextures.elem);
 
+        const enableFog = new UI.Checkbox('Enable Fog', false);
+        enableFog.onchanged = () => {
+            for (const geoRenderer of this.geoRenderers)
+                geoRenderer.setFogEnabled(enableFog.checked);
+        };
+        renderHacksPanel.contents.appendChild(enableFog.elem);
+
         const enableMonochromeVertexColors = new UI.Checkbox('Grayscale Vertex Colors', false);
         enableMonochromeVertexColors.onchanged = () => {
-            for (const meshRenderer of this.meshRenderers)
-                meshRenderer.setMonochromeVertexColorsEnabled(enableMonochromeVertexColors.checked);
+            for (const geoRenderer of this.geoRenderers)
+                geoRenderer.setMonochromeVertexColorsEnabled(enableMonochromeVertexColors.checked);
         };
         renderHacksPanel.contents.appendChild(enableMonochromeVertexColors.elem);
 
         const enableAlphaVisualizer = new UI.Checkbox('Visualize Vertex Alpha', false);
         enableAlphaVisualizer.onchanged = () => {
-            for (const meshRenderer of this.meshRenderers)
-                meshRenderer.setAlphaVisualizerEnabled(enableAlphaVisualizer.checked);
+            for (const geoRenderer of this.geoRenderers)
+                geoRenderer.setAlphaVisualizerEnabled(enableAlphaVisualizer.checked);
         };
         renderHacksPanel.contents.appendChild(enableAlphaVisualizer.elem);
+
+        const addVisibilityCheckbox = (label: string, layer: DK64Layer): void => {
+            const checkbox = new UI.Checkbox(label, true);
+            checkbox.onchanged = () => {
+                for (const geoRenderer of this.geoRenderers) {
+                    if (geoRenderer.renderLayer === layer)
+                        geoRenderer.setVisible(checkbox.checked);
+                }
+            };
+            renderHacksPanel.contents.appendChild(checkbox.elem);
+        };
+        addVisibilityCheckbox('Show Map Geometry', DK64Layer.MapGeometry);
+        addVisibilityCheckbox('Show Actors', DK64Layer.Actors);
+        addVisibilityCheckbox('Show Props', DK64Layer.Props);
+        addVisibilityCheckbox('Show Surfaces', DK64Layer.Surfaces);
+        addVisibilityCheckbox('Show Effects', DK64Layer.Effects);
 
         return [renderHacksPanel];
     }
@@ -493,16 +165,18 @@ class DK64Renderer implements Viewer.SceneGfx {
         template.setBindingLayouts(bindingLayouts);
 
         this.renderHelper.renderInstManager.setCurrentList(this.renderInstListMain);
+        this.backdropRenderer?.prepareToRender(this.renderHelper.renderInstManager, viewerInput);
 
-        for (let i = 0; i < this.meshRenderers.length; i++)
-            this.meshRenderers[i].prepareToRender(device, this.renderHelper.renderInstManager, viewerInput);
+        const tick = Math.floor(viewerInput.time / (1000 / 30));
+        this.activeLightCache.update(viewerInput.camera.worldMatrix, tick);
+        for (let i = 0; i < this.geoRenderers.length; i++)
+            this.geoRenderers[i].prepareToRender(device, this.renderHelper.renderInstManager, viewerInput, this.activeLightCache);
 
         this.renderHelper.renderInstManager.popTemplate();
         this.renderHelper.prepareToRender();
     }
 
     public render(device: GfxDevice, viewerInput: Viewer.ViewerRenderInput) {
-        const renderInstManager = this.renderHelper.renderInstManager;
         const builder = this.renderHelper.renderGraph.newGraphBuilder();
 
         const mainColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, viewerInput, standardFullClearRenderPassDescriptor);
@@ -527,162 +201,11 @@ class DK64Renderer implements Viewer.SceneGfx {
     }
 
     public destroy(device: GfxDevice): void {
+        this.backdropRenderer?.destroy(device);
         this.renderHelper.destroy();
-        for (let i = 0; i < this.meshRenderers.length; i++)
-            this.meshRenderers[i].destroy(device);
-        for (let i = 0; i < this.meshDatas.length; i++)
-            this.meshDatas[i].destroy(device);
-    }
-}
-
-export class DisplayListInfo {
-    public ChunkID: number;
-    public dlStartAddr: number;
-    public VertStartIndex: number;
-}
-
-export class MapChunk {
-    public x: number
-    public y: number
-    public z: number
-
-    public dlOffsets: number[] = [];
-    public dlSizes: number[] = [];
-    public vertOffset: number;
-    public vertSize: number;
-
-    static readonly size = 0x34;
-
-    constructor(bin: ArrayBufferSlice, public id: number) {
-        let view = bin.createDataView();
-        this.x = view.getInt32(0x00);
-        this.y = view.getInt32(0x04);
-
-        let dlTableIdx = 0x0C;
-        for (let i = 0; i < 4; i++) {
-            this.dlOffsets[i] = view.getInt32(dlTableIdx + 0x00);
-            this.dlSizes[i] = view.getUint32(dlTableIdx + 0x04);
-            dlTableIdx += 0x08;
-        }
-
-        this.vertOffset = view.getInt32(0x2C);
-        this.vertSize = view.getUint32(0x30);
-    }
-}
-
-export class MapSection {
-    public meshID: number;
-    public vertOffsets: number[] = [];
-
-    static readonly size = 0x1C;
-
-    constructor(bin: ArrayBufferSlice) {
-        let view = bin.createDataView();
-        this.meshID = view.getUint16(0x02, false);
-        for (let i = 0; i < 8; i++)
-            this.vertOffsets[i] = view.getUint16(0x08 + i*0x02);
-    }
-}
-
-export class Map {
-    public bin: ArrayBufferSlice;
-    public vertBin: ArrayBufferSlice;
-    public f3dexBin: ArrayBufferSlice;
-    public chunkCount: number;
-    public chunks: MapChunk[] = [];
-    public sections: MapSection[] = [];
-    public displayLists: DisplayListInfo[] = [];
-
-    // headerInfo
-    private dlStart: number;
-    private vertStart: number;
-    private vertEnd: number;
-    private sectionStart: number;
-    private sectionEnd: number;
-    private chunkCountOffset: number;
-    private chunkStart: number;
-
-    constructor(buffer: ArrayBufferSlice) {
-        this.bin = buffer;
-
-        const view = this.bin.createDataView();
-        this.dlStart = view.getUint32(0x34, false);
-        this.vertStart = view.getUint32(0x38, false);
-        this.vertEnd = view.getUint32(0x40, false);
-        this.sectionStart = view.getUint32(0x58, false);
-        this.sectionEnd = view.getUint32(0x5C, false);
-        this.chunkCountOffset = view.getUint32(0x64, false);
-        this.chunkStart = view.getUint32(0x68, false);
-
-        this.f3dexBin = this.bin.slice(this.dlStart, this.vertStart);
-        this.vertBin = this.bin.slice(this.vertStart, this.vertEnd);
-
-        this.chunkCount = view.getUint32(this.chunkCountOffset, false);
-
-        if (this.chunkCount > 0) {
-            for (let i = 0; i < this.chunkCount; i++) {
-                const chunkBuffer = this.bin.subarray(this.chunkStart + MapChunk.size * i, MapChunk.size);
-                this.chunks[i] = new MapChunk(chunkBuffer, i);
-            }
-        }
-
-        for (let i = 0; (i * MapSection.size) < (this.sectionEnd - this.sectionStart); i++) {
-            const sectionBuffer = this.bin.subarray(this.sectionStart + i * MapSection.size + 4, MapSection.size);
-            this.sections[i] = new MapSection(sectionBuffer);
-        }
-
-        console.log(`${this.chunkCount} CHUNKS PARSED FOR MAP`);
-
-        if (this.chunkCount > 0) {
-            this.chunks.forEach(chunk => {
-                for (let iDL = 0; iDL < 4; iDL++) {
-                    if (chunk.dlOffsets[iDL] !== -1 && chunk.dlSizes[iDL] !== 0){
-                        let snoopPresent = false;
-                        let currf3dexCnt = chunk.dlSizes[iDL];
-                        let currf3dexOffset = this.dlStart + chunk.dlOffsets[iDL];
-                        do {
-                            let command = view.getUint8(currf3dexOffset);
-
-                            // Load vertex segment buffer?
-                            if (command === 0x00) {
-                                snoopPresent = true;
-                                const sectionID = view.getUint32(currf3dexOffset + 0x04, false);
-                                const currSection = this.sections.find((section) => section.meshID === sectionID);
-
-                                if (currSection !== undefined) {
-                                    this.displayLists.push({
-                                        ChunkID: chunk.id,
-                                        dlStartAddr: currf3dexOffset - this.dlStart,
-                                        VertStartIndex: (chunk.vertOffset/0x10 + currSection.vertOffsets[iDL]),
-                                    });
-                                }
-                            }
-
-                            currf3dexOffset = currf3dexOffset + 8;
-                            currf3dexCnt = currf3dexCnt - 8;
-                        } while (currf3dexCnt > 0);
-
-                        if (!snoopPresent) {
-                            // More than 5 segments to chunk
-                            // Include Start as DL
-                            this.displayLists.push({
-                                ChunkID: chunk.id,
-                                dlStartAddr: chunk.dlOffsets[iDL],
-                                VertStartIndex: chunk.vertOffset/0x10
-                            });
-                        }
-                    }
-                }
-            });
-        } else {
-            this.displayLists.push({
-                ChunkID: 0,
-                dlStartAddr: 0,
-                VertStartIndex: 0
-            });
-        }
-
-        console.log(`${this.displayLists.length} DISPLAY LISTS FOUND IN MAP MODEL`);
+        for (let i = 0; i < this.geoDatas.length; i++)
+            this.geoDatas[i].destroy(device);
+        this.gfxTextureCache.destroy(device);
     }
 }
 
@@ -693,18 +216,181 @@ function decompress(buffer: ArrayBufferSlice): ArrayBufferSlice {
     return decompressed;
 }
 
-class ROMData {
-    public MapData: (ArrayBufferSlice | number)[];
-    public TexData: ArrayBufferSlice[];
+class TextureData {
+    public TexData: ArrayBufferSlice[] = [];
+    public AnimTexData: ArrayBufferSlice[] = [];
+
+    public static fromBuffer(buffer: ArrayBufferSlice): TextureData {
+        return new TextureData(BYML.parse(buffer, BYML.FileType.CRG1));
+    }
+
+    constructor(obj: any) {
+        applyTextureEntries(this.TexData, obj.TexData, true);
+        applyTextureEntries(this.AnimTexData, obj.AnimTexData, false);
+    }
+
+    // no-op for DataShare's Destroyable (DK64TextureCache owns the textures).
+    public destroy(device: GfxDevice): void {
+    }
+}
+
+class CommonData extends TextureData {
+    public SpriteData: SpriteData[];
+    public CustomScriptFunctionData: number[];
 
     constructor(buffer: ArrayBufferSlice) {
         const obj: any = BYML.parse(buffer, BYML.FileType.CRG1);
+        super(obj);
+        this.SpriteData = obj.SpriteData ?? [];
+        this.CustomScriptFunctionData = obj.CustomScriptFunctionData ?? [];
+    }
+}
 
-        this.MapData = obj.MapData;
-        this.TexData = obj.TexData.map((buffer: ArrayBufferSlice) => decompress(buffer));
+function applyTextureEntries(target: ArrayBufferSlice[], entries: any[] | undefined, compressed: boolean): void {
+    for (const entry of entries ?? [])
+        target[entry.ID] = compressed ? decompress(entry.Data) : entry.Data;
+}
+
+function overlayTextureData(target: ArrayBufferSlice[], source: ArrayBufferSlice[]): void {
+    for (let id = 0; id < source.length; id++) {
+        if (source[id] !== undefined)
+            target[id] = source[id];
+    }
+}
+
+export class ROMData {
+    public MapData: ArrayBufferSlice;
+    public Backdrop: BackdropData | null;
+    public PropGeometryData = new Map<number, ArrayBufferSlice>();
+    public ActorDefinitions = new Map<number, number>();
+    public ActorGeometryData = new Map<number, ArrayBufferSlice>();
+    public AnimationData = new Map<number, ArrayBufferSlice>();
+    public SetupData: ArrayBufferSlice;
+    public ScriptData: ArrayBufferSlice;
+    public CritterData: ArrayBufferSlice | null;
+    public EnvironmentParticleData: EnvironmentParticleData[];
+
+    public SpriteData: SpriteData[];
+    public CustomScriptFunctionData: number[];
+    public TexData: ArrayBufferSlice[];
+    public AnimTexData: ArrayBufferSlice[];
+
+    constructor(common: CommonData, level: any, commonTextureGroups: TextureData[]) {
+        this.MapData = level.MapData;
+        this.SetupData = level.SetupData;
+        this.ScriptData = level.ScriptData;
+        this.CritterData = level.CritterData;
+        this.EnvironmentParticleData = level.EnvironmentParticleData ?? [];
+        for (const prop of level.PropGeometry ?? [])
+            this.PropGeometryData.set(prop.Type, prop.Data);
+        for (const actor of level.ActorDefinitions ?? [])
+            this.ActorDefinitions.set(actor.Type, actor.Model);
+        for (const actor of level.ActorGeometry ?? [])
+            this.ActorGeometryData.set(actor.Model, actor.Data);
+        for (const animation of level.AnimationData ?? [])
+            this.AnimationData.set(animation.ID, animation.Data);
+
+        this.SpriteData = common.SpriteData;
+        this.CustomScriptFunctionData = common.CustomScriptFunctionData;
+        this.TexData = common.TexData.slice();
+        this.AnimTexData = common.AnimTexData.slice();
+        for (const group of commonTextureGroups) {
+            overlayTextureData(this.TexData, group.TexData);
+            overlayTextureData(this.AnimTexData, group.AnimTexData);
+        }
+        applyTextureEntries(this.TexData, level.TexData, true);
+        applyTextureEntries(this.AnimTexData, level.AnimTexData, false);
+        const backdrop = level.Backdrop ?? null;
+        if (backdrop !== null) {
+            const data = this.TexData[backdrop.TextureIndex];
+            this.Backdrop = { TextureID: backdrop.TextureID, Data: data! };
+        } else {
+            this.Backdrop = null;
+        }
     }
 
-    public destroy(device: GfxDevice): void {
+    public loadSetup(): ArrayBufferSlice {
+        return decompress(this.SetupData);
+    }
+
+    public loadPropGeometry(propType: number): ArrayBufferSlice {
+        const data = this.PropGeometryData.get(propType);
+        return decompress(data!);
+    }
+
+    public loadActorGeometry(model: number): ArrayBufferSlice {
+        const data = this.ActorGeometryData.get(model);
+        return decompress(data!);
+    }
+
+    public loadAnimation(id: number): ArrayBufferSlice {
+        return this.AnimationData.get(id)!;
+    }
+
+    public loadScripts(): ArrayBufferSlice {
+        return decompress(this.ScriptData);
+    }
+}
+
+function addSceneActors(
+    device: GfxDevice,
+    cache: GfxRenderCache,
+    sceneRenderer: DK64Renderer,
+    sharedOutput: RSPSharedOutput,
+    romData: ROMData,
+    setupActors: readonly SetupActor[],
+    worldScale: number,
+    lightingEnvironment: ObjectLightingEnvironment,
+    getActorPose: (definition: ActorRenderDefinition, speed: number) => ActorAnimationPose,
+): void {
+    const actors: { actor: SetupActor, definition: ActorRenderDefinition }[] = [];
+    for (const actor of setupActors) {
+        const definition = getActorRenderDefinition(actor.type, romData.ActorDefinitions.get(actor.type) ?? 0);
+        if (definition !== null)
+            actors.push({ actor, definition });
+    }
+
+    const geoDataByDefinition = new Map<string, GeometryData>();
+    for (const { actor, definition } of actors) {
+        const animationSpeed = getActorAnimationSpeed(definition, actor);
+        const geometryKey = `${definition.model}:${definition.animation ?? -1}:${animationSpeed}`;
+        let geoData = geoDataByDefinition.get(geometryKey);
+        if (geoData === undefined) {
+            const actorGeometry = buildActorGeometry(
+                romData.loadActorGeometry(definition.model),
+                getActorPose(definition, animationSpeed),
+                actor.type,
+                romData.TexData,
+                sharedOutput,
+            );
+            const geo: MeshInput = {
+                sharedOutput,
+                rspOutput: actorGeometry.rspOutput,
+                actorAnimation: actorGeometry.animation,
+            };
+            geoData = sceneRenderer.addGeoData(device, cache, geo);
+            geoDataByDefinition.set(geometryKey, geoData);
+        }
+        const rendererScale = actor.scale * actorModelScale * worldScale;
+        const renderer = sceneRenderer.addGeometryRenderer(device, cache, geoData, DK64Layer.Actors);
+        const origin = vec3.fromValues(
+            actor.position[0] * worldScale,
+            actor.position[1] * worldScale,
+            actor.position[2] * worldScale,
+        );
+        mat4.translate(renderer.modelMatrix, renderer.modelMatrix, [
+            origin[0],
+            origin[1],
+            origin[2],
+        ]);
+        mat4.rotateY(renderer.modelMatrix, renderer.modelMatrix, actor.rotationY / 0x1000 * MathConstants.TAU);
+        mat4.scale(renderer.modelMatrix, renderer.modelMatrix, [rendererScale, rendererScale, rendererScale]);
+        renderer.setObjectLighting(buildObjectLighting(lightingEnvironment, origin));
+        if (definition.rotationYSpeed !== undefined)
+            renderer.setRotationYAnimation(definition.rotationYSpeed);
+        if (definition.positionYAmplitude !== undefined)
+            renderer.setPositionYAnimation(definition.positionYAmplitude * worldScale, definition.rotationYSpeed ?? 0);
+        renderer.setCullBoundingBox(renderer.computeWorldBoundingBox());
     }
 }
 
@@ -714,120 +400,134 @@ class SceneDesc implements Viewer.SceneDesc {
 
     public async createScene(device: GfxDevice, context: SceneContext): Promise<Viewer.SceneGfx> {
         const dataFetcher = context.dataFetcher;
-        const romData = await context.dataShare.ensureObject(`${pathBase}/ROMData`, async () => {
-            return new ROMData(await dataFetcher.fetchData(`${pathBase}/ROM_arc.crg1`)!);
-        });
-
         const sceneID = parseInt(this.id, 16);
-
-        let mapData = romData.MapData[sceneID];
-        if (typeof mapData === 'number')
-            mapData = romData.MapData[mapData];
-        const map = new Map(decompress(mapData as ArrayBufferSlice));
+        const [commonData, levelBuffer] = await Promise.all([
+            context.dataShare.ensureObject(`${pathBase}/CommonData`, async () => {
+                return new CommonData(await dataFetcher.fetchData(`${pathBase}/common.crg1`));
+            }),
+            dataFetcher.fetchData(`${pathBase}/${this.id}.crg1`),
+        ]);
+        const levelData: any = BYML.parse(levelBuffer, BYML.FileType.CRG1);
+        const commonTextureGroupIDs: number[] = levelData.CommonTextureGroups ?? [];
+        const commonTextureGroups = await Promise.all(commonTextureGroupIDs.map((groupID) => {
+            const suffix = hexzero(groupID, 2).toUpperCase();
+            return context.dataShare.ensureObject(`${pathBase}/CommonTextureData/${suffix}`, async () => {
+                return TextureData.fromBuffer(await dataFetcher.fetchData(`${pathBase}/common_${suffix}.crg1`));
+            });
+        }));
+        const romData = new ROMData(commonData, levelData, commonTextureGroups);
+        const map = new DK64Map(decompress(romData.MapData), romData.AnimTexData);
+        const setup = parseSetup(romData.loadSetup());
+        const scripts = parseInstanceScripts(romData.loadScripts());
+        const actorPoses = new Map<string, ActorAnimationPose>();
+        const getActorPose = (definition: ActorRenderDefinition, speed: number): ActorAnimationPose => {
+            const key = `${definition.model}:${definition.animation ?? -1}:${speed}`;
+            let pose = actorPoses.get(key);
+            if (pose === undefined) {
+                pose = new ActorAnimationPose(
+                    romData.loadActorGeometry(definition.model),
+                    definition.animation !== null ? romData.loadAnimation(definition.animation) : null,
+                    speed,
+                );
+                actorPoses.set(key, pose);
+            }
+            return pose;
+        };
+        const dynamicLights = buildDynamicLights(
+            setup,
+            (type) => romData.loadPropGeometry(type).createDataView(),
+            getActorPose,
+        );
+        const objectLightingEnvironment = buildObjectLightingEnvironment(map.vertBin, map.chunks, dynamicLights);
 
         const sharedOutput = new RSPSharedOutput();
-        const sceneRenderer = new DK64Renderer(device);
+        const sceneRenderer = new DK64Renderer(device, sceneID, map.clipNear, map.clipFar, romData.Backdrop, dynamicLights);
         const cache = sceneRenderer.renderHelper.renderCache;
+
         for (let i = 0; i < map.displayLists.length; i++) {
             const dl = map.displayLists[i];
 
             const segmentBuffers: ArrayBufferSlice[] = [];
-            segmentBuffers[0x06] = map.vertBin.slice(dl.VertStartIndex * 0x10);
+            segmentBuffers[0x06] = map.vertBin.slice(dl.vertStartIndex * 0x10);
             segmentBuffers[0x07] = map.f3dexBin;
-            const state = new RSPState(romData.TexData, segmentBuffers, sharedOutput);
-            initDL(state, true);
+            // Bindings persist across material display lists. The state
+            // must be maintained for proper rendering.
+            const animatedTextures = dl.textureAnimationGroup !== null
+                ? [
+                    ...map.animatedTextures.filter((entry) => entry.group === dl.textureAnimationGroup),
+                    ...map.animatedTextures.filter((entry) => entry.group !== dl.textureAnimationGroup),
+                ]
+                : [...map.animatedTextures];
+            animatedTextures.unshift(...SceneNodeMaterial.getAnimatedTextureBindings(dl.materialIndex)
+                .map((binding) => binding.resolve(romData.AnimTexData)));
+            const state = new RSPState(romData.TexData, segmentBuffers, sharedOutput, animatedTextures);
+            // func_global_asm_806592B4: global fog
+            initDL(state, true, map.fogEnabled);
+            if (dl.materialIndex !== null)
+                initSceneNodeMaterial(state, dl.materialIndex, map.fogEnabled, sceneID);
+            const firstVertex = sharedOutput.vertices.length;
             runDL_F3DEX2(state, 0x07000000 | dl.dlStartAddr);
 
             const output = state.finish();
 
-            if (output === null) {
-                // TODO(jstpierre): Warn?
+            if (output === null)
                 continue;
-            }
 
-            const mesh: Mesh = { sharedOutput, rspState: state, rspOutput: output };
-            const meshData = new MeshData(device, cache, mesh);
-            sceneRenderer.meshDatas.push(meshData);
-
-            const meshRenderer = new RootMeshRenderer(device, cache, meshData);
-            sceneRenderer.meshRenderers.push(meshRenderer);
+            const chunk = dl.chunkID >= 0 ? map.chunks[dl.chunkID] ?? null : null;
+            const geo: MeshInput = {
+                sharedOutput,
+                rspOutput: output,
+                dynamicLighting: buildMapChunkLighting(
+                    sharedOutput, output.drawCalls, firstVertex,
+                    state.vertexSourceAddresses, dl.vertStartIndex * 0x10,
+                    chunk, dynamicLights,
+                ),
+            };
+            const geoData = sceneRenderer.addGeoData(device, cache, geo);
+            const renderLayer = dl.materialIndex === null
+                ? DK64Layer.MapGeometry
+                : DK64Layer.Surfaces;
+            const geoRenderer = sceneRenderer.addGeometryRenderer(device, cache, geoData, renderLayer);
+            if (dl.chunkID >= 0)
+                geoRenderer.setCullBoundingBox(geoData.cullBoundingBox);
         }
 
-        // for (let i = 0; i < sharedOutput.textureCache.textures.length; i++)
-        //     sceneRenderer.textureHolder.viewerTextures.push(textureToCanvas(sharedOutput.textureCache.textures[i]));
+        // Floor decals need an efficient way to find terrain triangles.
+        // The game uses floor-collision data, this is approximately equivalent.
+        const terrainTriangles = buildTerrainTriangles(sharedOutput);
+        // Streamed maps have 3x coords, single-chunk maps (DK's House etc) do not.
+        const setupWorldScale = map.chunkCount > 0 ? 3 : 1;
 
-        // Load setup data, ported from ScriptHawk's dumpSetup() function
-        /*
-        const model1SetupSize = 0x38;
-        const model1Setup = {
-            x_pos: 0x00, // Float
-            y_pos: 0x04, // Float
-            z_pos: 0x08, // Float
-            scale: 0x0C, // Float
-            rotation: 0x30, // s16_be / 0x1000 * 360 for degrees
-            behavior: 0x32, // Short, see ScriptHawk's obj_model1.actor_types table
-        };
-        
-        const model2SetupSize = 0x30;
-        const model2Setup = {
-            x_pos: 0x00, // Float
-            y_pos: 0x04, // Float
-            z_pos: 0x08, // Float
-            scale: 0x0C, // Float
-            rotation: 0x1C, // Float
-            behavior: 0x28, // Short, see ScriptHawk's obj_model2.object_types table
-        };
+        for (const surface of map.generatedSurfaces) {
+            const vertexBuffer = surface.createVertexBuffer();
+            const segmentBuffers: ArrayBufferSlice[] = [];
+            segmentBuffers[0x08] = vertexBuffer;
+            const materialTextures = surface.getAnimatedTextureBindings()
+                .map((binding) => binding.resolve(romData.AnimTexData));
+            const state = new RSPState(romData.TexData, segmentBuffers, sharedOutput, materialTextures);
+            initDL(state, false);
+            surface.initMaterial(state);
 
-        const setup = romHandler.loadSetup(parseInt(this.id, 16));
-        const setupView = setup.createDataView();
-        
-        console.log("Dumping setup for Structs:");
-        let model2Count = setupView.getUint32(0, false);
-        let model2Base = 0x04;
-        console.log("Count: " + model2Count);
-    
-        for (let i = 0; i < model2Count - 1; i++) {
-            let entryBase = model2Base + i * model2SetupSize;
-            let xPos = setupView.getFloat32(entryBase + model2Setup.x_pos, false);
-            let yPos = setupView.getFloat32(entryBase + model2Setup.y_pos, false);
-            let zPos = setupView.getFloat32(entryBase + model2Setup.z_pos, false);
-            let scale = setupView.getFloat32(entryBase + model2Setup.scale, false);
-            let rotation = setupView.getFloat32(entryBase + model2Setup.rotation, false);
-            let behavior = setupView.getUint16(entryBase + model2Setup.behavior, false);
-            // TODO: Actually render model
-            console.log("Struct: " + entryBase.toString(16) + ": " + behavior + " (model: " + (romHandler.StructTableView.getUint32(behavior * 4, false) & 0x7FFFFFFF).toString(16) + ") at " + Math.round(xPos) + ", " + Math.round(yPos) + ", " + Math.round(zPos) + " scale " + scale + " rotation " + rotation);
-            //let modelFile = romHandler.getStructModel(behavior);
+            const firstVertex = sharedOutput.vertices.length;
+            surface.emitGeometry(state);
+
+            const output = state.finish()!;
+            const geo: MeshInput = {
+                sharedOutput,
+                rspOutput: output,
+                generatedSurfaceAnimation: {
+                    surface,
+                    firstVertex,
+                    vertexCount: sharedOutput.vertices.length - firstVertex,
+                },
+            };
+            const geoData = sceneRenderer.addGeoData(device, cache, geo);
+            sceneRenderer.addGeometryRenderer(device, cache, geoData, DK64Layer.Surfaces);
         }
-    
-        // TODO: What to heck is this data used for?
-        // It's a bunch of floats that get loaded in to struct behaviors as far as I can tell
-        let mysteryModelSize = 0x24;
-        let mysteryModelBase = model2Base + model2Count * model2SetupSize;
-        let mysteryModelCount = setupView.getUint32(mysteryModelBase, false);
-        console.log("Dumping setup for 'mystery model':");
-        console.log("Base: " + mysteryModelBase.toString(16));
-        console.log("Count: " + mysteryModelCount);
 
-        console.log("Dumping setup for Actors:");
-        let model1Base = mysteryModelBase + 0x04 + mysteryModelCount * mysteryModelSize;
-        let model1Count = setupView.getUint32(model1Base, false);
-        console.log("Base: " + model1Base.toString(16));
-        console.log("Count: " + model1Count);
-    
-        for (let i = 0; i < model1Count - 1; i++) {
-            let entryBase = model1Base + 0x04 + i * model1SetupSize;
-            let xPos = setupView.getFloat32(entryBase + model1Setup.x_pos, false);
-            let yPos = setupView.getFloat32(entryBase + model1Setup.y_pos, false);
-            let zPos = setupView.getFloat32(entryBase + model1Setup.z_pos, false);
-            let scale = setupView.getFloat32(entryBase + model1Setup.scale, false);
-            let rotation = setupView.getInt16(entryBase + model1Setup.rotation) / 4096.0 * 360.0;
-            let behavior = (setupView.getUint16(entryBase + model1Setup.behavior, false) + 0x10) % 0x10000;
-            // TODO: Actually render model
-            //console.log("Actor: " + entryBase.toString(16) + ": " + behavior + " (model: " + romHandler.ActorModels[behavior].toString(16) + ") at " + Math.round(xPos) + ", " + Math.round(yPos) + ", " + Math.round(zPos) + " scale " + scale + " rotation " + rotation);
-            //let modelFile = romHandler.getActorModel(behavior);
-        }
-        */
-
+        addModel2Props(device, cache, sceneRenderer, sharedOutput, romData, setup.props, scripts, terrainTriangles, setupWorldScale, map.fogEnabled, objectLightingEnvironment);
+        addSceneActors(device, cache, sceneRenderer, sharedOutput, romData, setup.actors, setupWorldScale, objectLightingEnvironment, getActorPose);
+        addEnvironmentalEffects(device, cache, sceneRenderer, sharedOutput, romData, map, sceneID, setup.props, scripts);
         return sceneRenderer;
     }
 
@@ -837,7 +537,6 @@ class SceneDesc implements Viewer.SceneDesc {
 const id = `dk64`;
 const name = "Donkey Kong 64";
 const sceneDescs = [
-
     "DK Isles",
     new SceneDesc(`22`, "DK Isles Overworld"),
     new SceneDesc(`B0`, "Training Grounds"),
@@ -1085,4 +784,4 @@ const sceneDescs = [
     new SceneDesc(`BF`, "Rambi Arena"),
 ];
 
-export const sceneGroup: Viewer.SceneGroup = { id, name, sceneDescs };
+export const sceneGroup: Viewer.SceneGroup = { id, name, sceneDescs, altName: "dk64" };
