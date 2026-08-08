@@ -6,7 +6,6 @@ import { Slider, Widget, RENDER_HACKS_ICON, createDOMFromString, HIGHLIGHT_COLOR
 import { GlobalGrabManager } from "./GrabManager.js";
 import { assert, nullify } from "./util.js";
 import { invlerp, lerp } from "./MathHelpers.js";
-import { IS_DEVELOPMENT } from "./BuildVersion.js";
 import "reflect-metadata";
 
 interface Range {
@@ -434,9 +433,6 @@ export class DebugFloaterHolder {
 
     constructor() {
         this.elem = document.createElement('div');
-
-        if (IS_DEVELOPMENT)
-            this.midiControls.init();
     }
 
     public makeFloatingPanel(title: string = 'Floating Panel', icon: string = RENDER_HACKS_ICON): FloatingPanel {
