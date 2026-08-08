@@ -2350,7 +2350,6 @@ export class MPHEntityFile {
                         mapMaterialAnimationTime: (time) => locked ? 0 : time - latestTransitionTime,
                     };
                 });
-            renderers.push(lockRenderer);
             calcDoorLockModelMatrix(lockRenderer.modelMatrix, door, lockRenderer.modelScale);
             renderers.push(lockRenderer);
         }
