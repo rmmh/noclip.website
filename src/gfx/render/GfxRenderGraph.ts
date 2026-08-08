@@ -271,6 +271,16 @@ class GraphImpl {
 type PassSetupFunc = (pass: GfxrPass) => void;
 type ComputePassSetupFunc = (pass: GfxrComputePass) => void;
 
+export type GfxrExternalDepthTargetHook = (builder: GfxrGraphBuilder, depthTargetID: GfxrRenderTargetID) => void;
+const externalDepthTargetHooks = new WeakMap<GfxTexture, GfxrExternalDepthTargetHook>();
+
+export function setExternalTextureDepthTargetHook(texture: GfxTexture, hook: GfxrExternalDepthTargetHook | null): void {
+    if (hook !== null)
+        externalDepthTargetHooks.set(texture, hook);
+    else
+        externalDepthTargetHooks.delete(texture);
+}
+
 export interface GfxrGraphBuilder {
     /**
      * Add a new pass. {@param setupFunc} will be called *immediately* to set up the
@@ -653,6 +663,21 @@ export class GfxrRenderGraphImpl implements GfxrRenderGraph, GfxrGraphBuilder, G
         assert(renderPass.resolveOutputIDs[attachmentSlot] === undefined);
         renderPass.resolveOutputExternalTexture[attachmentSlot] = texture;
         renderPass.resolveOutputExternalTextureView[attachmentSlot] = view !== null ? view : { level: 0, z: 0 };
+
+        const depthHook = externalDepthTargetHooks.get(texture);
+        if (depthHook !== undefined) {
+            const passes = this.currentGraph!.passes;
+            for (let i = passes.indexOf(renderPass); i >= 0; i--) {
+                const pass = passes[i];
+                if (pass.attachmentRenderTargetID.includes(renderTargetID)) {
+                    const depthTargetID = pass.attachmentRenderTargetID[GfxrAttachmentSlot.DepthStencil];
+                    if (depthTargetID !== undefined) {
+                        depthHook(this, depthTargetID);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     public getRenderTargetDescription(renderTargetID: number): Readonly<GfxrRenderTargetDescription> {

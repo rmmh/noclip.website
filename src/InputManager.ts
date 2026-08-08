@@ -45,6 +45,8 @@ export default class InputManager {
     public dy: number = 0;
     public dz: number = 0;
     public buttons: number = 0;
+    private grabButton: number = -1;
+    private grabPosition = { x: 0, y: 0 };
     public ondraggingmodechanged: (() => void) | null = null;
     private scrollListeners: Listener[] = [];
     private usePointerLock: boolean = true;
@@ -58,6 +60,10 @@ export default class InputManager {
     private dTouchY: number = 0;
     private dPinchDist: number = 0;
     private releaseOnMouseUp: boolean = true;
+    private doubleClick: { x: number, y: number } | null = null;
+    private lastLeftClickTime = -Infinity;
+    private lastLeftClickX = 0;
+    private lastLeftClickY = 0;
 
     constructor(toplevel: HTMLElement) {
         document.body.tabIndex = -1;
@@ -77,7 +83,26 @@ export default class InputManager {
         this.toplevel.addEventListener('mousedown', (e) => {
             if (!this.isMouseEnabled)
                 return;
+            this.mouseX = e.clientX * window.devicePixelRatio;
+            this.mouseY = e.clientY * window.devicePixelRatio;
+            const now = performance.now();
+            const doubleClickDistance = Math.hypot(e.clientX - this.lastLeftClickX, e.clientY - this.lastLeftClickY);
+            if (e.button === 0 && now - this.lastLeftClickTime < 400 && doubleClickDistance < 12) {
+                this.lastLeftClickTime = -Infinity;
+                this.doubleClick = { x: e.clientX, y: e.clientY };
+                this.buttons = e.buttons;
+                e.preventDefault();
+                return;
+            }
+            if (e.button === 0) {
+                this.lastLeftClickTime = now;
+                this.lastLeftClickX = e.clientX;
+                this.lastLeftClickY = e.clientY;
+            }
             this.buttons = e.buttons;
+            this.grabButton = e.button;
+            this.grabPosition.x = e.clientX;
+            this.grabPosition.y = e.clientY;
             GlobalGrabManager.takeGrab(this, e, { takePointerLock: this.usePointerLock, useGrabbingCursor: true, releaseOnMouseUp: this.releaseOnMouseUp });
             if (this.ondraggingmodechanged !== null)
                 this.ondraggingmodechanged();
@@ -89,7 +114,6 @@ export default class InputManager {
         this.toplevel.addEventListener('mouseup', (e) => {
             this.buttons = e.buttons;
         });
-
         this.toplevel.addEventListener('touchstart', this._onTouchChange, { passive: true });
         this.toplevel.addEventListener('touchend', this._onTouchChange, { passive: true });
         this.toplevel.addEventListener('touchcancel', this._onTouchChange, { passive: true });
@@ -155,6 +179,20 @@ export default class InputManager {
         return this.getDraggingMode() !== DraggingMode.None;
     }
 
+    public getGrabButton(): number {
+        return this.isDragging() ? this.grabButton : -1;
+    }
+
+    public getGrabPosition(): Readonly<{ x: number, y: number }> {
+        return this.grabPosition;
+    }
+
+    public consumeDoubleClick(): { x: number, y: number } | null {
+        const doubleClick = this.doubleClick;
+        this.doubleClick = null;
+        return doubleClick;
+    }
+
     public afterFrame() {
         this.dx = 0;
         this.dy = 0;
@@ -162,6 +200,7 @@ export default class InputManager {
         this.dTouchX = 0;
         this.dTouchY = 0;
         this.dPinchDist = 0;
+        this.doubleClick = null;
 
         // Go through and mark all keys as non-event-triggered.
         this.keysDown.forEach((v, k) => {
@@ -283,6 +322,7 @@ export default class InputManager {
 
     public onGrabReleased() {
         this.buttons = 0;
+        this.grabButton = -1;
         if (this.ondraggingmodechanged !== null)
             this.ondraggingmodechanged();
     }

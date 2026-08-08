@@ -36,6 +36,8 @@ export class Camera {
     // Camera's linear (aka positional) velocity. Instantaneous for the frame.
     public linearVelocity = vec3.create();
 
+    public raycast: ((out: vec3, origin: ReadonlyVec3, direction: ReadonlyVec3) => boolean | null) | null = null;
+
     public frustum = new Frustum();
     
     public static DefaultFovY = MathConstants.TAU / 6;
@@ -141,8 +143,23 @@ const scratchVec3c = vec3.create();
 const scratchVec3d = vec3.create();
 const scratchVec3e = vec3.create();
 const scratchVec3f = vec3.create();
+const scratchVec3g = vec3.create();
+const scratchVec3h = vec3.create();
 const scratchMat4 = mat4.create();
 const scratchQuat = quat.create();
+
+function cameraPinError(camera: Camera, worldDirection: vec3, desiredLocalDirection: vec3): number {
+    mat4.getRotation(scratchQuat, camera.worldMatrix);
+    quat.conjugate(scratchQuat, scratchQuat);
+    vec3.transformQuat(scratchVec3g, worldDirection, scratchQuat);
+    const z0 = -desiredLocalDirection[2], z1 = -scratchVec3g[2];
+    if (z1 <= 0)
+        return Infinity;
+    return Math.hypot(
+        camera.projectionMatrix[0] * (scratchVec3g[0] / z1 - desiredLocalDirection[0] / z0),
+        camera.projectionMatrix[5] * (scratchVec3g[1] / z1 - desiredLocalDirection[1] / z0),
+    );
+}
 
 /**
  * Computes a view-space depth given {@param viewMatrix} and {@param aabb} in world-space.
@@ -249,11 +266,20 @@ export class FPSCameraController implements CameraController {
 
     private mouseLookSpeed = 500;
     private isMoving = false;
+    private isRightOrbiting = false;
+    private orbitTargetPending = false;
+    private orbitTarget = vec3.create();
+    private orbitLocalPivotDirection = vec3.create();
+    private orbitLocalLookDirection = vec3.create();
+    private pendingDoubleClickDirection: vec3 | null = null;
 
     public sceneMoveSpeedMult = 1;
 
     public cameraUpdateForced(): void {
         vec3.zero(this.linearMoveDir);
+        this.isRightOrbiting = false;
+        this.orbitTargetPending = false;
+        this.pendingDoubleClickDirection = null;
     }
 
     public setSceneMoveSpeedMult(v: number): void {
@@ -336,6 +362,86 @@ export class FPSCameraController implements CameraController {
         const viewForward = scratchVec3d;
         getMatrixAxis(viewRight, upAxis, viewForward, camera.worldMatrix);
 
+        const doubleClick = inputManager.consumeDoubleClick();
+        if (doubleClick !== null) {
+            const rect = inputManager.toplevel.getBoundingClientRect();
+            const ndcX = ((doubleClick.x - rect.left) / rect.width) * 2 - 1;
+            const ndcY = 1 - ((doubleClick.y - rect.top) / rect.height) * 2;
+            const clickDirection = scratchVec3e;
+            vec3.scale(clickDirection, viewRight, ndcX / camera.projectionMatrix[0]);
+            vec3.scaleAndAdd(clickDirection, clickDirection, upAxis, ndcY / camera.projectionMatrix[5]);
+            vec3.scaleAndAdd(clickDirection, clickDirection, viewForward, -1);
+            vec3.normalize(clickDirection, clickDirection);
+            this.pendingDoubleClickDirection = vec3.clone(clickDirection);
+        }
+
+        if (this.pendingDoubleClickDirection !== null) {
+            const clickDirection = this.pendingDoubleClickDirection;
+            let dollyDistance = Math.max(this.keyMoveSpeed * 0.5, 1);
+            const cameraOrigin = scratchVec3f;
+            vec3.set(cameraOrigin, camera.worldMatrix[12], camera.worldMatrix[13], camera.worldMatrix[14]);
+            const raycastHit = scratchVec3g;
+            const raycastResult = camera.raycast !== null ? camera.raycast(raycastHit, cameraOrigin, clickDirection) : false;
+            if (raycastResult === null) {
+                // The depth picker will complete this on a later frame.
+            } else {
+                if (raycastResult) {
+                    vec3.set(clickDirection,
+                        raycastHit[0] - camera.worldMatrix[12],
+                        raycastHit[1] - camera.worldMatrix[13],
+                        raycastHit[2] - camera.worldMatrix[14]);
+                    const hitDistance = vec3.length(clickDirection);
+                    vec3.normalize(clickDirection, clickDirection);
+                    dollyDistance = Math.max(0, hitDistance - Math.max(this.keyMoveSpeed * 0.25, 1));
+                }
+                camera.worldMatrix[12] += clickDirection[0] * dollyDistance;
+                camera.worldMatrix[13] += clickDirection[1] * dollyDistance;
+                camera.worldMatrix[14] += clickDirection[2] * dollyDistance;
+                this.pendingDoubleClickDirection = null;
+                updated = true;
+            }
+        }
+
+        const grabButton = inputManager.getGrabButton();
+        const rightOrbiting = grabButton === 2 && (inputManager.buttons & 1) === 0;
+        if (rightOrbiting && (!this.isRightOrbiting || this.orbitTargetPending)) {
+            const grabPosition = inputManager.getGrabPosition();
+            const rect = inputManager.toplevel.getBoundingClientRect();
+            const ndcX = ((grabPosition.x - rect.left) / rect.width) * 2 - 1;
+            const ndcY = 1 - ((grabPosition.y - rect.top) / rect.height) * 2;
+            const orbitDirection = scratchVec3e;
+            vec3.scale(orbitDirection, viewRight, ndcX / camera.projectionMatrix[0]);
+            vec3.scaleAndAdd(orbitDirection, orbitDirection, upAxis, ndcY / camera.projectionMatrix[5]);
+            vec3.scaleAndAdd(orbitDirection, orbitDirection, viewForward, -1);
+            vec3.normalize(orbitDirection, orbitDirection);
+            vec3.set(this.orbitTarget, camera.worldMatrix[12], camera.worldMatrix[13], camera.worldMatrix[14]);
+            const cameraOrigin = scratchVec3f;
+            vec3.set(cameraOrigin, camera.worldMatrix[12], camera.worldMatrix[13], camera.worldMatrix[14]);
+            const raycastResult = camera.raycast !== null ? camera.raycast(scratchVec3g, cameraOrigin, orbitDirection) : false;
+            this.orbitTargetPending = raycastResult === null;
+            if (raycastResult === true)
+                vec3.copy(this.orbitTarget, scratchVec3g);
+            else if (raycastResult === false)
+                vec3.scaleAndAdd(this.orbitTarget, this.orbitTarget, orbitDirection, Math.max(this.keyMoveSpeed * 2.5, 1));
+            if (this.orbitTargetPending)
+                vec3.copy(this.orbitTarget, cameraOrigin);
+            else {
+                // Preserve the pivot's exact camera-local direction. Keeping this
+                // vector constant keeps the pivot at the same projected position.
+                vec3.sub(this.orbitLocalPivotDirection, this.orbitTarget, cameraOrigin);
+                vec3.normalize(this.orbitLocalPivotDirection, this.orbitLocalPivotDirection);
+                mat4.getRotation(scratchQuat, camera.worldMatrix);
+                quat.conjugate(scratchQuat, scratchQuat);
+                vec3.transformQuat(this.orbitLocalPivotDirection, this.orbitLocalPivotDirection, scratchQuat);
+                vec3.normalize(this.orbitLocalPivotDirection, this.orbitLocalPivotDirection);
+                mat4.targetTo(scratchMat4, cameraOrigin, this.orbitTarget, Vec3UnitY);
+                mat4.getRotation(scratchQuat, scratchMat4);
+                quat.conjugate(scratchQuat, scratchQuat);
+                vec3.negate(this.orbitLocalLookDirection, viewForward);
+                vec3.transformQuat(this.orbitLocalLookDirection, this.orbitLocalLookDirection, scratchQuat);
+            }
+        }
+
         if (this.useWorldUp) {
             vec3.copy(upAxis, Vec3UnitY);
         }
@@ -363,6 +469,8 @@ export class FPSCameraController implements CameraController {
             camera.worldMatrix[12] += linearVelocity[0];
             camera.worldMatrix[13] += linearVelocity[1];
             camera.worldMatrix[14] += linearVelocity[2];
+            if (rightOrbiting)
+                vec3.add(this.orbitTarget, this.orbitTarget, linearVelocity);
             updated = true;
         } else {
             vec3.copy(linearVelocity, Vec3Zero);
@@ -384,6 +492,42 @@ export class FPSCameraController implements CameraController {
 
         // rotateAngles[2] is rotation around view forward (roll)
 
+        if (rightOrbiting && !this.orbitTargetPending && (dx !== 0 || dy !== 0)) {
+            mat4.copy(scratchMat4, camera.worldMatrix);
+            const cameraPosition = scratchVec3a;
+            vec3.set(cameraPosition, camera.worldMatrix[12], camera.worldMatrix[13], camera.worldMatrix[14]);
+            const orbitOffset = scratchVec3e;
+            vec3.sub(orbitOffset, cameraPosition, this.orbitTarget);
+
+            const radius = vec3.length(orbitOffset);
+            const theta = Math.atan2(orbitOffset[0], orbitOffset[2]) + dx;
+            const phi = Math.acos(clampRange(orbitOffset[1] / radius, 1)) + dy;
+            const sinPhiRadius = Math.sin(phi) * radius;
+            vec3.set(orbitOffset,
+                sinPhiRadius * Math.sin(theta),
+                Math.cos(phi) * radius,
+                sinPhiRadius * Math.cos(theta));
+            vec3.add(cameraPosition, this.orbitTarget, orbitOffset);
+
+            const worldPivotDirection = scratchVec3h;
+            vec3.sub(worldPivotDirection, this.orbitTarget, cameraPosition);
+            vec3.normalize(worldPivotDirection, worldPivotDirection);
+            mat4.targetTo(camera.worldMatrix, cameraPosition, this.orbitTarget, Vec3UnitY);
+            mat4.getRotation(scratchQuat, camera.worldMatrix);
+            const worldLookDirection = scratchVec3f;
+            vec3.transformQuat(worldLookDirection, this.orbitLocalLookDirection, scratchQuat);
+            const lookTarget = scratchVec3b;
+            vec3.add(lookTarget, cameraPosition, worldLookDirection);
+            mat4.targetTo(camera.worldMatrix, cameraPosition, lookTarget, Vec3UnitY);
+
+            const rejected = cameraPinError(camera, worldPivotDirection, this.orbitLocalPivotDirection) > 0.2;
+            if (rejected) {
+                mat4.copy(camera.worldMatrix, scratchMat4);
+            }
+            vec3.zero(rotateAngles);
+            updated ||= !rejected;
+        }
+
         const keyAngleChangeVel = isShiftPressed ? this.keyAngleChangeVelFast : this.keyAngleChangeVelSlow;
         if (inputManager.isKeyDown('KeyJ'))
             rotateAngles[0] += keyAngleChangeVel * invertXMult;
@@ -398,7 +542,7 @@ export class FPSCameraController implements CameraController {
         else if (inputManager.isKeyDown('KeyO'))
             rotateAngles[2] += keyAngleChangeVel;
 
-        if (!vec3.exactEquals(rotateAngles, Vec3Zero)) {
+        if (!rightOrbiting && !vec3.exactEquals(rotateAngles, Vec3Zero)) {
             // Construct our rotation matrix from our angle changes.
             mat4.rotate(scratchMat4, Mat4Identity, rotateAngles[0], upAxis);
             mat4.rotate(scratchMat4, scratchMat4, rotateAngles[1], viewRight);
@@ -425,6 +569,7 @@ export class FPSCameraController implements CameraController {
         this.camera.isOrthographic = false;
         this.camera.worldMatrixUpdated();
 
+        this.isRightOrbiting = rightOrbiting;
         this.forceUpdate = false;
 
         return important ? CameraUpdateResult.ImportantChange : updated ? CameraUpdateResult.Changed : CameraUpdateResult.Unchanged;

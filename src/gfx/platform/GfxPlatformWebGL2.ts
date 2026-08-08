@@ -950,7 +950,7 @@ class GfxImplP_GL implements GfxSwapChain, GfxDevice {
         let gl_target: GLenum;
         const internalformat = this.translateTextureInternalFormat(descriptor.pixelFormat);
         this._setActiveTexture(gl.TEXTURE0);
-        this._currentTextures[0] = null;
+        this._currentTextures[0] = gl_texture;
         const numLevels = descriptor.numLevels;
         if (descriptor.dimension === GfxTextureDimension.n2D) {
             gl_target = WebGL2RenderingContext.TEXTURE_2D;
@@ -1440,7 +1440,7 @@ class GfxImplP_GL implements GfxSwapChain, GfxDevice {
         const isCube = gl_target === WebGL2RenderingContext.TEXTURE_CUBE_MAP;
 
         this._setActiveTexture(gl.TEXTURE0);
-        this._currentTextures[0] = null;
+        this._currentTextures[0] = gl_texture;
         gl.bindTexture(gl_target, gl_texture);
         let w = width, h = height, d = depth;
         const maxMipLevel = Math.min(firstMipLevel + levelDatas.length, numLevels);

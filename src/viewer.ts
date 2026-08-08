@@ -14,6 +14,8 @@ import { IS_DEVELOPMENT } from './BuildVersion.js';
 import { GlobalSaveManager } from './SaveManager.js';
 import { mat4 } from 'gl-matrix';
 import ArrayBufferSlice from './ArrayBufferSlice.js';
+import { ViewerDepthPicker } from './gfx/helpers/ViewerDepthPicker.js';
+import { setExternalTextureDepthTargetHook } from './gfx/render/GfxRenderGraph.js';
 
 export interface ViewerUpdateInfo {
     time: number;
@@ -28,6 +30,7 @@ export interface Texture {
 interface MouseLocation {
     mouseX: number;
     mouseY: number;
+    buttons: number;
 }
 
 export interface DebugConsole {
@@ -97,6 +100,7 @@ export class Viewer {
     public externalControl: boolean = false;
 
     public gfxDevice: GfxDevice;
+    private depthPicker: ViewerDepthPicker;
     public viewerRenderInput: ViewerRenderInput;
     public renderStatisticsTracker = new RenderStatisticsTracker();
 
@@ -114,6 +118,7 @@ export class Viewer {
 
         // GfxDevice.
         this.gfxDevice = this.gfxSwapChain.getDevice();
+        this.depthPicker = new ViewerDepthPicker(this.gfxDevice, this.canvas);
         this.viewerRenderInput = {
             camera: this.camera,
             time: this.sceneTime,
@@ -162,12 +167,15 @@ export class Viewer {
         this.gfxDevice.beginFrame();
 
         this.viewerRenderInput.onscreenTexture = this.gfxSwapChain.getOnscreenTexture();
+        this.depthPicker.prepare(this.gfxDevice, this.viewerRenderInput);
+        setExternalTextureDepthTargetHook(this.viewerRenderInput.onscreenTexture, this.depthPicker.pushPasses);
         this.renderStatisticsTracker.beginFrame();
 
         resetGfxStatisticsGroup(this.statisticsGroup);
         this.gfxDevice.setStatisticsGroup(this.statisticsGroup);
 
         this.renderViewport();
+        setExternalTextureDepthTargetHook(this.viewerRenderInput.onscreenTexture, null);
 
         this.gfxDevice.setStatisticsGroup(null);
         this.gfxDevice.endFrame();
@@ -280,6 +288,7 @@ export class Viewer {
     public setScene(scene: SceneGfx | null): void {
         this.scene = scene;
         this.cameraController = null;
+        this.camera.raycast = null;
     }
 
     public update(updateInfo: ViewerUpdateInfo): void {
