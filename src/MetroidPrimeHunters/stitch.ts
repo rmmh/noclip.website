@@ -86,6 +86,8 @@ export class StitchedSceneDesc implements Viewer.SceneDesc {
         while (true) {
             let addedIsland = false;
             for (const sourceRoom of roomsByEntityFilename.values()) {
+                if (sourceRoom.transform === null)
+                    continue;
                 for (const sourceTeleporter of sourceRoom.entityLayer.teleporters) {
                     const destinationRoom = roomsByEntityFilename.get(sourceTeleporter.destinationEntityFilename);
                     if (!destinationRoom || destinationRoom.transform) continue;
