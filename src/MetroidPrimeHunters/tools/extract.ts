@@ -186,7 +186,7 @@ function extract(rom: Buffer): [object, Map<string, Buffer>] {
     const armOffset = u32(rom, 0x20), arm = blz(rom.subarray(armOffset, armOffset + u32(rom, 0x2C)));
     const str = (pointer: number) => readCString(arm, pointer - RAM);
     const files = nitroFS(rom);
-    const output = new Map([...files].filter(([p]) => /^(archives|models|levels\/(textures|entities|nodedata))\//i.test(p))
+    const output = new Map([...files].filter(([p]) => /^(archives|effects|models|levels\/(textures|entities|nodedata))\//i.test(p))
         .map(([p, data]) => [p.toLowerCase(), data]));
     const textureNames = new Set([...output.keys()].filter((p) => p.startsWith('levels/textures/')).map((p) => path.basename(p)));
     const archiveTextures = Object.fromEntries([...output.keys()].filter((p) => p.startsWith('archives/'))

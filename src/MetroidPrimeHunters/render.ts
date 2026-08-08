@@ -226,7 +226,7 @@ class Node {
     private localMatrix = mat4.create();
     private bindMatrix = mat4.create();
 
-    constructor(public node: MPHNode, public index: number) {
+    constructor(public node: MPHNode, public index: number, private ignoreBindTransform: boolean) {
         this.billboardMode = node.billboardType;
         computeModelMatrixSRT(this.bindMatrix,
             node.scale[0], node.scale[1], node.scale[2],
@@ -237,6 +237,8 @@ class Node {
     public calcMatrix(baseModelMatrix: mat4, viewMatrix: mat4, nodeAnimator: MPHNodeAnimator | null, timeInMilliseconds: number, modifyNodeMatrix: MPHRendererOptions['modifyNodeMatrix']): void {
         if (nodeAnimator !== null)
             nodeAnimator.calcNodeMatrix(this.localMatrix, this.index);
+        else if (this.ignoreBindTransform)
+            mat4.identity(this.localMatrix);
         else
             mat4.copy(this.localMatrix, this.bindMatrix);
         modifyNodeMatrix?.(this.localMatrix, this.node.name, timeInMilliseconds);
@@ -499,7 +501,7 @@ export class MPHRenderer {
         }
 
         for (let i = 0; i < mphModel.nodes.length; i++) {
-            const node = new Node(mphModel.nodes[i], i);
+            const node = new Node(mphModel.nodes[i], i, options.forceBillboard !== undefined);
             if (options.forceBillboard === 'axial')
                 node.billboardMode = BillboardMode.PARTICLE_AXIAL;
             else if (options.forceBillboard === 'camera')
