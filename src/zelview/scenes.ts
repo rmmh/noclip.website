@@ -275,17 +275,6 @@ const sceneDescs = [
     new ZelviewSceneDesc('ganon_boss_scene', 'Second-To-Last Boss Ganondorf'),
     new ZelviewSceneDesc('ganon_demo_scene', 'Final Battle Against Ganon'),
     new ZelviewSceneDesc('ganon_final_scene', "Ganondorf's Death"),
-    
-    "Unused Scenes",
-    new ZelviewSceneDesc('test01_scene', 'Collision Testing Area'),
-    new ZelviewSceneDesc('besitu_scene', 'Besitu / Treasure Chest Warp'),
-    new ZelviewSceneDesc('depth_test_scene', 'Depth Test'),
-    new ZelviewSceneDesc('syotes_scene', 'Stalfos Middle Room'),
-    new ZelviewSceneDesc('syotes2_scene', 'Stalfos Boss Room'),
-    new ZelviewSceneDesc('sutaru_scene', 'Dark Link Testing Area'),
-    new ZelviewSceneDesc('hairal_niwa2_scene', 'Beta Castle Courtyard'),
-    new ZelviewSceneDesc('sasatest_scene', 'Action Testing Room'),
-    new ZelviewSceneDesc('testroom_scene', 'Item Testing Room'),
 ];
 
-export const sceneGroup: Viewer.SceneGroup = { id, name, sceneDescs };
+export const sceneGroup: Viewer.SceneGroup = { id, name, dataPath: pathBase, sceneDescs };
