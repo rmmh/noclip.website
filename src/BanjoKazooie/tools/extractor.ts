@@ -7,7 +7,7 @@ import * as BYML from "../../byml.js";
 
 function fetchDataSync(path: string): ArrayBufferSlice {
     const b: Buffer = readFileSync(path);
-    return new ArrayBufferSlice(b.buffer);
+    return ArrayBufferSlice.fromView(b);
 }
 
 const pathBaseIn  = `./data/BanjoKazooie_Raw`;
@@ -47,7 +47,7 @@ function decompress(buffer: ArrayBufferSlice): ArrayBufferSlice {
 
     let srcOffs = 0x06;
     const decompressed = inflateRawSync(buffer.createTypedArray(Uint8Array, srcOffs));
-    return new ArrayBufferSlice(decompressed.buffer);
+    return ArrayBufferSlice.fromView(decompressed);
 }
 
 // the second file table at 3ffe10 in RAM has a list of start and end addresses of compressed files
@@ -62,7 +62,7 @@ function decompressPairedFiles(buffer: ArrayBufferSlice, ram: number): RAMRegion
 
     // typescript types are wrong, when info = true, then it returns a buffer and an engine
     const { buffer: outBuffer, engine } = inflateRawSync(buffer.createTypedArray(Uint8Array, srcOffs), { info: true }) as unknown as { buffer: Buffer, engine: Zlib };
-    out.push({ data: new ArrayBufferSlice(outBuffer.buffer), start: ram });
+    out.push({ data: ArrayBufferSlice.fromView(outBuffer), start: ram });
 
     const startPoint = srcOffs + engine.bytesWritten;
     const dataFile = decompress(buffer.slice(startPoint));

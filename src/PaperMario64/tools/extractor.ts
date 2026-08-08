@@ -2,7 +2,7 @@
 import ArrayBufferSlice from "../../ArrayBufferSlice.js";
 import { readFileSync, writeFileSync } from "fs";
 import { assert, decodeString, readString } from "../../util.js";
-import * as Yay0 from "../../Common/compression/Yay0.js";
+import * as Yay0 from "../../Common/Compression/Yay0.js";
 import * as BYML from "../../byml.js";
 
 function fetchDataSync(path: string): ArrayBufferSlice {
@@ -11,7 +11,7 @@ function fetchDataSync(path: string): ArrayBufferSlice {
 }
 
 const pathBaseIn  = `./data/pm64_raw`;
-const pathBaseOut = `./data/pm64`;
+const pathBaseOut = `./data/PaperMario64`;
 
 interface AssetEntry {
     assetName: string;
