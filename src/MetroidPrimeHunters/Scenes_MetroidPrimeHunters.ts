@@ -468,4 +468,4 @@ const sceneDescs = [
     new SceneDesc("mp_fh_data/levels/models/testLevel_Model", "Test Room"),
 ];
 
-export const sceneGroup: Viewer.SceneGroup = { id, name, sceneDescs };
+export const sceneGroup: Viewer.SceneGroup = { id, name, dataPath: pathBase, sceneDescs };

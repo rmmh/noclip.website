@@ -46,6 +46,7 @@ export interface SceneDesc {
 export interface SceneGroup {
     id: string;
     name: string;
+    dataPath?: string;
     sceneDescs: (string | SceneDesc)[];
     sceneIdMap?: Map<string, string>;
     hidden?: boolean;

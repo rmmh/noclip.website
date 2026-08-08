@@ -144,7 +144,7 @@ import { GfxPlatform } from './gfx/platform/GfxPlatform.js';
 import { SaveState, SaveStateSerializer } from './SaveState.js';
 import ArrayBufferSlice from './ArrayBufferSlice.js';
 
-const sceneGroups: (string | SceneGroup)[] = [
+const allSceneGroups: (string | SceneGroup)[] = [
     "Development",
     Scenes_Example.sceneGroup,
     "Wii",
@@ -280,6 +280,32 @@ const sceneGroups: (string | SceneGroup)[] = [
     Scenes_TopGearRally.sceneGroup,
     Scenes_KingdomHeartsBBS.sceneGroup,
 ];
+
+const availableDataDirs = new Set(__AVAILABLE_DATA_DIRS);
+const normalizedDataDirs = new Set(__AVAILABLE_DATA_DIRS.map(normalizeDataName));
+const sceneGroups: (string | SceneGroup)[] = [];
+let pendingSceneGroupHeader: string | null = null;
+for (const entry of allSceneGroups) {
+    if (typeof entry === 'string') {
+        pendingSceneGroupHeader = entry;
+    } else if (hasSceneGroupData(entry)) {
+        if (pendingSceneGroupHeader !== null)
+            sceneGroups.push(pendingSceneGroupHeader);
+        sceneGroups.push(entry);
+        pendingSceneGroupHeader = null;
+    }
+}
+
+function normalizeDataName(name: string): string {
+    return name.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function hasSceneGroupData(group: SceneGroup): boolean {
+    if (group.dataPath !== undefined)
+        return availableDataDirs.has(group.dataPath);
+    return [group.id, group.name, group.altName]
+        .some((name) => name !== undefined && normalizedDataDirs.has(normalizeDataName(name)));
+}
 
 enum SaveStatesAction {
     Load,

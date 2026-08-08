@@ -648,6 +648,7 @@ export const sceneGroup: SceneGroup = {
     // The SceneGroup's ID is used to identify the scene by URL. Much like the SceneDesc ID,
     // keep this stable so that users can bookmark your scene!
     id: "NoclipExamples",
+    dataPath: pathBase,
     // The SceneGroup's name is shown in the UI, on the left side of the scene picker.
     name: "Examples",
 

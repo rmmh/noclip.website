@@ -1,7 +1,7 @@
 import { defineConfig, type RequestHandler } from '@rsbuild/core';
 import { pluginTypeCheck } from '@rsbuild/plugin-type-check';
 import { execSync } from 'node:child_process';
-import { readdir } from 'node:fs';
+import { readdir, readdirSync } from 'node:fs';
 import type { ServerResponse } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,14 @@ try {
 }
 
 const projectRoot = dirname(fileURLToPath(import.meta.url));
+let availableDataDirs: string[] = [];
+try {
+  availableDataDirs = readdirSync(join(projectRoot, 'data'), { withFileTypes: true })
+    .filter((entry) => (entry.isDirectory() || entry.isSymbolicLink()) && !entry.name.startsWith('.'))
+    .map((entry) => entry.name);
+} catch {
+  // A build without a data directory simply has no built-in scene groups.
+}
 
 // The URL path the site is served from. It only needs to be set for the dev
 // server; production builds emit document-relative URLs and can be dropped into
@@ -42,6 +50,7 @@ export default defineConfig({
     },
     define: {
       __COMMIT_HASH: JSON.stringify(gitCommit),
+      __AVAILABLE_DATA_DIRS: JSON.stringify(availableDataDirs),
     },
   },
   html: {
