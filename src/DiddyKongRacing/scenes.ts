@@ -17,7 +17,7 @@ import { DkrTextureCache } from './DkrTextureCache.js';
 import { trackParams } from './scenes_TrackParams.js';
 
 const pathBase = `DiddyKongRacing`;
-const dkrVersion = 'us_1.0';
+const dkrVersion = 'us_1.1';
 
 const bindingLayouts: GfxBindingLayoutDescriptor[] = [
     { numUniformBuffers: 2, numSamplers: 1, },

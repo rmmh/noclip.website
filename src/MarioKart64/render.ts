@@ -26,6 +26,13 @@ import { gfxDeviceNeedsFlipY } from '../gfx/helpers/GfxDeviceHelpers.js';
 const viewMtxScratch = mat4.create();
 const modelViewScratch = mat4.create();
 const texMtxScratch = mat4.create();
+const texRegionMtxScratch = mat4.create();
+
+function transformTextureRegion(m: mat4, left: number, top: number, width: number, height: number): void {
+    mat4.fromTranslation(texRegionMtxScratch, [left, top, 0]);
+    mat4.scale(texRegionMtxScratch, texRegionMtxScratch, [width, height, 1]);
+    mat4.multiply(m, texRegionMtxScratch, m);
+}
 
 export enum Mk64RenderLayer {
     Opa = 0,
@@ -259,9 +266,17 @@ class DrawCallInstance {
         offs += fillMatrix4x3(mappedF32, offs, modelViewScratch);
 
         this.computeTextureMatrix(texMtxScratch, 0);
-        if (this.textureMappings[0].lateBinding && gfxDeviceNeedsFlipY(device)) {
+        const framebufferFlipY = !!this.textureMappings[0].lateBinding && gfxDeviceNeedsFlipY(device);
+        if (framebufferFlipY) {
             texMtxScratch[5] *= -1;
             texMtxScratch[13] += 1;
+        }
+        if (this.drawCall.framebufferTile >= 0) {
+            const column = this.drawCall.framebufferTile & 1;
+            const row = this.drawCall.framebufferTile >>> 1;
+            const left = (88 + column * 64) / 320;
+            const top = (framebufferFlipY ? 136 - row * 32 : 72 + row * 32) / 240;
+            transformTextureRegion(texMtxScratch, left, top, 64 / 320, 32 / 240);
         }
         offs += fillMatrix4x2(mappedF32, offs, texMtxScratch);
 

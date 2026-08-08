@@ -434,6 +434,7 @@ export enum F3DEX_GBI {
     G_RDPLOADSYNC       = 0xE6,
     G_TEXRECTFLIP       = 0xE5,
     G_TEXRECT           = 0xE4,
+    G_NOOP              = 0xC0,
 }
 
 export function runDL_F3DEX(state: RSPStateInterface, addr: number): void {
@@ -555,6 +556,14 @@ export function runDL_F3DEX(state: RSPStateInterface, addr: number): void {
             state.gDPSetCombine(w0 & 0x00FFFFFF, w1);
         } break;
 
+        case F3DEX_GBI.G_SETPRIMCOLOR:
+            // This RSP interface does not expose primitive color. Games which use
+            // it dynamically can still parse and render the remainder of the list.
+            break;
+
+        case F3DEX_GBI.G_NOOP:
+            break;
+
         case F3DEX_GBI.G_SETTILESIZE: {
             const uls =  (w0 >>> 12) & 0x0FFF;
             const ult =  (w0 >>>  0) & 0x0FFF;
@@ -588,7 +597,7 @@ export function runDL_F3DEX(state: RSPStateInterface, addr: number): void {
             break;
 
         default:
-            console.error(`Unknown DL opcode: ${cmd.toString(16)}`);
+            console.error(`Unknown DL opcode: ${cmd.toString(16)} at ${hexzero(addr, 8)}+${hexzero(i, 8)}`);
         }
     }
 }

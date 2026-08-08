@@ -72,6 +72,7 @@ export class MkDrawCall extends F3DEX.DrawCall {
     public fogColor: Color = colorNewCopy(White);
 
     public light: Light1 = new Light1();
+    public framebufferTile = -1;
 }
 
 export class MkRSPOutput {

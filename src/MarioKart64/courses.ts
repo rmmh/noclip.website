@@ -1873,10 +1873,21 @@ export class Mk64Renderer implements Viewer.SceneGfx {
             F3DEX.runDL_F3DEX(rspState, courseInfo.courseOpa);
             const baseOutputOpa = rspState.finish();
 
-            //HACK! Late binding flag for courses with jumbotrons
+            // The game copies the previous framebuffer into six 64x32 texture
+            // tiles. Bind those tiles directly to the temporal framebuffer.
             if (baseOutputOpa && courseId === CourseId.LuigiRaceway) {
-                const drawCall = baseOutputOpa.drawCalls[149];
-                drawCall.textureIndices[0] |= 0x0F000000;
+                const framebufferTiles = [0x0500F800, 0x05010800, 0x05011800, 0x05012800, 0x05013800, 0x05014800];
+                for (const drawCall of baseOutputOpa.drawCalls) {
+                    const textureIndex = drawCall.textureIndices[0];
+                    if (textureIndex === undefined)
+                        continue;
+                    const texture = baseOutputOpa.textureCache.textures[textureIndex];
+                    const tile = framebufferTiles.indexOf(texture.dramAddr);
+                    if (tile >= 0) {
+                        drawCall.framebufferTile = tile;
+                        drawCall.textureIndices[0] |= 0x0F000000;
+                    }
+                }
             }
             else if (baseOutputOpa && courseId === CourseId.WarioStadium) {
                 const drawCall = baseOutputOpa.drawCalls[18];
