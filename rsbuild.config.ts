@@ -3,6 +3,8 @@ import { pluginTypeCheck } from '@rsbuild/plugin-type-check';
 import { execSync } from 'node:child_process';
 import { readdir } from 'node:fs';
 import type { ServerResponse } from 'node:http';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import parseUrl from 'parseurl';
 import send from 'send';
 
@@ -11,6 +13,20 @@ try {
   gitCommit = execSync('git rev-parse --short HEAD').toString().trim();
 } catch (e) {
   console.warn('Failed to fetch Git commit hash', e);
+}
+
+const projectRoot = dirname(fileURLToPath(import.meta.url));
+
+// The URL path the site is served from. It only needs to be set for the dev
+// server; production builds emit document-relative URLs and can be dropped into
+// any directory. Set e.g. `BASE_PATH=/noclip` to serve from a subdirectory.
+const basePath = normalizeBasePath(process.env.BASE_PATH ?? '/');
+
+// Normalizes to a leading slash and no trailing slash, e.g. `noclip/` -> `/noclip`.
+// The server root normalizes to `/`.
+function normalizeBasePath(base: string): string {
+  const trimmed = base.replace(/^\/*/, '').replace(/\/*$/, '');
+  return trimmed === '' ? '/' : `/${trimmed}`;
 }
 
 export default defineConfig({
@@ -33,11 +49,16 @@ export default defineConfig({
   },
   output: {
     target: 'web',
+    // Emit document-relative asset URLs, so that a build can be served from any
+    // directory without being rebuilt. Set `ASSET_PREFIX` to serve assets from a
+    // fixed location, such as a CDN.
+    assetPrefix: process.env.ASSET_PREFIX ?? 'auto',
     // Mark Node.js built-in modules as external.
     externals: ['fs', 'path', 'url'],
     // TODO: These should be converted to use `new URL('./file.wasm', import.meta.url)`
-    // so that the bundler can resolve them. In the meantime, they're expected to be
-    // at the root.
+    // so that the bundler can resolve them. In the meantime, the Emscripten modules
+    // look for them either next to the loading script or next to the document, so
+    // they're copied to both places. Both are relative to the deploy directory.
     copy: [
       { from: 'src/**/*.wasm', to: '[name][ext]' },
       { from: 'node_modules/librw/lib/librw.wasm', to: 'static/js/[name][ext]' },
@@ -61,6 +82,7 @@ export default defineConfig({
   },
   // Disable fallback to index for 404 responses.
   server: {
+    base: basePath,
     htmlFallback: false,
   },
   // Setup middleware to serve the `data` directory.
@@ -74,13 +96,23 @@ export default defineConfig({
   },
 });
 
+// Matches `/data/...`, optionally prefixed by the base path. This middleware runs
+// ahead of the one that strips the base path, so it has to accept both forms.
+const dataPathRE = new RegExp(
+  `^(?:${escapeRegExp(basePath === '/' ? '' : basePath)})?/data(/.*)?$`,
+);
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Serve files from the `data` directory.
 const serveData: RequestHandler = (req, res, next) => {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     next();
     return;
   }
-  const matches = parseUrl(req)?.pathname?.match(/^\/data(\/.*)?$/);
+  const matches = parseUrl(req)?.pathname?.match(dataPathRE);
   if (!matches) {
     next();
     return;
@@ -89,7 +121,7 @@ const serveData: RequestHandler = (req, res, next) => {
   // ETag generation, Cache-Control, Last-Modified, and more.
   const stream = send(req, matches[1] || '', {
     index: false,
-    root: 'data',
+    root: join(projectRoot, 'data'),
   });
   stream.on(
     'directory',

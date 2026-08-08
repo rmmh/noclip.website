@@ -422,7 +422,8 @@ class Main {
     }
 
     public async init() {
-        this.isEmbedMode = window.location.pathname === '/embed.html';
+        // The app is not necessarily served from the root of the site.
+        this.isEmbedMode = window.location.pathname.endsWith('/embed.html');
 
         this.toplevel = document.createElement('div');
         document.body.appendChild(this.toplevel);

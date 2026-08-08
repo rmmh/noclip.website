@@ -8,10 +8,25 @@ export interface NamedArrayBufferSlice extends ArrayBufferSlice {
     name: string;
 }
 
+// The URL that relative paths in the app resolve against. `document.baseURI`
+// accounts for the directory the app is served from, and for any `<base>` tag.
+function getDocumentBaseURL(): string {
+    if (typeof document !== 'undefined')
+        return document.baseURI;
+    // Workers have no document; their own URL is the next best thing.
+    return self.location.href;
+}
+
 function getDataStorageBaseURL(isDevelopment: boolean): string {
-    if (isDevelopment)
-        return `/data`;
-    return import.meta.env.PUBLIC_STORAGE_URL;
+    if (!isDevelopment) {
+        const storageURL = import.meta.env.PUBLIC_STORAGE_URL;
+        if (storageURL)
+            return storageURL;
+    }
+
+    // The `data` directory is served alongside the app, which is not necessarily
+    // at the root of the server.
+    return new URL(`data`, getDocumentBaseURL()).href;
 }
 
 function getDataURLForPath(url: string, isDevelopment: boolean): string {
