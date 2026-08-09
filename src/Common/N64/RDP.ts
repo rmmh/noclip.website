@@ -477,15 +477,20 @@ function textureMatch(a: TileState, b: TileState): boolean {
 
 export class TextureCache {
     public textures: Texture[] = [];
+    private namespaces: number[] = [];
 
-    public translateTileTexture(segmentBuffers: ArrayBufferSlice[], dramAddr: number, dramPalAddr: number, tile: TileState, deinterleave: boolean = false): number {
-        const existingIndex = this.textures.findIndex((t) => t.dramAddr === dramAddr && (tile.fmt !== ImageFormat.G_IM_FMT_CI || t.dramPalAddr === dramPalAddr) && textureMatch(t.tile, tile));
+    public translateTileTexture(segmentBuffers: ArrayBufferSlice[], dramAddr: number, dramPalAddr: number, tile: TileState,
+                                deinterleave: boolean = false, namespace: number = 0): number {
+        const existingIndex = this.textures.findIndex((t, i) => (this.namespaces[i] ?? 0) === namespace &&
+            t.dramAddr === dramAddr && (tile.fmt !== ImageFormat.G_IM_FMT_CI || t.dramPalAddr === dramPalAddr) &&
+            textureMatch(t.tile, tile));
         if (existingIndex >= 0) {
             return existingIndex;
         } else {
             const texture = translateTileTexture(segmentBuffers, dramAddr, dramPalAddr, tile, deinterleave);
             const index = this.textures.length;
             this.textures.push(texture);
+            this.namespaces.push(namespace);
             return index;
         }
     }

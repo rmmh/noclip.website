@@ -12,6 +12,8 @@ if (scene === null || !/^[^/]+\/[^/]+$/.test(scene))
     throw new Error('--scene must be a group/scene identifier, such as sm64/thi');
 const output = option('--output', `/tmp/${scene.replace('/', '-')}.png`);
 const saveState = option('--save-state', null);
+const shareData = option('--share-data', null);
+const evaluate = option('--evaluate', null);
 const waitMs = Number(option('--wait-ms', '12000'));
 if (!Number.isFinite(waitMs) || waitMs < 0)
     throw new Error('--wait-ms must be a non-negative number');
@@ -52,26 +54,45 @@ try {
     await send('Log.enable');
     await send('Page.enable');
     await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
-    const sceneHash = saveState === null ? scene : `${scene};${saveState}`;
+    const sceneState = saveState ?? (shareData === null ? null : `ShareData=${shareData}`);
+    const sceneHash = sceneState === null ? scene : `${scene};${sceneState}`;
     const sceneURL = `http://127.0.0.1:${serverPort}/?allow-swiftshader#${encodeURIComponent(sceneHash)}`;
     await send('Page.navigate', { url: sceneURL });
+    let loaded = null;
+    const loadDeadline = Date.now() + 30000;
+    while (Date.now() < loadDeadline) {
+        const pageState = await send('Runtime.evaluate', {
+            expression: `({ href: location.href, hash: decodeURIComponent(location.hash.slice(1)), title: document.title, body: document.body.innerText.slice(0, 500), hasMain: window.main !== undefined, hasCanvas: document.querySelector('canvas') !== null, hasScene: window.main?.viewer?.scene !== null && window.main?.viewer?.scene !== undefined })`,
+            returnByValue: true,
+        });
+        loaded = pageState.result.value ?? null;
+        if (loaded?.hasMain && loaded.hasCanvas && loaded.hasScene) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     await new Promise((resolve) => setTimeout(resolve, waitMs));
     if (cdp.errors.length !== 0)
         throw new Error(`browser exception:\n${cdp.errors.join('\n')}`);
     if (server.exitCode !== null)
         throw new Error(`development server exited with status ${server.exitCode}\n${serverOutput}`);
-    const pageState = await send('Runtime.evaluate', {
-        expression: `({ href: location.href, title: document.title, body: document.body.innerText.slice(0, 500), hasMain: window.main !== undefined, hasCanvas: document.querySelector('canvas') !== null })`,
-        returnByValue: true,
-    });
-    const loaded = pageState.result.value;
-    if (!loaded.hasMain || !loaded.hasCanvas || !loaded.href.includes(`#${scene}`))
+    if (loaded === null || loaded.hash.split(';')[0] !== scene || !loaded.hasMain || !loaded.hasCanvas || !loaded.hasScene)
         throw new Error(`Scene ${scene} did not load: ${JSON.stringify(loaded)}\n${serverOutput}`);
     if (focus !== null) {
         const eye = explicitEye ?? [focus[0] - 260, focus[1] + 180, focus[2] + 260];
         const camera = mat4.targetTo(mat4.create(), eye, [focus[0], focus[1] + 100, focus[2]], [0, 1, 0]);
         await send('Runtime.evaluate', { expression: `window.main.viewer.cameraController = null; window.main.viewer.camera.worldMatrix.set(${JSON.stringify([...camera])}); window.main.viewer.camera.worldMatrixUpdated()` });
         await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    if (evaluate !== null) {
+        const evaluated = await send('Runtime.evaluate', { expression: evaluate, returnByValue: true, awaitPromise: true });
+        if (evaluated.exceptionDetails !== undefined) {
+            const description = evaluated.exceptionDetails.exception?.description ?? evaluated.exceptionDetails.text;
+            throw new Error(`--evaluate failed: ${description}`);
+        }
+        console.log(JSON.stringify(evaluated.result.value));
+        await send('Runtime.evaluate', {
+            expression: `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`,
+            awaitPromise: true,
+        });
     }
     const screenshot = await send('Page.captureScreenshot', { format: 'png' });
     await writeFile(output, Buffer.from(screenshot.data, 'base64'));

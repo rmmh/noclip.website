@@ -12,6 +12,7 @@ import * as Scenes_DonkeyKong64 from './DonkeyKong64/scenes.js';
 import * as Scenes_PaperMario64 from './PaperMario64/scenes.js';
 import * as Scenes_Pilotwings64 from './Pilotwings64/Scenes.js';
 import * as Scenes_PokemonSnap from './PokemonSnap/scenes.js';
+import * as Scenes_PokemonStadium from './PokemonStadium/scenes.js';
 import * as Scenes_MetroidPrimeHunters from './MetroidPrimeHunters/Scenes_MetroidPrimeHunters.js';
 import * as Scenes_BanjoTooie from './BanjoTooie/scenes.js';
 import * as Scenes_BeetleAdventureRacing from './BeetleAdventureRacing/Scenes.js';
@@ -61,6 +62,7 @@ const allSceneGroups: (string | SceneGroup)[] = [
     Scenes_PaperMario64.sceneGroup,
     Scenes_Pilotwings64.sceneGroup,
     Scenes_PokemonSnap.sceneGroup,
+    Scenes_PokemonStadium.sceneGroup,
     Scenes_SuperMario64.sceneGroup,
     Scenes_Zelda_OcarinaOfTime.sceneGroup,
 ];

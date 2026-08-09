@@ -8,6 +8,7 @@ Major differences compared to upstream:
 
 * Nintendo 64
   * GoldenEye 007 (new)
+  * Pokémon Stadium (new)
   * Super Mario 64 (new)
   * Donkey Kong 64 (significantly expanded)
 * Nintendo DS
