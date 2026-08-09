@@ -58,8 +58,14 @@ export interface SceneGfx {
     serializeSaveState?(dst: ArrayBuffer, offs: number): number;
     deserializeSaveState?(src: ArrayBufferSlice): void;
     onstatechanged?: () => void;
+    setRegressionOptions?(options: SceneRegressionOptions): void;
     render(device: GfxDevice, renderInput: ViewerRenderInput): void;
     destroy(device: GfxDevice): void;
+}
+
+export interface SceneRegressionOptions {
+    disableFrustumCulling: boolean;
+    disablePortalCulling: boolean;
 }
 
 export type Listener = (viewer: Viewer) => void;

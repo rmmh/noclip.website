@@ -1,21 +1,20 @@
 #!/usr/bin/env node
 
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { mat4 } from 'gl-matrix';
-
-function option(name, fallback) {
-    const index = process.argv.indexOf(name);
-    return index >= 0 ? process.argv[index + 1] : fallback;
-}
+import { CDP, option, reservePort, waitForHTTP } from './lib/browser_harness.mjs';
 
 const scene = option('--scene', null);
 if (scene === null || !/^[^/]+\/[^/]+$/.test(scene))
     throw new Error('--scene must be a group/scene identifier, such as sm64/thi');
 const output = option('--output', `/tmp/${scene.replace('/', '-')}.png`);
+const saveState = option('--save-state', null);
+const waitMs = Number(option('--wait-ms', '12000'));
+if (!Number.isFinite(waitMs) || waitMs < 0)
+    throw new Error('--wait-ms must be a non-negative number');
 const chromePath = option('--chrome', process.env.CHROME ?? 'google-chrome');
 const focusArg = option('--focus', null);
 const focus = focusArg === null ? null : focusArg.split(',').map(Number);
@@ -27,64 +26,6 @@ if (explicitEye !== null && (explicitEye.length !== 3 || explicitEye.some((v) =>
     throw new Error('--eye must be x,y,z');
 if (explicitEye !== null && focus === null)
     throw new Error('--eye requires --focus');
-
-async function reservePort() {
-    const server = createServer();
-    await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', resolve);
-    });
-    const { port } = server.address();
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-    return port;
-}
-
-async function waitFor(url, timeout = 30000) {
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-        try {
-            const response = await fetch(url);
-            if (response.ok) return response;
-        } catch (_) {
-        }
-        await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    throw new Error(`timed out waiting for ${url}`);
-}
-
-class CDP {
-    constructor(url) {
-        this.socket = new WebSocket(url);
-        this.id = 0;
-        this.pending = new Map();
-        this.errors = [];
-    }
-
-    async open() {
-        await new Promise((resolve, reject) => {
-            this.socket.addEventListener('open', resolve, { once: true });
-            this.socket.addEventListener('error', reject, { once: true });
-        });
-        this.socket.addEventListener('message', ({ data }) => {
-            const message = JSON.parse(data);
-            if (message.id === undefined) {
-                if (message.method === 'Runtime.exceptionThrown')
-                    this.errors.push(message.params.exceptionDetails.exception?.description ?? message.params.exceptionDetails.text);
-                return;
-            }
-            const pending = this.pending.get(message.id);
-            this.pending.delete(message.id);
-            if (message.error) pending.reject(new Error(message.error.message));
-            else pending.resolve(message.result);
-        });
-    }
-
-    send(method, params = {}) {
-        const id = ++this.id;
-        this.socket.send(JSON.stringify({ id, method, params }));
-        return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
-    }
-}
 
 const serverPort = await reservePort();
 const debugPort = await reservePort();
@@ -100,26 +41,21 @@ const chrome = spawn(chromePath, [
 ], { stdio: 'ignore' });
 
 try {
-    await waitFor(`http://127.0.0.1:${serverPort}/`);
-    const version = await (await waitFor(`http://127.0.0.1:${debugPort}/json/version`)).json();
+    await waitForHTTP(`http://127.0.0.1:${serverPort}/`);
+    const version = await (await waitForHTTP(`http://127.0.0.1:${debugPort}/json/version`)).json();
     const cdp = new CDP(version.webSocketDebuggerUrl);
     await cdp.open();
     const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    const send = (method, params = {}) => cdp.send(method, { ...params, sessionId });
-    // Flattened sessions put sessionId on the protocol envelope, not in params.
-    cdp.send = function(method, params = {}) {
-        const id = ++this.id;
-        this.socket.send(JSON.stringify({ id, method, params: Object.fromEntries(Object.entries(params).filter(([key]) => key !== 'sessionId')), sessionId: params.sessionId }));
-        return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
-    };
+    const send = (method, params = {}) => cdp.send(method, params, sessionId);
     await send('Runtime.enable');
     await send('Log.enable');
     await send('Page.enable');
     await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
-    const sceneURL = `http://127.0.0.1:${serverPort}/?allow-swiftshader#${scene}`;
+    const sceneHash = saveState === null ? scene : `${scene};${saveState}`;
+    const sceneURL = `http://127.0.0.1:${serverPort}/?allow-swiftshader#${encodeURIComponent(sceneHash)}`;
     await send('Page.navigate', { url: sceneURL });
-    await new Promise((resolve) => setTimeout(resolve, 12000));
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
     if (cdp.errors.length !== 0)
         throw new Error(`browser exception:\n${cdp.errors.join('\n')}`);
     if (server.exitCode !== null)
@@ -129,7 +65,7 @@ try {
         returnByValue: true,
     });
     const loaded = pageState.result.value;
-    if (!loaded.hasMain || !loaded.hasCanvas || !loaded.href.startsWith(sceneURL))
+    if (!loaded.hasMain || !loaded.hasCanvas || !loaded.href.includes(`#${scene}`))
         throw new Error(`Scene ${scene} did not load: ${JSON.stringify(loaded)}\n${serverOutput}`);
     if (focus !== null) {
         const eye = explicitEye ?? [focus[0] - 260, focus[1] + 180, focus[2] + 260];

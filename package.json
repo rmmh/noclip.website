@@ -33,6 +33,7 @@
   "scripts": {
     "start": "wireit",
     "start:release": "wireit",
+    "regression:game": "node scripts/game_regression.mjs",
     "build": "wireit",
     "build:wasm-debug": "wireit",
     "build:wasm-release": "wireit",
@@ -40,6 +41,7 @@
     "build:ZeldaTwilightPrincess": "tsx src/ZeldaTwilightPrincess/tools/ztp_extractor.ts",
     "build:DonkeyKong64": "tsx src/DonkeyKong64/tools/extractor.ts",
     "build:SuperMario64": "tsx src/SuperMario64/tools/extractor.ts",
+    "build:GoldenEye007": "tsx src/GoldenEye007/tools/extractor.ts",
     "build:KatamariDamacy": "tsx src/KatamariDamacy/tools/extractor.ts",
     "build:FinalFantasyX": "tsx src/FinalFantasyX/tools/extractor.ts",
     "build:zelview": "tsx src/zelview/tools/extractor.ts",

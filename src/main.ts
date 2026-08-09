@@ -14,6 +14,7 @@ import * as Scenes_SuperMarioGalaxy1 from './SuperMarioGalaxy/Scenes_SuperMarioG
 import * as Scenes_SuperMarioGalaxy2 from './SuperMarioGalaxy/Scenes_SuperMarioGalaxy2.js';
 import * as Scenes_SuperMario64DS from './SuperMario64DS/scenes.js';
 import * as Scenes_SuperMario64 from './SuperMario64/scenes.js';
+import * as Scenes_GoldenEye007 from './GoldenEye007/scenes.js';
 import * as Scenes_Zelda_OcarinaOfTime from './zelview/scenes.js';
 import * as Scenes_Zelda_OcarinaOfTime_Beta from './zelview/scenes_beta.js';
 import * as Scenes_Zelda_OcarinaOfTime3D from './OcarinaOfTime3D/oot3d_scenes.js';
@@ -192,6 +193,7 @@ const allSceneGroups: (string | SceneGroup)[] = [
     Scenes_DiddyKongRacing.sceneGroup,
     Scenes_DonkeyKong64.sceneGroup,
     Scenes_Glover.sceneGroup,
+    Scenes_GoldenEye007.sceneGroup,
     Scenes_MarioKart64.sceneGroup,
     Scenes_PaperMario64.sceneGroup,
     Scenes_Pilotwings64.sceneGroup,

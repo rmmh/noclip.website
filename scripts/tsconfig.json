@@ -1,0 +1,22 @@
+// Typecheck-only config for the game regression harness. The root tsconfig includes
+// only ./src/, so the harness's browser entry point is otherwise never typechecked --
+// it is bundled by rsbuild, which does not check types. Without this, renaming a field
+// the harness reads fails at runtime as a per-scene error and every subsequent scene
+// burns its 120s timeout.
+//
+// Run: npx tsc --noEmit -p scripts/tsconfig.json
+{
+    "extends": "../tsconfig.json",
+    // rsbuild config pulls in vendored .d.ts files with pre-existing errors.
+    "compilerOptions": {
+        "paths": {
+            "noclip-rust-support": ["../rust/pkg"]
+        },
+        "skipLibCheck": true
+    },
+    "include": [
+        "./game_regression_browser.ts",
+        "../src/",
+        "../node_modules/@webgpu/types"
+    ]
+}
