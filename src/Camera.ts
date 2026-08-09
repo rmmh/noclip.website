@@ -377,7 +377,8 @@ export class FPSCameraController implements CameraController {
 
         if (this.pendingDoubleClickDirection !== null) {
             const clickDirection = this.pendingDoubleClickDirection;
-            let dollyDistance = Math.max(this.keyMoveSpeed * 0.5, 1);
+            const sceneMoveSpeed = this.keyMoveSpeed * this.sceneMoveSpeedMult;
+            let dollyDistance = sceneMoveSpeed * 5;
             const cameraOrigin = scratchVec3f;
             vec3.set(cameraOrigin, camera.worldMatrix[12], camera.worldMatrix[13], camera.worldMatrix[14]);
             const raycastHit = scratchVec3g;
@@ -392,7 +393,8 @@ export class FPSCameraController implements CameraController {
                         raycastHit[2] - camera.worldMatrix[14]);
                     const hitDistance = vec3.length(clickDirection);
                     vec3.normalize(clickDirection, clickDirection);
-                    dollyDistance = Math.max(0, hitDistance - Math.max(this.keyMoveSpeed * 0.25, 1));
+                    const stopDistance = sceneMoveSpeed * 0.25;
+                    dollyDistance = Math.max(0, hitDistance - stopDistance);
                 }
                 camera.worldMatrix[12] += clickDirection[0] * dollyDistance;
                 camera.worldMatrix[13] += clickDirection[1] * dollyDistance;

@@ -359,7 +359,7 @@ export async function initializeViewerWebGL2(canvas: HTMLCanvasElement): Promise
 
     // SwiftShader is slow, and gives a poor experience.
     const WEBGL_debug_renderer_info = gl.getExtension('WEBGL_debug_renderer_info');
-    if (WEBGL_debug_renderer_info && gl.getParameter(WEBGL_debug_renderer_info.UNMASKED_RENDERER_WEBGL).includes('SwiftShader'))
+    if (WEBGL_debug_renderer_info && gl.getParameter(WEBGL_debug_renderer_info.UNMASKED_RENDERER_WEBGL).includes('SwiftShader') && !location.search.includes('allow-swiftshader'))
         return { error: InitErrorCode.GARBAGE_WEBGL2_SWIFTSHADER };
 
     const config = new GfxPlatformWebGL2Config();

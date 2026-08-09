@@ -18,7 +18,6 @@ import { MkDrawCall, MkRSPOutput, MkRSPState, Light1 } from './f3dex.js';
 import { reverseDepthForDepthOffset } from '../gfx/helpers/ReversedDepthHelpers.js';
 import { Color, colorNewCopy, White } from '../Color.js';
 import { makeVertexBufferData } from '../Glover/render.js';
-import { IS_WIREFRAME } from './courses.js';
 import { GfxShaderLibrary } from '../gfx/helpers/GfxShaderLibrary.js';
 import { createBufferFromData } from '../gfx/helpers/BufferHelpers.js';
 import { gfxDeviceNeedsFlipY } from '../gfx/helpers/GfxDeviceHelpers.js';
@@ -27,6 +26,9 @@ const viewMtxScratch = mat4.create();
 const modelViewScratch = mat4.create();
 const texMtxScratch = mat4.create();
 const texRegionMtxScratch = mat4.create();
+
+export let IS_WIREFRAME = false;
+export function setWireframeEnabled(v: boolean): void { IS_WIREFRAME = v; }
 
 function transformTextureRegion(m: mat4, left: number, top: number, width: number, height: number): void {
     mat4.fromTranslation(texRegionMtxScratch, [left, top, 0]);
@@ -161,8 +163,8 @@ class DrawCallInstance {
     public textureEntry: RDP.Texture[] = [];
     public textureMappings = nArray(2, () => new TextureMapping());
 
-    public primColor: Color = colorNewCopy(White);
-    public envColor: Color = colorNewCopy(White);
+    public primColor: Color;
+    public envColor: Color;
 
     private fogEnabled = true;
     private vertexColorsEnabled = true;
@@ -176,8 +178,12 @@ class DrawCallInstance {
 
     private usesLighting = false;
     private usesFog = false;
+    public textureScrollS = 0;
+    public textureRotation = 0;
 
-    constructor(renderCache: GfxRenderCache, public drawCall: MkDrawCall, textureCache: RDP.TextureCache) {
+    constructor(renderCache: GfxRenderCache, public drawCall: MkDrawCall, textureCache: RDP.TextureCache, private textureGenAspectCorrection: boolean = false) {
+        this.primColor = colorNewCopy(drawCall.primColor);
+        this.envColor = colorNewCopy(drawCall.envColor);
         this.renderData = new RenderData(renderCache, drawCall, textureCache);
 
         for (let i = 0; i < this.textureMappings.length; i++) {
@@ -225,6 +231,9 @@ class DrawCallInstance {
         if (this.drawCall.SP_GeometryMode & RSP_Geometry.G_TEXTURE_GEN)
             program.defines.set('TEXTURE_GEN', '1');
 
+        if (this.textureGenAspectCorrection)
+            program.defines.set('TEXTURE_GEN_ASPECT_CORRECTION', '1');
+
         if (this.alphaVisualizerEnabled)
             program.defines.set('USE_ALPHA_VISUALIZER', '1');
 
@@ -233,7 +242,7 @@ class DrawCallInstance {
     }
 
     //TODO: Instancing
-    public prepareToRender(renderInstManager: GfxRenderInstManager, drawMatrix: ReadonlyMat4, isBillboard: boolean, isOrthographic: boolean): void {
+    public prepareToRender(renderInstManager: GfxRenderInstManager, drawMatrix: ReadonlyMat4, isBillboard: boolean, isOrthographic: boolean, time: number = 0): void {
         const device = renderInstManager.gfxRenderCache.device;
 
         if (this.gfxProgram === null)
@@ -266,6 +275,10 @@ class DrawCallInstance {
         offs += fillMatrix4x3(mappedF32, offs, modelViewScratch);
 
         this.computeTextureMatrix(texMtxScratch, 0);
+        if (this.textureScrollS !== 0)
+            texMtxScratch[12] += time * 30 / 1000 * this.textureScrollS;
+        if (this.textureRotation !== 0)
+            mat4.rotateZ(texMtxScratch, texMtxScratch, time * 30 / 1000 * this.textureRotation);
         const framebufferFlipY = !!this.textureMappings[0].lateBinding && gfxDeviceNeedsFlipY(device);
         if (framebufferFlipY) {
             texMtxScratch[5] *= -1;
@@ -379,7 +392,7 @@ export class BasicRspRenderer {
 
     public isOrthographic = false;
 
-    constructor(renderCache: GfxRenderCache, public rspOutput: MkRSPOutput | null, public isBillboard: boolean = false, public renderLayer: Mk64RenderLayer = 0) {
+    constructor(renderCache: GfxRenderCache, public rspOutput: MkRSPOutput | null, public isBillboard: boolean = false, public renderLayer: Mk64RenderLayer = 0, textureGenAspectCorrection: boolean = false) {
         if (rspOutput !== null) {
             for (const drawCall of rspOutput.drawCalls) {
 
@@ -387,7 +400,7 @@ export class BasicRspRenderer {
                     this.computeLookAt = true;
                 }
 
-                this.drawCallInstances.push(new DrawCallInstance(renderCache, drawCall, rspOutput.textureCache));
+                this.drawCallInstances.push(new DrawCallInstance(renderCache, drawCall, rspOutput.textureCache, textureGenAspectCorrection));
             }
         }
     }
@@ -417,10 +430,17 @@ export class BasicRspRenderer {
         }
 
         for (const drawcall of this.drawCallInstances) {
-            drawcall.prepareToRender(renderInstManager, modelMtx, this.isBillboard, this.isOrthographic);
+            drawcall.prepareToRender(renderInstManager, modelMtx, this.isBillboard, this.isOrthographic, viewerInput.time);
         }
 
         renderInstManager.popTemplate();
+    }
+
+    public setTextureAnimation(scrollS: number, rotation: number): void {
+        for (const drawCall of this.drawCallInstances) {
+            drawCall.textureScrollS = scrollS;
+            drawCall.textureRotation = rotation;
+        }
     }
 
     public setTileSize(uls: number, ult: number, tile: number = 0) {

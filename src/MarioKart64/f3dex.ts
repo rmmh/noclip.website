@@ -9,10 +9,10 @@ import { Color, colorFromRGBA8, colorNewCopy, White } from '../Color.js';
 import { G_TX_CLAMP, G_TX_LOADTILE, G_TX_MIRROR, G_TX_NOLOD, G_TX_NOMASK, G_TX_NOMIRROR, G_TX_RENDERTILE, G_TX_WRAP } from '../Glover/render.js';
 import { RENDER_MODES } from '../Common/N64/RDP.js';
 import { vec3 } from 'gl-matrix';
-import { BinAngleToRad } from './utils.js';
 
 const G_TX_DXT_FRAC = 11;
 const G_TEXTURE_IMAGE_FRAC = 2;
+const BinAngleToRad = Math.PI / 0x8000;
 
 export class Light1 {
     public diffuseColor: vec3 = vec3.create();
@@ -70,6 +70,8 @@ export class MkDrawCall extends F3DEX.DrawCall {
     public fogNear: number = 0;
     public fogFar: number = 0;
     public fogColor: Color = colorNewCopy(White);
+    public primColor: Color = colorNewCopy(White);
+    public envColor: Color = colorNewCopy(White);
 
     public light: Light1 = new Light1();
     public framebufferTile = -1;
@@ -93,8 +95,8 @@ export class MkRSPState implements F3DEX.RSPStateInterface {
     private SP_TextureState = new TextureState();
     protected SP_MatrixStackDepth = 0;
 
-    //private DP_PrimColor: Color = colorNewCopy(White);
-    //private DP_EnvColor: Color = colorNewCopy(White);
+    private DP_PrimColor: Color = colorNewCopy(White);
+    private DP_EnvColor: Color = colorNewCopy(White);
     private DP_FogColor: Color = colorNewCopy(White);
     private fogNear: number = 0;
     private fogFar: number = 0;
@@ -107,7 +109,7 @@ export class MkRSPState implements F3DEX.RSPStateInterface {
     public DP_TileState = nArray(8, () => new RDP.TileState());
     private DP_TMemTracker = new Map<number, number>();
 
-    constructor(public segmentBuffers: ArrayBufferSlice[]) {
+    constructor(public segmentBuffers: ArrayBufferSlice[], private enableTextureLOD: boolean = false) {
     }
 
     public initStateMk64(): void {
@@ -204,7 +206,9 @@ export class MkRSPState implements F3DEX.RSPStateInterface {
 
         const lod_en = !!((this.DP_OtherModeH >>> 16) & 0x01);
         if (lod_en) {
-            assert(false);
+            assert(this.enableTextureLOD);
+            dc.textureIndices.push(this._translateTileTexture(this.SP_TextureState.tile));
+            dc.textureIndices.push(this._translateTileTexture(this.SP_TextureState.tile + 1));
         } else {
             // We're in TILE mode. Now check if we're in two-cycle mode.
             const cycletype = RDP.getCycleTypeFromOtherModeH(this.DP_OtherModeH);
@@ -230,6 +234,8 @@ export class MkRSPState implements F3DEX.RSPStateInterface {
         dc.fogNear = this.fogNear;
         dc.fogFar = this.fogFar;
         dc.fogColor = colorNewCopy(this.DP_FogColor);
+        dc.primColor = colorNewCopy(this.DP_PrimColor);
+        dc.envColor = colorNewCopy(this.DP_EnvColor);
         dc.light.copy(this.SP_Light);
         return dc;
     }
@@ -263,6 +269,16 @@ export class MkRSPState implements F3DEX.RSPStateInterface {
 
     public gDPSetFogColor(rgba8: number): void {
         colorFromRGBA8(this.DP_FogColor, rgba8);
+        this.stateChanged = true;
+    }
+
+    public gDPSetPrimColor(rgba8: number): void {
+        colorFromRGBA8(this.DP_PrimColor, rgba8);
+        this.stateChanged = true;
+    }
+
+    public gDPSetEnvColor(rgba8: number): void {
+        colorFromRGBA8(this.DP_EnvColor, rgba8);
         this.stateChanged = true;
     }
 

@@ -148,6 +148,11 @@ void main() {
         v_TexCoord.xy = (t_Normal.xy + vec2(1.0))/2.0;
 #   endif
 
+#ifdef TEXTURE_GEN_ASPECT_CORRECTION
+    mat4x2 t_TextureGenMatrix = UnpackMatrix(u_TexMatrix[0]);
+    v_TexCoord.y *= abs(t_TextureGenMatrix[1].y / t_TextureGenMatrix[0].x);
+#endif
+
     v_TexCoord.zw = v_TexCoord.xy;
 #endif
 

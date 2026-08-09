@@ -29,11 +29,10 @@ import { Actor, ActorBowsersCastleBush, ActorCactus1, ActorCactus2, ActorCactus3
 import { CollisionGrid, ObjectCollision } from './collision.js';
 import { dBooPaths, dCourseCpuMaxSeparation, dCourseData, dCrabSpawns, dDkJungleTorchSpawns, dDustAngleOffsets, dDustPosOffsets, dFireBreathsSpawns, dFlagPoleSpawns, dFlamePillarSpawnsA, dFlamePillarSpawnsB, dFlamePillarSpawnsC, dHedgehogPatrolPoints, dHedgehogSpawns, dMapSkyColors, dMoleSpawns, dPenguinPath, dSnowmanSpawns, dStaticNeonSpawns, dThwompLights, dThwompSpawns150CC, Mk64ActorSpawnData, Mk64Anim, Mk64AnimTrack, Mk64Cloud, Mk64Point, seagullPathList, ThwompType } from './course_data.js';
 import { Light1, MkRSPState } from './f3dex.js';
-import { BasicRspRenderer, Mk64RenderLayer, Mk64SkyRenderer } from './render.js';
+import { BasicRspRenderer, IS_WIREFRAME, Mk64RenderLayer, Mk64SkyRenderer, setWireframeEnabled } from './render.js';
 import { CourseId } from './scenes.js';
 import { BinAngleToRad, calcModelMatrix, calcPitch, calcTargetAngleY, crossedTime, hashFromValues, IsTargetInRangeXYZ, IsTargetInRangeXZ, kmToSpeed, lerpBinAngle, normalizeAngle, RadToBinAngle, random_int, random_u16, readActorSpawnData, readPathData, rotatePositionAroundPivot, rotateVectorXY, setShadowSurfaceAngle, stepTowardsAngle } from './utils.js';
 
-export let IS_WIREFRAME: boolean = false;
 export let DELTA_TIME: number = 1.0;
 let SCENE_TIME: number = 1.0;
 
@@ -2170,7 +2169,7 @@ export class Mk64Renderer implements Viewer.SceneGfx {
 
         const enableWireframe = new UI.Checkbox('Enable wireframe', IS_WIREFRAME);
         enableWireframe.onchanged = () => {
-            IS_WIREFRAME = enableWireframe.checked;
+            setWireframeEnabled(enableWireframe.checked);
         };
         renderHacksPanel.contents.appendChild(enableWireframe.elem);
 

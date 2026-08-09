@@ -13,6 +13,7 @@ import * as Scenes_Pikmin2 from './j3d/pik2_scenes.js';
 import * as Scenes_SuperMarioGalaxy1 from './SuperMarioGalaxy/Scenes_SuperMarioGalaxy1.js';
 import * as Scenes_SuperMarioGalaxy2 from './SuperMarioGalaxy/Scenes_SuperMarioGalaxy2.js';
 import * as Scenes_SuperMario64DS from './SuperMario64DS/scenes.js';
+import * as Scenes_SuperMario64 from './SuperMario64/scenes.js';
 import * as Scenes_Zelda_OcarinaOfTime from './zelview/scenes.js';
 import * as Scenes_Zelda_OcarinaOfTime_Beta from './zelview/scenes_beta.js';
 import * as Scenes_Zelda_OcarinaOfTime3D from './OcarinaOfTime3D/oot3d_scenes.js';
@@ -195,6 +196,7 @@ const allSceneGroups: (string | SceneGroup)[] = [
     Scenes_PaperMario64.sceneGroup,
     Scenes_Pilotwings64.sceneGroup,
     Scenes_PokemonSnap.sceneGroup,
+    Scenes_SuperMario64.sceneGroup,
     Scenes_Zelda_OcarinaOfTime.sceneGroup,
     "PlayStation 2",
     Scenes_DragonQuest8.sceneGroup,
