@@ -27,10 +27,12 @@ const pathBase = 'SuperMario64';
 
 interface ObjectInfo { model: number; position: number[]; rotation: number[]; behavior?: number; behaviorParameter?: number; billboard?: boolean; billboardDepthOffset?: number; scale?: number; scaleXYZ?: number[]; graphYOffset?: number; motionPath?: number[][]; motionSpeed?: number; motionPathFrameStep?: number; spawnPeriod?: number; nearSpawnPeriod?: number; spawnDistanceMin?: number; spawnDistanceMax?: number; spawnOdds?: number; spawnRequiresMarioBelow?: boolean; motionRollRate?: number; wigglerBodyIndex?: number; pokeyPartIndex?: number; chainPartIndex?: number; activationCenter?: number[]; activeFromAfar?: boolean; birdParent?: number[]; behaviorTarget?: number[]; spawnedByTriplet?: boolean; spawnedByScuttlebugSpawner?: boolean; randomSeedOffset?: number; }
 interface MarioStart { area: number; yaw: number; position: number[]; }
-interface DisplayListInfo { address: number; layer: number; }
+interface DisplayListInfo { address: number; layer: number; area?: number; }
 interface MovtexInfo { kind: 'water' | 'sand' | 'lava'; vertices: number[][]; indices: number[]; alpha: number; scrollS?: number; rotation?: number; textureAddress: number; materialAddress?: number; lighting?: boolean; }
-interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex?: MovtexInfo[]; modelGeos?: Record<number, number>; modelDLs?: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; }
-interface LevelArchive { Segments: { ID: number; Data: ArrayBufferSlice }[]; Collision?: ArrayBufferSlice; }
+interface EnvironmentRegion { type: number; loX: number; loZ: number; hiX: number; hiZ: number; height: number; }
+interface PaintingInfo { displayList: number; position: number[]; pitch: number; yaw: number; size: number; alpha: number; textureType: number; }
+interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex?: MovtexInfo[]; paintings?: PaintingInfo[]; modelGeos?: Record<number, number>; modelDLs?: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; }
+interface LevelArchive { Segments: { ID: number; Data: ArrayBufferSlice }[]; Collision?: ArrayBufferSlice; EnvironmentRegions?: EnvironmentRegion[]; }
 
 interface CollisionFloor {
     ax: number; ay: number; az: number;
@@ -94,6 +96,13 @@ function findCollisionFloor(floors: CollisionFloorIndex, x: number, y: number, z
         if (height <= y + 100 && height > bestHeight) { bestHeight = height; bestNormalY = floor.normalY; }
     }
     return bestHeight === -Infinity ? null : { height: bestHeight, normalY: bestNormalY };
+}
+
+function findWaterLevel(regions: EnvironmentRegion[], x: number, z: number): number | null {
+    for (const region of regions)
+        if (region.type < 50 && region.loX < x && x < region.hiX && region.loZ < z && z < region.hiZ)
+            return region.height;
+    return null;
 }
 
 function makeInitialCameraMatrix(levelId: string, start: MarioStart | undefined, cameraMode: number | undefined): mat4 {
@@ -456,7 +465,7 @@ function updateRandomBlink(state: IdleBehaviorState): void {
     }
 }
 
-function stepIdleBehavior(state: IdleBehaviorState, mario: vec3, collisionFloors: CollisionFloorIndex): void {
+function stepIdleBehavior(state: IdleBehaviorState, mario: vec3, collisionFloors: CollisionFloorIndex, environmentRegions: EnvironmentRegion[]): void {
     const dxMario = mario[0] - state.position[0], dyMario = mario[1] - state.position[1], dzMario = mario[2] - state.position[2];
     const marioDistance = Math.hypot(dxMario, dyMario, dzMario);
     if (state.kind === 'goomba') {
@@ -1365,12 +1374,18 @@ function stepIdleBehavior(state: IdleBehaviorState, mario: vec3, collisionFloors
         state.yaw = (phase + 0x4000) & 0xFFFF;
         state.timer++;
     } else if (state.kind === 'fish') {
-        const activationDistance = vec3.distance(mario, state.activationCenter);
         state.visible = true;
         if (state.visible) {
             if (state.timer === 0) {
                 state.forwardVel = 3 + 2 * randomFloat(state);
-                state.walkTimer = Math.floor((state.activeFromAfar || activationDistance >= 1500 ? 700 : 100) * randomFloat(state));
+                state.walkTimer = Math.floor((state.activeFromAfar ? 700 : 100) * randomFloat(state));
+                state.targetHeightOffset = 300 * randomFloat(state);
+            }
+            const waterLevel = state.activeFromAfar ? 0 : findWaterLevel(environmentRegions, state.position[0], state.position[2]);
+            if (!state.activeFromAfar && environmentRegions.length > 0 && waterLevel === null) {
+                // bhv_fish_loop deletes non-SA fish which leave all water boxes.
+                state.visible = false;
+                return;
             }
             const dx = mario[0] - state.position[0], dz = mario[2] - state.position[2];
             state.targetYaw = Math.atan2(dx, dz) * 0x8000 / Math.PI & 0xFFFF;
@@ -1378,13 +1393,21 @@ function stepIdleBehavior(state: IdleBehaviorState, mario: vec3, collisionFloors
             state.position[0] += Math.sin(binang(state.yaw)) * state.forwardVel;
             state.position[2] += Math.cos(binang(state.yaw)) * state.forwardVel;
             const targetY = mario[1] + state.walkTimer;
-            state.position[1] += Math.max(-4, Math.min(4, targetY - state.position[1]));
+            if (state.activeFromAfar) {
+                const speed = Math.abs(state.position[1] - targetY) > 500 ? 10 : Math.abs(state.position[1] - mario[1]) < 500 ? 2 : 4;
+                state.position[1] += Math.max(-speed, Math.min(speed, targetY - state.position[1]));
+            } else if (waterLevel !== null && state.position[1] >= waterLevel - 50) {
+                state.position[1] = waterLevel - 50 - (state.position[1] - mario[1] > 300 ? 1 : 0);
+            } else if (state.activationCenter[1] - 100 - state.targetHeightOffset < state.position[1]
+                    && state.position[1] < state.activationCenter[1] + 1000 + state.targetHeightOffset) {
+                const speed = Math.abs(state.position[1] - mario[1]) < 500 ? 2 : 4;
+                state.position[1] += Math.max(-speed, Math.min(speed, targetY - state.position[1]));
+            }
             state.animationIndex = 0;
             state.animationSpeed = state.timer < 10 ? 2 : 1;
             state.timer++;
         }
     } else if (state.kind === 'tankFish') {
-        // The room gate is omitted so the aquarium schools remain visible.
         state.visible = true;
         if (state.visible) {
             if (state.action === 0) {
@@ -1397,20 +1420,20 @@ function stepIdleBehavior(state: IdleBehaviorState, mario: vec3, collisionFloors
                 state.animationSpeed = 1;
                 if (state.timer < state.walkTimer / 2) state.facePitch += state.verticalVel;
                 else state.facePitch -= state.verticalVel;
-                if (++state.timer >= state.walkTimer) { state.action = 1; state.timer = 0; }
+                if (state.timer++ >= state.walkTimer) { state.action = 1; state.timer = 0; }
             } else if (state.action === 1) {
                 state.animationSpeed = 2;
                 state.yaw = (state.yaw + state.targetYaw) & 0xFFFF;
-                if (++state.timer >= 15) { state.action = 2; state.timer = 0; }
+                if (state.timer++ >= 15) { state.action = 2; state.timer = 0; }
             } else if (state.action === 2) {
                 state.animationSpeed = 1;
                 if (state.timer < state.walkTimer / 2) state.facePitch -= state.verticalVel;
                 else state.facePitch += state.verticalVel;
-                if (++state.timer >= state.walkTimer) { state.action = 3; state.timer = 0; }
+                if (state.timer++ >= state.walkTimer) { state.action = 3; state.timer = 0; }
             } else {
                 state.animationSpeed = 2;
                 state.yaw = (state.yaw + state.targetYaw) & 0xFFFF;
-                if (++state.timer >= 15) { state.action = 0; state.timer = 0; }
+                if (state.timer++ >= 15) { state.action = 0; state.timer = 0; }
             }
             const pitch = binang(state.facePitch);
             state.position[0] += Math.cos(pitch) * Math.sin(binang(state.yaw)) * state.forwardVel;
@@ -1808,11 +1831,13 @@ class SM64Renderer implements Viewer.SceneGfx {
     private modelMatrix = mat4.create();
     private skybox: SkyboxRenderer | null = null;
     private collisionFloors: CollisionFloorIndex;
+    private environmentRegions: EnvironmentRegion[];
     private behaviorsInitialized = false;
 
-    constructor(device: GfxDevice, segmentBuffers: ArrayBufferSlice[], displayLists: DisplayListInfo[], objects: ObjectInfo[], movtex: MovtexInfo[], modelGeos: Record<number, number>, extractedModelDLs: Record<number, number>, collisionData: ArrayBufferSlice | undefined, private initialCameraMatrix: mat4) {
+    constructor(device: GfxDevice, segmentBuffers: ArrayBufferSlice[], displayLists: DisplayListInfo[], objects: ObjectInfo[], movtex: MovtexInfo[], paintings: PaintingInfo[], modelGeos: Record<number, number>, extractedModelDLs: Record<number, number>, collisionData: ArrayBufferSlice | undefined, environmentRegions: EnvironmentRegion[], private initialCameraMatrix: mat4) {
         this.renderHelper = new GfxRenderHelper(device);
         this.collisionFloors = parseCollisionFloors(collisionData);
+        this.environmentRegions = environmentRegions;
         if (segmentBuffers[0x0A] !== undefined)
             this.skybox = createSkyboxRenderer(device, this.renderHelper.renderCache, segmentBuffers[0x0A]);
         const state = new MkRSPState(segmentBuffers, true);
@@ -1827,8 +1852,29 @@ class SM64Renderer implements Viewer.SceneGfx {
             const output = state.finish();
             if (output !== null) {
                 const model = new BasicRspRenderer(this.renderHelper.renderCache, output, false, 0);
-                this.models.push(model);
+                if (dl.area === 2 || dl.area === 3) {
+                    const matrix = mat4.fromTranslation(mat4.create(), [0, dl.area === 2 ? 2000 : -2000, 0]);
+                    this.objectModels.push({ models: [model], matrix, animated: false });
+                } else {
+                    this.models.push(model);
+                }
             }
+        }
+        // display_painting_not_rippling applies this exact model-view transform
+        // before calling the Painting record's normal display list.
+        for (const painting of paintings) {
+            state.gSPTexture(false, 0, 0, 0, 0);
+            setGeoLayerRenderMode(state, painting.alpha === 0xFF ? 1 : 5);
+            runDisplayList(state, painting.displayList);
+            const output = state.finish();
+            if (output === null) continue;
+            const matrix = mat4.create();
+            mat4.translate(matrix, matrix, painting.position as [number, number, number]);
+            mat4.rotateX(matrix, matrix, painting.pitch * Math.PI / 180);
+            mat4.rotateY(matrix, matrix, painting.yaw * Math.PI / 180);
+            const scale = painting.size / 614;
+            mat4.scale(matrix, matrix, [scale, scale, scale]);
+            this.objectModels.push({ models: [new BasicRspRenderer(this.renderHelper.renderCache, output, false, painting.alpha === 0xFF ? 0 : 1)], matrix, animated: false });
         }
         // GEO_ASM generates these meshes every frame in SM64. The extractor records
         // the ROM descriptors; a temporary vertex segment lets the normal F3D path
@@ -2190,7 +2236,7 @@ class SM64Renderer implements Viewer.SceneGfx {
                 // Step every state once at this frame before advancing again.
                 for (const state of uniqueStates) {
                     if (state.lastFrame < frame) {
-                        stepIdleBehavior(state, marioPosition, this.collisionFloors);
+                        stepIdleBehavior(state, marioPosition, this.collisionFloors, this.environmentRegions);
                         state.lastFrame = frame;
                     }
                 }
@@ -2320,7 +2366,7 @@ class SceneDesc implements Viewer.SceneDesc {
         const segmentBuffers: ArrayBufferSlice[] = [];
         for (const segment of archive.Segments)
             segmentBuffers[segment.ID] = segment.Data;
-        return new SM64Renderer(device, segmentBuffers, info.displayLists, info.objects ?? [], info.movtex ?? [], info.modelGeos ?? {}, info.modelDLs ?? {}, archive.Collision, makeInitialCameraMatrix(info.id, info.marioStart, info.cameraMode));
+        return new SM64Renderer(device, segmentBuffers, info.displayLists, info.objects ?? [], info.movtex ?? [], info.paintings ?? [], info.modelGeos ?? {}, info.modelDLs ?? {}, archive.Collision, archive.EnvironmentRegions ?? [], makeInitialCameraMatrix(info.id, info.marioStart, info.cameraMode));
     }
 }
 

@@ -25,10 +25,12 @@ const scriptsSegmentRomEnd = scriptsSegmentRomStart + scriptsSegmentSize;
 
 interface ObjectInfo { model: number; position: number[]; rotation: number[]; behavior?: number; behaviorParameter?: number; billboard?: boolean; billboardDepthOffset?: number; scale?: number; scaleXYZ?: number[]; graphYOffset?: number; motionPath?: number[][]; motionSpeed?: number; motionPathFrameStep?: number; spawnPeriod?: number; nearSpawnPeriod?: number; spawnDistanceMin?: number; spawnDistanceMax?: number; spawnOdds?: number; spawnRequiresMarioBelow?: boolean; motionRollRate?: number; trajectoryAddress?: number; activationCenter?: number[]; activeFromAfar?: boolean; birdParent?: number[]; behaviorTarget?: number[]; spawnedByTriplet?: boolean; spawnedByScuttlebugSpawner?: boolean; randomSeedOffset?: number; pokeyPartIndex?: number; chainPartIndex?: number; }
 interface MarioStart { area: number; yaw: number; position: number[]; }
-interface DisplayListInfo { address: number; layer: number; }
+interface DisplayListInfo { address: number; layer: number; area?: number; }
 interface MovtexInfo { kind: 'water' | 'sand' | 'lava'; vertices: number[][]; indices: number[]; alpha: number; scrollS?: number; rotation?: number; textureAddress: number; materialAddress?: number; lighting?: boolean; }
-interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex: MovtexInfo[]; modelGeos: Record<number, number>; modelDLs: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; }
-interface LevelArchive { Segments: { ID: number; Data: ArrayBufferSlice }[]; Collision: ArrayBufferSlice; }
+interface EnvironmentRegion { type: number; loX: number; loZ: number; hiX: number; hiZ: number; height: number; }
+interface PaintingInfo { displayList: number; position: number[]; pitch: number; yaw: number; size: number; alpha: number; textureType: number; }
+interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex: MovtexInfo[]; paintings?: PaintingInfo[]; modelGeos: Record<number, number>; modelDLs: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; }
+interface LevelArchive { Segments: { ID: number; Data: ArrayBufferSlice }[]; Collision: ArrayBufferSlice; EnvironmentRegions: EnvironmentRegion[]; }
 
 function collectCollisionTriangles(buffer: Buffer, start: number): Buffer {
     const forceSurfaces = new Set([0x04, 0x0E, 0x24, 0x25, 0x27, 0x2C, 0x2D]);
@@ -53,7 +55,9 @@ function collectCollisionTriangles(buffer: Buffer, start: number): Buffer {
                 const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
                 const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
                 const normalY = uz * vx - ux * vz;
-                if (normalY > 0) triangles.push([...a, ...b, ...c]);
+                if (normalY > 0) {
+                    triangles.push([...a, ...b, ...c]);
+                }
             }
         } else if (command === 0x41) {
             continue;
@@ -261,6 +265,63 @@ function collectWaterBoxes(segment7: Buffer, collisionOffset: number, collisionE
         break;
     }
     return result;
+}
+
+function collectEnvironmentRegions(segment7: Buffer, collisionOffset: number, collisionEnd: number): EnvironmentRegion[] {
+    const result: EnvironmentRegion[] = [];
+    for (let p = collisionOffset; p + 6 <= collisionEnd; p += 2) {
+        if (segment7.readUInt16BE(p) !== 0x0044) continue;
+        const count = segment7.readUInt16BE(p + 2);
+        const sectionEnd = p + 4 + count * 12;
+        if (count === 0 || count > 64 || sectionEnd + 2 > collisionEnd || segment7.readUInt16BE(sectionEnd) !== 0x0042)
+            continue;
+        for (let i = 0; i < count; i++) {
+            const q = p + 4 + i * 12;
+            result.push({
+                type: segment7.readInt16BE(q),
+                loX: segment7.readInt16BE(q + 2), loZ: segment7.readInt16BE(q + 4),
+                hiX: segment7.readInt16BE(q + 6), hiZ: segment7.readInt16BE(q + 8),
+                height: segment7.readInt16BE(q + 10),
+            });
+        }
+        break;
+    }
+    return result;
+}
+
+function collectCastlePaintings(segment7: Buffer): PaintingInfo[] {
+    // The N64 Painting structure is 0x78 bytes. Locate the complete table by
+    // validating its fourteen consecutive IDs, texture types, and segmented
+    // normal-display-list pointers instead of relying on a ROM file offset.
+    const structSize = 0x78;
+    // HMC occupies group slot 6 but uses painting ID 14 for its floor-warp
+    // surface. This is the exact ordering of sInsideCastlePaintings.
+    const paintingIDs = [0, 1, 2, 3, 4, 5, 14, 7, 8, 9, 10, 11, 12, 13];
+    const count = paintingIDs.length;
+    for (let start = 0; start + structSize * count <= segment7.length; start += 4) {
+        let valid = true;
+        for (let i = 0; i < count; i++) {
+            const p = start + i * structSize;
+            const textureType = segment7[p + 3], displayList = segment7.readUInt32BE(p + 0x58);
+            if (segment7.readUInt16BE(p) !== paintingIDs[i] || textureType > 1 || displayList >>> 24 !== 0x07) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) continue;
+        const result: PaintingInfo[] = [];
+        for (let i = 0; i < count; i++) {
+            const p = start + i * structSize;
+            result.push({
+                displayList: segment7.readUInt32BE(p + 0x58),
+                pitch: segment7.readFloatBE(p + 0x08), yaw: segment7.readFloatBE(p + 0x0C),
+                position: [segment7.readFloatBE(p + 0x10), segment7.readFloatBE(p + 0x14), segment7.readFloatBE(p + 0x18)],
+                textureType: segment7[p + 3], alpha: segment7[p + 0x6D], size: segment7.readFloatBE(p + 0x74),
+            });
+        }
+        return result;
+    }
+    throw new Error('castle_inside: could not locate painting table');
 }
 
 interface MovtexMeshDesc { data: number; count: number; triangles: number; colored: boolean; kind: 'sand' | 'lava' | 'water'; textureAddress: number; alpha: number; materialAddress?: number; }
@@ -643,8 +704,10 @@ function main(): void {
                     // rotated (300, 0, -200) offset, randomized within 200.
                     const originX = rom.readInt16BE(p + 4), originY = rom.readInt16BE(p + 6), originZ = rom.readInt16BE(p + 8);
                     const yaw = rom.readInt16BE(p + 12), yawRadians = yaw * Math.PI / 180;
-                    const baseX = originX + Math.cos(yawRadians) * 300 - Math.sin(yawRadians) * -200;
-                    const baseZ = originZ + Math.sin(yawRadians) * 300 + Math.cos(yawRadians) * -200;
+                    // spawn_object_relative transforms local offsets with
+                    // mtxf_rotate_zxy_and_translate's SM64 yaw convention.
+                    const baseX = originX + Math.cos(yawRadians) * 300 + Math.sin(yawRadians) * -200;
+                    const baseZ = originZ - Math.sin(yawRadians) * 300 + Math.cos(yawRadians) * -200;
                     for (let fishIndex = 0; fishIndex < 15; fishIndex++) {
                         const phase = fishIndex * 2.399963229728653 + originX * 0.001 + originZ * 0.002;
                         const radius = 30 + (fishIndex * 47) % 200;
@@ -689,6 +752,7 @@ function main(): void {
         }
 
         let displayLists = new Map<number, number>();
+        let areaDisplayLists: DisplayListInfo[] | undefined;
         let cameraMode: number | undefined;
         if (levelSegmentBase < 0) throw new Error(`${id}: missing segment 7 load`);
         const nextCompressedSegment = rom.indexOf('MIO0', levelSegmentBase);
@@ -696,10 +760,25 @@ function main(): void {
         segmentData.set(0x0E, Buffer.from(rom.subarray(levelSegmentBase, rawSegmentEnd)));
         collectLinkedScripts(id, segmentData, jumpLinks, objects, explicitModelGeos, explicitModelDLs);
         if (areaGeoLayouts.length > 0) {
-            const entryLayouts = marioStart === undefined ? areaGeoLayouts : areaGeoLayouts.filter((layout) => layout.area === marioStart.area);
-            const areaGeo = collectAreaGeo(levelSegmentBase, entryLayouts.map((layout) => layout.offset));
-            displayLists = areaGeo.displayLists;
-            cameraMode = areaGeo.cameraMode;
+            // Peach's Castle is split into three level-script areas: main
+            // floor, upper floors, and basement. Objects and paintings from
+            // all three are intentionally retained for the combined noclip
+            // view, so traverse their corresponding original geo roots too.
+            const entryLayouts = id === 'castle_inside' || marioStart === undefined
+                ? areaGeoLayouts : areaGeoLayouts.filter((layout) => layout.area === marioStart.area);
+            if (id === 'castle_inside') {
+                areaDisplayLists = [];
+                for (const layout of entryLayouts) {
+                    const areaGeo = collectAreaGeo(levelSegmentBase, [layout.offset]);
+                    for (const [address, layer] of areaGeo.displayLists)
+                        areaDisplayLists.push({ address, layer, area: layout.area });
+                    cameraMode ??= areaGeo.cameraMode;
+                }
+            } else {
+                const areaGeo = collectAreaGeo(levelSegmentBase, entryLayouts.map((layout) => layout.offset));
+                displayLists = areaGeo.displayLists;
+                cameraMode = areaGeo.cameraMode;
+            }
         }
 
         const segments = [...segmentData.keys()].sort((a, b) => a - b);
@@ -717,8 +796,10 @@ function main(): void {
         const collisionOffset = selectedArea === undefined ? undefined : collisionByArea.get(selectedArea);
         const collisionEnd = collisionOffset === undefined ? undefined : [...collisionByArea.values()].filter((offset) => offset > collisionOffset).sort((a, b) => a - b)[0] ?? segment7.length;
         const collisionTriangles = collisionOffset === undefined ? Buffer.alloc(0) : collectCollisionTriangles(segment7, collisionOffset);
+        const environmentRegions = collisionOffset === undefined || collisionEnd === undefined ? [] : collectEnvironmentRegions(segment7, collisionOffset, collisionEnd);
         const waterKind = id === 'lll' && selectedArea === 2 ? 'lava' : 'water';
         const movtex = collisionOffset === undefined || collisionEnd === undefined ? [] : collectWaterBoxes(segment7, collisionOffset, collisionEnd, waterKind);
+        const paintings = id === 'castle_inside' ? collectCastlePaintings(segment7) : undefined;
         movtex.push(...collectMovtexMeshes(id, selectedArea, segment7));
         // Collision special-object lists contain static level geometry, trees, doors, and props.
         // Records have preset-dependent lengths; level-geometry presets include a byte-angle yaw.
@@ -930,6 +1011,26 @@ function main(): void {
         // camera-facing iris 100 scaled units in front of it.
         for (const eye of objects.filter((object) => object.behavior === 0x13000054))
             objects.push({ model: 0x66, position: [...eye.position], rotation: [...eye.rotation], billboard: true, billboardDepthOffset: 100 * (eye.scale ?? 1), scale: eye.scale });
+        if (id === 'castle_inside') {
+            const shiftPosition = (position: number[]): void => {
+                if (position[1] > 1000) position[1] += 2000;
+                else if (position[1] < -500) position[1] -= 2000;
+            };
+            for (const object of objects) {
+                shiftPosition(object.position);
+                if (object.activationCenter !== undefined) shiftPosition(object.activationCenter);
+                if (object.behaviorTarget !== undefined) shiftPosition(object.behaviorTarget);
+                if (object.birdParent !== undefined) shiftPosition(object.birdParent);
+                if (object.motionPath !== undefined)
+                    for (const point of object.motionPath) shiftPosition(point);
+            }
+            if (paintings !== undefined) {
+                for (let painting = 0; painting < paintings.length; painting++) {
+                    if (painting >= 8) paintings[painting].position[1] += 2000;
+                    else if (painting >= 4) paintings[painting].position[1] -= 2000;
+                }
+            }
+        }
         // bhvCourtyardBooTriplet has no rendered model of its own. With the
         // viewer's all-placements presentation, expand its three ROM-relative
         // Ghost Hunt Boo children directly.
@@ -946,12 +1047,13 @@ function main(): void {
                 Data: ArrayBufferSlice.fromView(segmentData.get(segment)!),
             })),
             Collision: ArrayBufferSlice.fromView(collisionTriangles),
+            EnvironmentRegions: environmentRegions,
         };
         const archiveData = BYML.write(archive, BYML.FileType.CRG1);
         writeFileSync(join(outputRoot, `${id}.crg1`), zstdCompressSync(new Uint8Array(archiveData)));
         const modelGeos = { ...findModelGeos(new Set(segments)), ...explicitModelGeos };
         const modelDLs = { ...findModelDLs(new Set(segments)), ...explicitModelDLs };
-        manifest.push({ id, name, displayLists: [...displayLists].map(([address, layer]) => ({ address, layer })), segments, objects, movtex, modelGeos, modelDLs, marioStart, cameraMode });
+        manifest.push({ id, name, displayLists: areaDisplayLists ?? [...displayLists].map(([address, layer]) => ({ address, layer })), segments, objects, movtex, paintings, modelGeos, modelDLs, marioStart, cameraMode });
     }
     writeFileSync(join(outputRoot, 'manifest.json'), JSON.stringify(manifest));
     console.log(`Extracted ${manifest.length} Super Mario 64 levels from ${basename(romPath)}`);
