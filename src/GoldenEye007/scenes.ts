@@ -863,12 +863,19 @@ export class GoldenEyeRenderer implements Viewer.SceneGfx {
                 instance.setSortBias(bias);
             }
             if (instance.visible && roomIndex !== undefined) {
-                for (const memberRoom of roomIndices ?? [roomIndex]) {
-                    for (const lists of roomLists.get(memberRoom) ?? []) {
-                        const list = roomPhase === 'secondary' ? lists.secondary : lists.primary;
-                        this.renderHelper.renderInstManager.setCurrentList(list);
-                        instance.prepareToRender(device, this.renderHelper.renderInstManager, viewerInput, matrix);
-                    }
+                // A setup prop can overlap several room bounds, but it is still
+                // one object. Submitting it to every visible room is harmless
+                // for opaque geometry and visibly wrong for translucent model
+                // streams (the swivel-chair cutouts accumulate into slabs).
+                // Prefer the authored room, falling back to another intersected
+                // room only when portal traversal has culled the authored one.
+                const memberRooms = roomIndices ?? [roomIndex];
+                const activeRoom = roomLists.has(roomIndex) ? roomIndex
+                    : memberRooms.find((room) => roomLists.has(room));
+                for (const lists of activeRoom === undefined ? [] : roomLists.get(activeRoom) ?? []) {
+                    const list = roomPhase === 'secondary' ? lists.secondary : lists.primary;
+                    this.renderHelper.renderInstManager.setCurrentList(list);
+                    instance.prepareToRender(device, this.renderHelper.renderInstManager, viewerInput, matrix);
                 }
                 this.renderHelper.renderInstManager.setCurrentList(this.renderInstList);
             } else {
