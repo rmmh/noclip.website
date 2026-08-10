@@ -390,6 +390,12 @@ export class DrawCallInstance {
         this.sortLayer = layer;
     }
 
+    public isTranslucent(): boolean {
+        const blend = RDP.translateRenderMode(this.drawCall.DP_OtherModeL)
+            .attachmentsState?.[0]?.rgbBlendState;
+        return blend !== undefined && blend.blendDstFactor !== GfxBlendFactor.Zero;
+    }
+
     public setLODRange(min: number, max: number): void {
         this.lodMin = min;
         this.lodMax = max;
@@ -567,4 +573,3 @@ export class DrawCallInstance {
         renderInstManager.submitRenderInst(renderInst);
     }
 }
-

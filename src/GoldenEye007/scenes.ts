@@ -14,7 +14,7 @@ import { makeAttachmentClearDescriptor } from '../gfx/helpers/RenderGraphHelpers
 import { GfxRenderHelper } from '../gfx/render/GfxRenderHelper.js';
 import { GfxRendererLayer, GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
 import { GfxrAttachmentSlot } from '../gfx/render/GfxRenderGraph.js';
-import { GfxBlendFactor, GfxCompareMode, GfxDevice } from '../gfx/platform/GfxPlatform.js';
+import { GfxCompareMode, GfxDevice } from '../gfx/platform/GfxPlatform.js';
 import { SceneContext } from '../SceneBase.js';
 import * as Viewer from '../viewer.js';
 import { colorNewFromRGBA, Color } from '../Color.js';
@@ -122,6 +122,8 @@ export class GoldenEyeRenderer implements Viewer.SceneGfx {
     private guardsVisible = true;
     private portalsVisible = false;
     private roomRenderInstLists: { primary: GfxRenderInstList; secondary: GfxRenderInstList; bounds: PortalWindow }[] = [];
+    private unscissoredRoomPrimary = new GfxRenderInstList();
+    private unscissoredRoomSecondary = new GfxRenderInstList();
 
     constructor(device: GfxDevice, private archive: LevelArchive) {
         this.renderHelper = new GfxRenderHelper(device);
@@ -448,7 +450,12 @@ export class GoldenEyeRenderer implements Viewer.SceneGfx {
                         mat4.multiply(callMatrix, callMatrix, inverseScreenMatrix);
                     }
                 }
-                this.drawCallInstances.push({ instance, matrix: callMatrix, kind: instanceKind, roomIndex, roomIndices, glass, bsp });
+                // The flat model-104 "window" records in Dam are authored
+                // floor shadows (uniform black, translucent texture 654).
+                // The cart submits these decals before the model's translucent
+                // stream so they cannot darken the chair geometry above them.
+                const roomPhase = prop.Type === SetupType.Glass && prop.ModelID === 104 ? 'primary' : undefined;
+                this.drawCallInstances.push({ instance, matrix: callMatrix, kind: instanceKind, roomIndex, roomIndices, roomPhase, glass, bsp });
             }
             propIndex++;
             if (prop.HeadModelID != null) {
@@ -736,6 +743,8 @@ export class GoldenEyeRenderer implements Viewer.SceneGfx {
         this.renderHelper.renderInstManager.setCurrentList(this.renderInstList);
         const roomWindows = this.buildVisibleRoomWindows(viewerInput);
         this.roomRenderInstLists = [];
+        this.unscissoredRoomPrimary.reset();
+        this.unscissoredRoomSecondary.reset();
         const roomLists = new Map<number, { primary: GfxRenderInstList; secondary: GfxRenderInstList; bounds: PortalWindow }[]>();
         for (const [room, windows] of roomWindows) {
             const lists = windows.map((bounds) => ({ primary: new GfxRenderInstList(), secondary: new GfxRenderInstList(), bounds }));
@@ -870,6 +879,18 @@ export class GoldenEyeRenderer implements Viewer.SceneGfx {
                 // Prefer the authored room, falling back to another intersected
                 // room only when portal traversal has culled the authored one.
                 const memberRooms = roomIndices ?? [roomIndex];
+                if (memberRooms.length > 1) {
+                    // A prop spanning multiple rooms must not inherit any one
+                    // room's portal scissor: that clips the object at the
+                    // window boundary. Visibility was already accepted above,
+                    // so submit it once to the unscissored scene list.
+                    const translucentModel = roomPhase === undefined && instance.isTranslucent();
+                    this.renderHelper.renderInstManager.setCurrentList(roomPhase === 'secondary' || translucentModel
+                        ? this.unscissoredRoomSecondary : this.unscissoredRoomPrimary);
+                    instance.prepareToRender(device, this.renderHelper.renderInstManager, viewerInput, matrix);
+                    this.renderHelper.renderInstManager.setCurrentList(this.renderInstList);
+                    continue;
+                }
                 const activeRoom = roomLists.has(roomIndex) ? roomIndex
                     : memberRooms.find((room) => roomLists.has(room));
                 for (const lists of activeRoom === undefined ? [] : roomLists.get(activeRoom) ?? []) {
@@ -951,6 +972,9 @@ export class GoldenEyeRenderer implements Viewer.SceneGfx {
                 // screen rectangle immediately before submitting its DL.
                 for (const { primary, bounds } of this.roomRenderInstLists)
                     drawRoomList(primary, bounds);
+                passRenderer.setScissor(0, 0, viewerInput.backbufferWidth, viewerInput.backbufferHeight);
+                this.unscissoredRoomPrimary.drawOnPassRenderer(this.renderHelper.renderCache, passRenderer);
+                this.unscissoredRoomSecondary.drawOnPassRenderer(this.renderHelper.renderCache, passRenderer);
                 for (let i = this.roomRenderInstLists.length - 1; i >= 0; i--) {
                     const { secondary, bounds } = this.roomRenderInstLists[i];
                     drawRoomList(secondary, bounds);

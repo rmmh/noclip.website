@@ -6,6 +6,7 @@ export const enum SetupType {
     SingleMonitor = 10,
     MultiMonitor = 11,
     Hat = 17,
+    Glass = 42,
     TintedGlass = 47,
     End = 48,
 }
