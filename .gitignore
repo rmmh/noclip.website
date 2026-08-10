@@ -57,6 +57,10 @@ data/*
 !data/Examples/
 dist/
 
+# Personal release uploader and its retained rclone reports.
+/twoclip-up
+/.twoclip-deploy/
+
 .wireit
 
 __pycache__/

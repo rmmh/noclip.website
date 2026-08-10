@@ -16,7 +16,7 @@ import { assert, assertExists } from './util.js';
 import * as Viewer from './viewer.js';
 
 // @ts-ignore
-import logoURL from './assets/logo.png';
+import logoURL from './assets/logo.svg';
 import { AntialiasingMode } from './gfx/helpers/RenderGraphHelpers.js';
 import { TextureCanvas } from './TextureViewer.js';
 
@@ -2293,14 +2293,12 @@ class About extends Panel {
 }
 </style>
 
-<h1> <img src="${logoURL}"> <span> noclip.website </span> </h1>
+<h1> <img src="${logoURL}"> <span> twoclip </span> </h1>
 <h2> A digital museum of video game levels </h2>
 
-<p> <strong>CLICK AND DRAG</strong> to look around and use <strong>WASD</strong> to move the camera </p>
-<p> Hold <strong>SHIFT</strong> to go faster, and use <strong>MOUSE WHEEL</strong> to fine tune the speed
+<p> <strong>CLICK AND DRAG</strong> to look around and use <strong>WASD</strong> to move the camera. <strong>RIGHT CLICK</strong> to orbit around a point. </p>
+<p> Hold <strong>SHIFT</strong> to go faster, and use <strong>MOUSE WHEEL</strong> to fine tune the speed. 
 <strong>Z</strong> toggles the UI. </p>
-
-<p><a href="https://discord.gg/bkJmKKv"><strong>JOIN THE DISCORD</strong> by clicking here</a></p>
 
 <p><strong>OPEN SOURCE</strong> at <a href="${GITHUB_URL}">GitHub</a></p>
 

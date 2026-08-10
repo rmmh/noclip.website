@@ -1,23 +1,27 @@
-<img align="right" src="src/assets/logo.png">
+<img align="right" src="src/assets/logo.svg" width="128" height="128">
 
-# <a href="https://noclip.website">noclip</a>
+# <a href="https://mod.ifies.com/twoclip/">twoclip</a>
+
+A fork of [noclip](https://noclip.website) with additional games I didn't bother upstreaming, particularly N64.
+
+Major differences compared to upstream:
+
+* Nintendo 64
+  * GoldenEye 007 (new)
+  * Super Mario 64 (new)
+  * Donkey Kong 64 (significantly expanded)
+* Nintendo DS
+  * Metroid Prime Hunters (significantly expanded)
 
 The reverse engineering of model formats was done by many people. See the application for full credits.
 
 ## Contributing
 
-Contributions are very welcome! New games, new features, and bug fixes are all very appreciated. Even small contributions like proper map names, grouping maps and new default savestates are extremely helpful.
-
-## AI Contributions Policy
-
-* If AI was used in any capacity for your contribution (coding, reverse engineering, authoring commit messages or PR descriptions), this must be disclosed in your pull request.
-* Please only submit contributions that you have tested, reviewed, and feel you understand.
-* All comments or documentation *must* be fully human-authored. Any AI-written or even AI-assisted comments are not allowed.
-* Project maintainers reserve the right to reject contributions at any time, for any reason, including if they suspect this policy has not been correctly followed.
+You should probably contribute to upstream instead.
 
 ## Development Guide
 
-To develop for noclip.website, you'll need these requisites:
+To develop for twoclip, you'll need these requisites:
 
 * Your code editor of choice (for example, [Visual Studio Code](https://code.visualstudio.com/), [WebStorm](https://www.jetbrains.com/webstorm/)),
 * [Node.js](https://nodejs.org/en/download). Choose the latest LTS version and choose the `pnpm` package manager,
@@ -35,11 +39,9 @@ Then, use the following commands to set up your environment (only needed every s
 
 Finally, to build and run the project, use `pnpm start`. This will start a live-reloading environment and uses filesystem watchers to auto-build the project. To include live-reloading for Rust code as well, use `pnpm start --watch`.
 
-The dev server serves the site from the root of the server. To serve it from a subdirectory instead, set `BASE_PATH`, e.g. `BASE_PATH=/noclip pnpm start`. Production builds (`pnpm build`) reference their assets relatively, so the `dist` directory can be dropped into any directory of a static host without further configuration.
+The dev server serves the site from the root of the server. To serve it from a subdirectory instead, set `BASE_PATH`, e.g. `BASE_PATH=/twoclip pnpm start`. Production builds (`pnpm build`) reference their assets relatively, so the `dist` directory can be dropped into any directory of a static host without further configuration.
 
-Note that Rust will be built in debug mode by default, which can greatly affect performance. To build the project with Rust in release mode, use `pnpm start:release` instead.
-
-For any questions related to development, see the [Official noclip.website Discord Server](https://discord.gg/bkJmKKv)'s #development channel. A number of developers from the community are present there and can help answer questions if you run into any additional issues getting set up.
+Rust is built in release mode by default. To run with a faster-to-build debug WASM module instead, use `npm run start:debug`.
 
 ## Controls
 

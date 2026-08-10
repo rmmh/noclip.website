@@ -32,7 +32,7 @@
   },
   "scripts": {
     "start": "wireit",
-    "start:release": "wireit",
+    "start:debug": "wireit",
     "regression:game": "node scripts/game_regression.mjs",
     "build": "wireit",
     "build:wasm-debug": "wireit",
@@ -65,16 +65,16 @@
     "start": {
       "command": "rsbuild dev",
       "dependencies": [
-        "build:wasm-debug"
+        "build:wasm-release"
       ],
       "service": true,
       "cascade": false,
       "files": []
     },
-    "start:release": {
+    "start:debug": {
       "command": "rsbuild dev",
       "dependencies": [
-        "build:wasm-release"
+        "build:wasm-debug"
       ],
       "service": true,
       "cascade": false,

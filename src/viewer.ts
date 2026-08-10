@@ -10,7 +10,7 @@ import { createSwapChainForWebGPU, GfxPlatformWebGPUConfig } from './gfx/platfor
 import { RenderStatistics, RenderStatisticsTracker } from './RenderStatistics.js';
 import { AntialiasingMode } from './gfx/helpers/RenderGraphHelpers.js';
 import { WebXRContext, WebXRInputManager } from './WebXR.js';
-import { IS_DEVELOPMENT } from './BuildVersion.js';
+import { GITHUB_URL, IS_DEVELOPMENT } from './BuildVersion.js';
 import { GlobalSaveManager } from './SaveManager.js';
 import { mat4 } from 'gl-matrix';
 import ArrayBufferSlice from './ArrayBufferSlice.js';
@@ -410,13 +410,13 @@ export function makeErrorUI(errorCode: InitErrorCode): DocumentFragment {
     if (errorCode === InitErrorCode.NO_WEBGL2_GENERIC)
         return makeErrorMessageUI(`
 <p>Your browser does not appear to have WebGL 2 support.
-<p>If <a href="http://webglreport.com/?v=2">WebGL Report</a> says your browser supports WebGL 2, please open a <a href="https://github.com/magcius/noclip.website/issues/new?template=tech_support.md">GitHub issue</a> with as much as information as possible.
+<p>If <a href="http://webglreport.com/?v=2">WebGL Report</a> says your browser supports WebGL 2, please open a <a href="${GITHUB_URL}/issues/new?template=tech_support.md">GitHub issue</a> with as much as information as possible.
 <p style="text-align: right">Thank you.
 `);
     else if (errorCode === InitErrorCode.NO_WEBGPU_GENERIC)
         return makeErrorMessageUI(`
 <p>Your browser does not appear to have WebGPU support.
-<p>If <a href="https://webgpureport.org/">WebGPU</a> says your browser supports WebGPU, please open a <a href="https://github.com/magcius/noclip.website/issues/new?template=tech_support.md">GitHub issue</a> with as much as information as possible.
+<p>If <a href="https://webgpureport.org/">WebGPU</a> says your browser supports WebGPU, please open a <a href="${GITHUB_URL}/issues/new?template=tech_support.md">GitHub issue</a> with as much as information as possible.
 <p style="text-align: right">Thank you.
 `);
     else if (errorCode === InitErrorCode.GARBAGE_WEBGL2_SWIFTSHADER)

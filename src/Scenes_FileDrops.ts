@@ -14,7 +14,6 @@ import * as CTR_H3D from './Common/CTR/H3D.js';
 import * as RRES from './rres/scenes.js';
 import * as PaperMarioTTYD from './PaperMarioTTYD/Scenes_PaperMarioTTYD.js';
 import * as JPAExplorer from './InteractiveExamples/JPAExplorer.js';
-import * as SourceFileDrops from './SourceEngine/Scenes_FileDrops.js';
 import * as SuperMonkeyBall from './SuperMonkeyBall/Scenes_SuperMonkeyBall.js';
 import { SceneContext } from "./SceneBase.js";
 import { DataFetcher, NamedArrayBufferSlice } from "./DataFetcher.js";
@@ -104,14 +103,10 @@ export async function createSceneFromFiles(context: SceneContext, buffers: Named
     if (buffer.name.endsWith('.bch'))
         CTR_H3D.parse(buffer);
 
-    // Source renderer also use .gma extension, so try SMB first to see if it parses or not
     const superMonkeyBallRenderer = SuperMonkeyBall.createSceneFromNamedBuffers(context, buffers);
     if (superMonkeyBallRenderer !== null) {
         return superMonkeyBallRenderer;
     }
-
-    if (buffer.name.endsWith('.bsp') || buffer.name.endsWith('.gma'))
-        return SourceFileDrops.createFileDropsScene(context, buffer); 
 
     throw new Error("whoops");
 }
