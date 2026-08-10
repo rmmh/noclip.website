@@ -3,7 +3,7 @@ import { decompress } from 'fzstd';
 import ArrayBufferSlice from '../ArrayBufferSlice.js';
 import * as BYML from '../byml.js';
 import { CameraController } from '../Camera.js';
-import { makeBackbufferDescSimple, standardFullClearRenderPassDescriptor } from '../gfx/helpers/RenderGraphHelpers.js';
+import { makeAttachmentClearDescriptor, makeBackbufferDescSimple } from '../gfx/helpers/RenderGraphHelpers.js';
 import { fillMatrix4x4 } from '../gfx/helpers/UniformBufferHelpers.js';
 import { GfxRenderHelper } from '../gfx/render/GfxRenderHelper.js';
 import { GfxRenderInstList } from '../gfx/render/GfxRenderInstManager.js';
@@ -22,6 +22,7 @@ import { decodeAnimationTable, parseGeoLayout } from './geo.js';
 import type { GeoAnimationPose } from './geo.js';
 import { createSkyboxRenderer } from './render.js';
 import type { SkyboxRenderer } from './render.js';
+import { colorNewFromRGBA } from '../Color.js';
 
 const pathBase = 'SuperMario64';
 
@@ -31,7 +32,7 @@ interface DisplayListInfo { address: number; layer: number; area?: number; }
 interface MovtexInfo { kind: 'water' | 'sand' | 'lava'; vertices: number[][]; indices: number[]; alpha: number; scrollS?: number; rotation?: number; textureAddress: number; materialAddress?: number; lighting?: boolean; }
 interface EnvironmentRegion { type: number; loX: number; loZ: number; hiX: number; hiZ: number; height: number; }
 interface PaintingInfo { displayList: number; position: number[]; pitch: number; yaw: number; size: number; alpha: number; textureType: number; }
-interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex?: MovtexInfo[]; paintings?: PaintingInfo[]; modelGeos?: Record<number, number>; modelDLs?: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; }
+interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex?: MovtexInfo[]; paintings?: PaintingInfo[]; modelGeos?: Record<number, number>; modelDLs?: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; backgroundColor?: number; }
 interface LevelArchive { Segments: { ID: number; Data: ArrayBufferSlice }[]; Collision?: ArrayBufferSlice; EnvironmentRegions?: EnvironmentRegion[]; }
 
 interface CollisionFloor {
@@ -103,6 +104,11 @@ function findWaterLevel(regions: EnvironmentRegion[], x: number, z: number): num
         if (region.type < 50 && region.loX < x && x < region.hiX && region.loZ < z && z < region.hiZ)
             return region.height;
     return null;
+}
+
+function decodeRGBA5551(color: number) {
+    return colorNewFromRGBA((color >>> 11 & 0x1F) / 0x1F, (color >>> 6 & 0x1F) / 0x1F,
+        (color >>> 1 & 0x1F) / 0x1F, color & 1);
 }
 
 function makeInitialCameraMatrix(levelId: string, start: MarioStart | undefined, cameraMode: number | undefined): mat4 {
@@ -1834,7 +1840,7 @@ class SM64Renderer implements Viewer.SceneGfx {
     private environmentRegions: EnvironmentRegion[];
     private behaviorsInitialized = false;
 
-    constructor(device: GfxDevice, segmentBuffers: ArrayBufferSlice[], displayLists: DisplayListInfo[], objects: ObjectInfo[], movtex: MovtexInfo[], paintings: PaintingInfo[], modelGeos: Record<number, number>, extractedModelDLs: Record<number, number>, collisionData: ArrayBufferSlice | undefined, environmentRegions: EnvironmentRegion[], private initialCameraMatrix: mat4) {
+    constructor(device: GfxDevice, segmentBuffers: ArrayBufferSlice[], displayLists: DisplayListInfo[], objects: ObjectInfo[], movtex: MovtexInfo[], paintings: PaintingInfo[], modelGeos: Record<number, number>, extractedModelDLs: Record<number, number>, collisionData: ArrayBufferSlice | undefined, environmentRegions: EnvironmentRegion[], private backgroundColor: number, private initialCameraMatrix: mat4) {
         this.renderHelper = new GfxRenderHelper(device);
         this.collisionFloors = parseCollisionFloors(collisionData);
         this.environmentRegions = environmentRegions;
@@ -2329,8 +2335,9 @@ class SM64Renderer implements Viewer.SceneGfx {
         this.renderHelper.prepareToRender();
 
         const builder = this.renderHelper.renderGraph.newGraphBuilder();
-        const mainColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, viewerInput, standardFullClearRenderPassDescriptor);
-        const mainDepthDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.DepthStencil, viewerInput, standardFullClearRenderPassDescriptor);
+        const clearDescriptor = makeAttachmentClearDescriptor(decodeRGBA5551(this.backgroundColor));
+        const mainColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, viewerInput, clearDescriptor);
+        const mainDepthDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.DepthStencil, viewerInput, clearDescriptor);
         const mainColorTargetID = builder.createRenderTargetID(mainColorDesc, 'Main Color');
         const mainDepthTargetID = builder.createRenderTargetID(mainDepthDesc, 'Main Depth');
         builder.pushPass((pass) => {
@@ -2366,7 +2373,7 @@ class SceneDesc implements Viewer.SceneDesc {
         const segmentBuffers: ArrayBufferSlice[] = [];
         for (const segment of archive.Segments)
             segmentBuffers[segment.ID] = segment.Data;
-        return new SM64Renderer(device, segmentBuffers, info.displayLists, info.objects ?? [], info.movtex ?? [], info.paintings ?? [], info.modelGeos ?? {}, info.modelDLs ?? {}, archive.Collision, archive.EnvironmentRegions ?? [], makeInitialCameraMatrix(info.id, info.marioStart, info.cameraMode));
+        return new SM64Renderer(device, segmentBuffers, info.displayLists, info.objects ?? [], info.movtex ?? [], info.paintings ?? [], info.modelGeos ?? {}, info.modelDLs ?? {}, archive.Collision, archive.EnvironmentRegions ?? [], info.backgroundColor ?? 0x0001, makeInitialCameraMatrix(info.id, info.marioStart, info.cameraMode));
     }
 }
 

@@ -29,7 +29,7 @@ interface DisplayListInfo { address: number; layer: number; area?: number; }
 interface MovtexInfo { kind: 'water' | 'sand' | 'lava'; vertices: number[][]; indices: number[]; alpha: number; scrollS?: number; rotation?: number; textureAddress: number; materialAddress?: number; lighting?: boolean; }
 interface EnvironmentRegion { type: number; loX: number; loZ: number; hiX: number; hiZ: number; height: number; }
 interface PaintingInfo { displayList: number; position: number[]; pitch: number; yaw: number; size: number; alpha: number; textureType: number; }
-interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex: MovtexInfo[]; paintings?: PaintingInfo[]; modelGeos: Record<number, number>; modelDLs: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; }
+interface LevelInfo { id: string; name: string; displayLists: DisplayListInfo[]; segments: number[]; objects: ObjectInfo[]; movtex: MovtexInfo[]; paintings?: PaintingInfo[]; modelGeos: Record<number, number>; modelDLs: Record<number, number>; marioStart?: MarioStart; cameraMode?: number; backgroundColor?: number; }
 interface LevelArchive { Segments: { ID: number; Data: ArrayBufferSlice }[]; Collision: ArrayBufferSlice; EnvironmentRegions: EnvironmentRegion[]; }
 
 function collectCollisionTriangles(buffer: Buffer, start: number): Buffer {
@@ -462,9 +462,10 @@ const hmcBigBoulderPath = [
     [-6093, -423, -607], [-6093, -1359, -367],
 ];
 
-function collectAreaGeo(segmentBase: number, starts: number[]): { displayLists: Map<number, number>; cameraMode?: number } {
+function collectAreaGeo(segmentBase: number, starts: number[]): { displayLists: Map<number, number>; cameraMode?: number; backgroundColor?: number } {
     const result = new Map<number, number>();
     let cameraMode: number | undefined;
+    let backgroundColor: number | undefined;
     const active = new Set<number>();
     const walk = (start: number): void => {
         if (active.has(start)) return;
@@ -501,6 +502,10 @@ function collectAreaGeo(segmentBase: number, starts: number[]): { displayLists: 
                 if (param & 0x80) { dlOffset = 8; size = 12; }
             } else if (op === 0x1F) size = 16;
             else if (op > 0x20) break;
+            // A null function pointer makes GEO_BACKGROUND's parameter an
+            // RGBA5551 fill color rather than a panorama ID.
+            if (op === 0x19 && rom.readUInt32BE(p + 4) === 0)
+                backgroundColor ??= rom.readUInt16BE(p + 2);
             if (dlOffset >= 0) {
                 const dl = rom.readUInt32BE(p + dlOffset);
                 if ((dl >>> 24) === 7) result.set(dl, param & 0x0F);
@@ -510,7 +515,7 @@ function collectAreaGeo(segmentBase: number, starts: number[]): { displayLists: 
         active.delete(start);
     };
     for (const start of starts) walk(start);
-    return { displayLists: result, cameraMode };
+    return { displayLists: result, cameraMode, backgroundColor };
 }
 
 function findModelGeos(segments: Set<number>): Record<number, number> {
@@ -754,6 +759,7 @@ function main(): void {
         let displayLists = new Map<number, number>();
         let areaDisplayLists: DisplayListInfo[] | undefined;
         let cameraMode: number | undefined;
+        let backgroundColor: number | undefined;
         if (levelSegmentBase < 0) throw new Error(`${id}: missing segment 7 load`);
         const nextCompressedSegment = rom.indexOf('MIO0', levelSegmentBase);
         const rawSegmentEnd = nextCompressedSegment >= 0 ? nextCompressedSegment : Math.min(rom.length, scriptStart + 0x10000);
@@ -773,11 +779,13 @@ function main(): void {
                     for (const [address, layer] of areaGeo.displayLists)
                         areaDisplayLists.push({ address, layer, area: layout.area });
                     cameraMode ??= areaGeo.cameraMode;
+                    backgroundColor ??= areaGeo.backgroundColor;
                 }
             } else {
                 const areaGeo = collectAreaGeo(levelSegmentBase, entryLayouts.map((layout) => layout.offset));
                 displayLists = areaGeo.displayLists;
                 cameraMode = areaGeo.cameraMode;
+                backgroundColor = areaGeo.backgroundColor;
             }
         }
 
@@ -1053,7 +1061,7 @@ function main(): void {
         writeFileSync(join(outputRoot, `${id}.crg1`), zstdCompressSync(new Uint8Array(archiveData)));
         const modelGeos = { ...findModelGeos(new Set(segments)), ...explicitModelGeos };
         const modelDLs = { ...findModelDLs(new Set(segments)), ...explicitModelDLs };
-        manifest.push({ id, name, displayLists: areaDisplayLists ?? [...displayLists].map(([address, layer]) => ({ address, layer })), segments, objects, movtex, paintings, modelGeos, modelDLs, marioStart, cameraMode });
+        manifest.push({ id, name, displayLists: areaDisplayLists ?? [...displayLists].map(([address, layer]) => ({ address, layer })), segments, objects, movtex, paintings, modelGeos, modelDLs, marioStart, cameraMode, backgroundColor });
     }
     writeFileSync(join(outputRoot, 'manifest.json'), JSON.stringify(manifest));
     console.log(`Extracted ${manifest.length} Super Mario 64 levels from ${basename(romPath)}`);
