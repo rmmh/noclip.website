@@ -228,11 +228,11 @@ export class GoldenEyeRenderer implements Viewer.SceneGfx {
         const makeInstance = ({ drawCall, modelID, lodMin, lodMax, sortPosition }: GoldenEyeDrawCall): DrawCallInstance => {
             const lights = (drawCall.SP_GeometryMode & RSP_Geometry.G_LIGHTING) !== 0 ? this.sceneLighting : null;
             const instance = new DrawCallInstance(drawCall, textureCache, lights);
-            // Character LOD nodes control articulated relation subtrees. They
-            // cannot be culled safely after those subtrees have been flattened
-            // into material batches (doing so drops individual limbs). Static
-            // prop LODs are independent meshes and can use this draw-level test.
-            if (lodMax !== undefined && modelID < 0x10000)
+            // modelUpdateDistanceRelations disconnects an LOD node's entire
+            // affected subtree when its scaled distance range is inactive.
+            // Extraction preserves that range on every flattened draw call in
+            // the subtree, so the same test applies to characters and props.
+            if (lodMax !== undefined)
                 instance.setLODRange(lodMin ?? 0, lodMax);
             if (sortPosition !== undefined)
                 instance.setSortPosition(sortPosition[0], sortPosition[1], sortPosition[2]);

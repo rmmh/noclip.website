@@ -918,7 +918,26 @@ function extractModelFromMetadata(meta: [number, string, number, number, number,
         throw new Error(`model ${archiveID} (${name}) has invalid compression header`);
     const data = Buffer.from(inflateRawSync(packed.subarray(2)));
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const root = switches * 4 + textures * 0x0C;
+    let root = switches * 4 + textures * 0x0C;
+    if (character) {
+        // Character texture records are packed/variable-sized in the source
+        // files, so sizeof(ModelFileTextures) does not locate RootNode. Find
+        // the structurally valid opcode-1 root which load_object_fill_header
+        // publishes: it has no parent or siblings and owns a valid child.
+        for (let candidate = switches * 4; candidate + 0x18 <= view.byteLength; candidate += 4) {
+            const pointer = (offs: number): number => view.getUint32(offs) & 0x00FFFFFF;
+            if ((view.getUint16(candidate) & 0xFF) === 1
+                    && pointer(candidate + 4) < view.byteLength
+                    && pointer(candidate + 8) === 0
+                    && pointer(candidate + 0x0C) === 0
+                    && pointer(candidate + 0x10) === 0
+                    && pointer(candidate + 0x14) > 0
+                    && pointer(candidate + 0x14) + 0x18 <= view.byteLength) {
+                root = candidate;
+                break;
+            }
+        }
+    }
     // A display list can be referenced by more than one group. Keep the group
     // transform in the identity so articulated/shared geometry is not dropped.
     const displayLists = new Map<string, ModelDisplayListArchive>();
