@@ -299,6 +299,7 @@ function isPenguinKind(kind: IdleBehavior): boolean {
 
 function behaviorAnimation(address: number | undefined, model?: number): [number, number] | undefined {
     switch (address) {
+        case 0x13000AFC: case 0x13000B0C: return [0x030156C0, 0]; // Warp / regular door idle
         case 0x130001F4: return [0x0500FE30, 5]; // King Bob-omb waiting for Mario
         case 0x13000528: return [0x0800C070, 4]; // Chuckya patrol
         case 0x13001548: return [0x0501534C, 0]; // Heave-Ho
@@ -2373,7 +2374,14 @@ class SceneDesc implements Viewer.SceneDesc {
         const segmentBuffers: ArrayBufferSlice[] = [];
         for (const segment of archive.Segments)
             segmentBuffers[segment.ID] = segment.Data;
-        return new SM64Renderer(device, segmentBuffers, info.displayLists, info.objects ?? [], info.movtex ?? [], info.paintings ?? [], info.modelGeos ?? {}, info.modelDLs ?? {}, archive.Collision, archive.EnvironmentRegions ?? [], info.backgroundColor ?? 0x0001, makeInitialCameraMatrix(info.id, info.marioStart, info.cameraMode));
+        const objects = (info.objects ?? []).map((object) => {
+            // Compatibility for archives extracted before the AREA(2) entrance
+            // pair was kept with noclip's +2000-separated area-2 geometry.
+            if (info.id === 'castle_inside' && object.model === 0x25 && object.behavior === 0x13000AFC && object.position[1] === 512 && object.position[2] === 3021)
+                return { ...object, position: [object.position[0], object.position[1] + 2000, object.position[2]] };
+            return object;
+        });
+        return new SM64Renderer(device, segmentBuffers, info.displayLists, objects, info.movtex ?? [], info.paintings ?? [], info.modelGeos ?? {}, info.modelDLs ?? {}, archive.Collision, archive.EnvironmentRegions ?? [], info.backgroundColor ?? 0x0001, makeInitialCameraMatrix(info.id, info.marioStart, info.cameraMode));
     }
 }
 

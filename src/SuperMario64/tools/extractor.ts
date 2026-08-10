@@ -1025,7 +1025,12 @@ function main(): void {
                 else if (position[1] < -500) position[1] -= 2000;
             };
             for (const object of objects) {
-                shiftPosition(object.position);
+                // script_func_local_2 is linked exclusively from AREA(2), but
+                // this entrance pair sits below the general area-2 Y heuristic.
+                if (object.model === 0x25 && object.behavior === 0x13000AFC && object.position[1] === 512 && object.position[2] === 3021)
+                    object.position[1] += 2000;
+                else
+                    shiftPosition(object.position);
                 if (object.activationCenter !== undefined) shiftPosition(object.activationCenter);
                 if (object.behaviorTarget !== undefined) shiftPosition(object.behaviorTarget);
                 if (object.birdParent !== undefined) shiftPosition(object.birdParent);
